@@ -126,41 +126,95 @@ def save_optimization_pickle(grid):
     import numpy as np
 
     results_data = {}
-    # Store charger combination as a list in the value, key for the main dict will be tuple
     results_data['charger_combination'] = list(grid.chargers) if grid.chargers is not None else []
 
-    # Link connectivity removed from here, will be stored once globally.
+    link_flows_dict = {}
+    all_edges = grid.net.edges.sort_values("link_id").copy()
 
     if hasattr(grid, 'cvxpy_link_flows') and grid.cvxpy_link_flows is not None: # CVXPY case
         results_data['objective_value'] = grid.best_objective_value
-        link_flows_to_save = grid.cvxpy_link_flows
         results_data['method'] = 'cvxpy'
+        raw_link_flows = grid.cvxpy_link_flows
+        charger_throughputs = getattr(grid, 'cvxpy_charger_throughput', None)
+        
+        charger_node_to_throughput_map = {}
+        if charger_throughputs is not None and grid.chargers is not None and len(grid.chargers) == len(charger_throughputs):
+            for i, charger_node_id in enumerate(grid.chargers):
+                 charger_node_to_throughput_map[charger_node_id] = charger_throughputs[i]
+        elif charger_throughputs is not None:
+            # This case might occur if grid.chargers is None or length mismatch.
+            # For now, we cannot map throughputs to specific charger nodes if so.
+            print(f"Warning: Charger throughputs available but cannot map to charger nodes for {grid.chargers}")
+
+        for _, edge_row in all_edges.iterrows():
+            link_id = int(edge_row['link_id'])
+            start_node = int(edge_row['start_node_id'])
+            end_node = int(edge_row['end_node_id'])
+            flow_value = 0.0
+
+            is_charger_self_link = (start_node == end_node and start_node in charger_node_to_throughput_map)
+
+            if is_charger_self_link:
+                flow_value = charger_node_to_throughput_map.get(start_node, 0.0)
+            elif link_id < len(raw_link_flows): # Regular road link
+                flow_value = raw_link_flows[link_id]
+            
+            link_flows_dict[link_id] = {
+                'start_node_id': start_node,
+                'end_node_id': end_node,
+                'flow': float(flow_value)
+            }
+
     elif hasattr(grid, 'flow') and grid.flow is not None: # SciPy case
         results_data['objective_value'] = grid.travel_time_obj
-        # Ensure link_flows covers all self.l links, populating active ones
-        # and leaving others as 0 if not active.
-        if hasattr(grid, 'active_link_indices') and hasattr(grid, 'l'):
-            full_link_flows = np.zeros(grid.l)
-            if grid.active_link_indices is not None and len(grid.active_link_indices) == len(grid.flow):
-                full_link_flows[grid.active_link_indices] = grid.flow
-            elif len(grid.flow) == grid.l: # If grid.flow already has full length
-                 full_link_flows = grid.flow
-            else: # Fallback or if active_link_indices is not well-defined for this grid.flow
-                print(f"Warning: Could not map grid.flow (len {len(grid.flow)}) to grid.l ({grid.l}) using active_link_indices for {grid.chargers}. Saving raw grid.flow.")
-                full_link_flows = grid.flow # Save what we have
-            link_flows_to_save = full_link_flows
-        else: # Fallback if attributes for full mapping are missing
-            link_flows_to_save = grid.flow
         results_data['method'] = 'scipy'
+        
+        # Create a full flow array initialized to zeros
+        full_scipy_flows = np.zeros(grid.l)
+        if hasattr(grid, 'active_link_indices') and grid.active_link_indices is not None and len(grid.active_link_indices) == len(grid.flow):
+            # Populate flows for active links
+            full_scipy_flows[grid.active_link_indices] = grid.flow
+        elif len(grid.flow) == grid.l:
+            # grid.flow is already a full array
+            full_scipy_flows = grid.flow
+        else:
+            # Fallback: This case indicates a potential issue with SciPy flow data structure.
+            # Log a warning and save what's available, possibly resulting in missing flows for some links.
+            print(f"Warning: SciPy flow array (len {len(grid.flow)}) and active_link_indices mismatch or grid.l (len {grid.l}) issue for {grid.chargers}. Some flows may be zero.")
+            # Try to assign flows if grid.flow is shorter but covers initial link_ids
+            # This is a best-effort assignment if active_link_indices is not usable.
+            if len(grid.flow) < grid.l:
+                full_scipy_flows[:len(grid.flow)] = grid.flow
+            # If grid.flow is longer, it's an undefined state, so full_scipy_flows remains mostly zeros.
+
+        for _, edge_row in all_edges.iterrows():
+            link_id = int(edge_row['link_id'])
+            flow_val = 0.0
+            if link_id < len(full_scipy_flows):
+                flow_val = full_scipy_flows[link_id]
+            else:
+                # This should ideally not happen if all_edges corresponds to grid.l and full_scipy_flows is sized to grid.l
+                print(f"Warning: link_id {link_id} out of bounds for SciPy full_scipy_flows (len {len(full_scipy_flows)}). Flow set to 0.")
+
+            link_flows_dict[link_id] = {
+                'start_node_id': int(edge_row['start_node_id']),
+                'end_node_id': int(edge_row['end_node_id']),
+                'flow': float(flow_val)
+            }
+
     else: # Fallback if no flow data is found
         print(f"Warning: No flow data found for grid with chargers {grid.chargers}. Cannot save link flows.")
         results_data['objective_value'] = getattr(grid, 'best_objective_value', getattr(grid, 'travel_time_obj', float('inf')))
-        link_flows_to_save = [] # Empty list or None
         results_data['method'] = 'unknown'
+        for _, edge_row in all_edges.iterrows():
+            link_id = int(edge_row['link_id'])
+            link_flows_dict[link_id] = {
+                'start_node_id': int(edge_row['start_node_id']),
+                'end_node_id': int(edge_row['end_node_id']),
+                'flow': 0.0
+            }
 
-    results_data['link_flows'] = link_flows_to_save.tolist() if isinstance(link_flows_to_save, np.ndarray) else link_flows_to_save
-
-    # Removed file saving logic from here
+    results_data['link_flows'] = link_flows_dict
     return results_data
 
 def save_charger_flow_heatmaps(grid, output_folder, base_filename, use_cvxpy=True, flow_threshold=1.0):

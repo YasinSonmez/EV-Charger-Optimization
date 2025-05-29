@@ -79,12 +79,9 @@ dmypy.json
 .vscode/
 
 # Custom entries
-results/
-model_fit_plots/
-optimization_comparison_summary.png 
+# results/
+# model_fit_plots/
 cache/
-data/cached_results.pkl # Assuming this is a cache of model fitting
-fitter_results.csv # If this is a generated output
 
 # Specific config copies - consider deleting these if not needed
 # or moving to an untracked archive directory

@@ -811,7 +811,8 @@ class Network(RoadNet):
             self.travel_time_obj = prob.value
             
         # Store optimization results
-        self.cvxpy_link_flows = x_total.value
+        self.cvxpy_link_flows = x_total.value if x_total is not None else np.zeros(self.l)
+        self.cvxpy_charger_throughput = x_hat.value if x_hat is not None and x_hat.value is not None else np.zeros(n_s)
         self.cvxpy_link_flows_data = self.cvxpy_link_flows
 
         # Store demand splits for analysis
