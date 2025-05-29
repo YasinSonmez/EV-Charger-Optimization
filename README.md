@@ -54,43 +54,6 @@ This project requires several Python dependencies including optimization librari
     python -c "import cvxpy; print('Available solvers:', cvxpy.installed_solvers())"
     ```
 
-### Manual Solver Installation (if needed)
-
-If you encounter issues with specific solvers not being found by CVXPY even after setting up the environment, you can try installing them manually within the activated `evopt` environment:
-
-```bash
-# Ensure your conda environment is activated
-conda activate evopt
-
-# Install ECOS (often a reliable choice)
-conda install -c conda-forge ecos
-
-# Install other useful solvers (CLARABEL, OSQP, SCS are used by the project)
-pip install clarabel osqp scs
-```
-
-### Troubleshooting Solver Issues
-
-If CVXPY reports a solver (e.g., ECOS) as not installed:
-
-1.  **Confirm the solver is in the correct environment path:**
-    ```bash
-    python -c "import sys; print(sys.path); import ecos; print(ecos.__version__)" 
-    ```
-    (Replace `ecos` with the solver in question if different).
-2.  **Prefer Conda for ECOS:** If ECOS was installed via pip and is problematic, try reinstalling it with Conda:
-    ```bash
-    conda install -c conda-forge ecos
-    ```
-3.  **Check Python and package locations:** Ensure your execution environment matches your package installation environment.
-    ```bash
-    # Check which Python interpreter is being used
-    which python # (or where python on Windows)
-    
-    # Check where packages are installed (within the active Conda env)
-    pip show ecos cvxpy
-    ```
-
 ## Usage
 
 You can run the optimizer with the default configuration:
