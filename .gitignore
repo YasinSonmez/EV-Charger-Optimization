@@ -1,0 +1,94 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+Downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/version info.
+#  Hence CI tools tend to build them unversioned in a pass following the
+#  tag pass, making them dirty.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+.hypothesis/
+
+# Transpiled JavaScript files for JS style FE
+# *.js
+# *.js.map
+
+# Environments
+.env
+.venv
+venv/
+ENV/
+env/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# VS Code
+.vscode/
+
+# Custom entries
+results/
+model_fit_plots/
+optimization_comparison_summary.png 
+cache/
+data/cached_results.pkl # Assuming this is a cache of model fitting
+fitter_results.csv # If this is a generated output
+
+# Specific config copies - consider deleting these if not needed
+# or moving to an untracked archive directory
+# config copy 2.json
+# config copy.json
+# config_exp1.json
+# config_old.json 
