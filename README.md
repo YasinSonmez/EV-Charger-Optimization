@@ -189,7 +189,11 @@ The primary output of an optimization run is a single pickle file named `all_opt
     -   The *value* is another dictionary containing the results for that particular charger combination, with the following keys:
         -   `'charger_combination'`: (list) A list of node IDs representing the chargers in this specific configuration.
         -   `'objective_value'`: (float) The calculated objective function value (e.g., total travel time) for this configuration.
-        -   `'link_flows'`: (list of floats) A list representing the traffic flow on each link in the network for this configuration. The order of flows corresponds to the sorted `link_id`s in `'network_link_connectivity'`.
+        -   `'link_flows'`: (dict) A dictionary where each key is an integer `link_id`.
+            -   The value for each `link_id` is another dictionary with:
+                -   `'start_node_id'`: (integer) The starting node of the link.
+                -   `'end_node_id'`: (integer) The ending node of the link.
+                -   `'flow'`: (float) The traffic flow on this link. For charger self-links (where start\_node\_id == end\_node\_id and the node is a charger), this value represents the total demand serviced by that charger in the CVXPY case.`'network_link_connectivity'`.
         -   `'method'`: (string) Indicates the optimization method used for this result (e.g., 'cvxpy' or 'scipy').
 
 This structure allows for a comprehensive analysis of the optimization process, providing details about the network, the run parameters, and the performance of each evaluated charger configuration. 
