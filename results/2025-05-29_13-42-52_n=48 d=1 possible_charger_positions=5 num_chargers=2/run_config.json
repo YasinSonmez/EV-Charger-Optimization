@@ -1,0 +1,14 @@
+{
+    "coordinates": [38.98211, 38.975, -76.93006, -76.93704],
+    "num_chargers": 2,
+    "possible_charger_positions": [14, 20, 21, 41, 43],
+    "od_demand": {
+        "7,26": [60,120]
+    },
+    "max_iter": 1000,
+    "use_derivatives": false,
+    "single_swap": true,
+    "use_cvxpy": true,
+    "plot_info": false,
+    "calculate_on_all_possible_positions": true
+} 
