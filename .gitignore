@@ -89,3 +89,5 @@ cache/
 # config copy.json
 # config_exp1.json
 # config_old.json 
+
+*/.DS_Store
