@@ -137,55 +137,65 @@ def save_optimization_pickle(grid):
         raw_link_flows = grid.cvxpy_link_flows
         charger_throughputs = getattr(grid, 'cvxpy_charger_throughput', None)
         
+        # Get charger contributions if available
+        charger_contributions = grid.get_charger_contributions() if hasattr(grid, 'get_charger_contributions') else None
+        
         charger_node_to_throughput_map = {}
         if charger_throughputs is not None and grid.chargers is not None and len(grid.chargers) == len(charger_throughputs):
             for i, charger_node_id in enumerate(grid.chargers):
                  charger_node_to_throughput_map[charger_node_id] = charger_throughputs[i]
         elif charger_throughputs is not None:
-            # This case might occur if grid.chargers is None or length mismatch.
-            # For now, we cannot map throughputs to specific charger nodes if so.
             print(f"Warning: Charger throughputs available but cannot map to charger nodes for {grid.chargers}")
 
         for _, edge_row in all_edges.iterrows():
             link_id = int(edge_row['link_id'])
             start_node = int(edge_row['start_node_id'])
             end_node = int(edge_row['end_node_id'])
-            flow_value = 0.0
-
+            
+            # Initialize flow components
+            flow_data = {
+                'start_node_id': start_node,
+                'end_node_id': end_node,
+                'total_flow': 0.0,
+                'non_charging_flow': 0.0,
+                'charging_flows': {}
+            }
+            
             is_charger_self_link = (start_node == end_node and start_node in charger_node_to_throughput_map)
 
             if is_charger_self_link:
-                flow_value = charger_node_to_throughput_map.get(start_node, 0.0)
+                flow_data['total_flow'] = charger_node_to_throughput_map.get(start_node, 0.0)
+                # For charger self-links, all flow is charging flow
+                flow_data['charging_flows'][f'charger_{start_node}'] = flow_data['total_flow']
             elif link_id < len(raw_link_flows): # Regular road link
-                flow_value = raw_link_flows[link_id]
+                flow_data['total_flow'] = float(raw_link_flows[link_id])
+                
+                # Add non-charging flow if available
+                if charger_contributions and 'non_charging' in charger_contributions:
+                    flow_data['non_charging_flow'] = float(charger_contributions['non_charging'][link_id])
+                
+                # Add individual charger contributions if available
+                if charger_contributions:
+                    for charger_key, flows in charger_contributions.items():
+                        if charger_key != 'non_charging':
+                            flow_data['charging_flows'][charger_key] = float(flows[link_id])
             
-            link_flows_dict[link_id] = {
-                'start_node_id': start_node,
-                'end_node_id': end_node,
-                'flow': float(flow_value)
-            }
+            link_flows_dict[link_id] = flow_data
 
-    elif hasattr(grid, 'flow') and grid.flow is not None: # SciPy case
+    elif hasattr(grid, 'flow') and grid.flow is not None:
         results_data['objective_value'] = grid.travel_time_obj
         results_data['method'] = 'scipy'
         
         # Create a full flow array initialized to zeros
         full_scipy_flows = np.zeros(grid.l)
         if hasattr(grid, 'active_link_indices') and grid.active_link_indices is not None and len(grid.active_link_indices) == len(grid.flow):
-            # Populate flows for active links
             full_scipy_flows[grid.active_link_indices] = grid.flow
         elif len(grid.flow) == grid.l:
-            # grid.flow is already a full array
             full_scipy_flows = grid.flow
         else:
-            # Fallback: This case indicates a potential issue with SciPy flow data structure.
-            # Log a warning and save what's available, possibly resulting in missing flows for some links.
             print(f"Warning: SciPy flow array (len {len(grid.flow)}) and active_link_indices mismatch or grid.l (len {grid.l}) issue for {grid.chargers}. Some flows may be zero.")
-            # Try to assign flows if grid.flow is shorter but covers initial link_ids
-            # This is a best-effort assignment if active_link_indices is not usable.
             if len(grid.flow) < grid.l:
                 full_scipy_flows[:len(grid.flow)] = grid.flow
-            # If grid.flow is longer, it's an undefined state, so full_scipy_flows remains mostly zeros.
 
         for _, edge_row in all_edges.iterrows():
             link_id = int(edge_row['link_id'])
@@ -193,13 +203,14 @@ def save_optimization_pickle(grid):
             if link_id < len(full_scipy_flows):
                 flow_val = full_scipy_flows[link_id]
             else:
-                # This should ideally not happen if all_edges corresponds to grid.l and full_scipy_flows is sized to grid.l
                 print(f"Warning: link_id {link_id} out of bounds for SciPy full_scipy_flows (len {len(full_scipy_flows)}). Flow set to 0.")
 
             link_flows_dict[link_id] = {
                 'start_node_id': int(edge_row['start_node_id']),
                 'end_node_id': int(edge_row['end_node_id']),
-                'flow': float(flow_val)
+                'total_flow': float(flow_val),
+                'non_charging_flow': float(flow_val),  # In SciPy case, we can't separate flows
+                'charging_flows': {}  # Empty dict for SciPy case as we don't have this information
             }
 
     else: # Fallback if no flow data is found
@@ -211,7 +222,9 @@ def save_optimization_pickle(grid):
             link_flows_dict[link_id] = {
                 'start_node_id': int(edge_row['start_node_id']),
                 'end_node_id': int(edge_row['end_node_id']),
-                'flow': 0.0
+                'total_flow': 0.0,
+                'non_charging_flow': 0.0,
+                'charging_flows': {}
             }
 
     results_data['link_flows'] = link_flows_dict
