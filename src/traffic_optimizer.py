@@ -1002,22 +1002,19 @@ class Network(RoadNet):
         # Extract individual charger contributions (from t=2)
         for c in range(len(self.chargers)):
             charger_flows = np.zeros(n_links)
-            
+            charger_node_id = self.chargers[c]
             for i in range(len(self.od_demand)):
                 # Add flow to the charger
                 if (i, 2, c) in self.flow_components["x_plus"]:
                     flow_value = self.flow_components["x_plus"][i, 2, c].value
                     if flow_value is not None:
                         charger_flows += flow_value
-                
                 # Add flow from the charger
                 if (i, 2, c) in self.flow_components["x_minus"]:
                     flow_value = self.flow_components["x_minus"][i, 2, c].value
                     if flow_value is not None:
                         charger_flows += flow_value
-            
-            charger_contributions[f"charger_{c}"] = charger_flows
-        
+            charger_contributions[charger_node_id] = charger_flows
         # Store the results
         self.charger_flow_contributions = charger_contributions
         

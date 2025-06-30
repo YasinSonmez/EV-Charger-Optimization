@@ -1,6 +1,6 @@
 EV Charger Optimization Results
 ===============================
-Time: 2025-05-29 14:00:27
+Time: 2025-06-30 14:06:53
 Coordinates: [38.98211, 38.975, -76.93006, -76.93704]
 Number of chargers: 2
 Possible positions: [14, 20, 21, 41, 43]
@@ -22,14 +22,14 @@ Computation Statistics:
 ----------------------
 Greedy algorithm result: 219540.2486
 Greedy algorithm chargers: [14 20]
-Greedy algorithm computation time: 14.43 seconds
+Greedy algorithm computation time: 14.89 seconds
 
 Full optimization minimum result: 221767.1370
 Full optimization mean result: 227885.7635 ± 5336.2019
 Full optimization best chargers: [14 21]
-Full optimization computation time: 9.96 seconds
+Full optimization computation time: 9.90 seconds
 
-Total computation time: 24.39 seconds
+Total computation time: 24.80 seconds
 
 Braess Paradoxes:
 ----------------

@@ -166,7 +166,7 @@ def save_optimization_pickle(grid):
             if is_charger_self_link:
                 flow_data['total_flow'] = charger_node_to_throughput_map.get(start_node, 0.0)
                 # For charger self-links, all flow is charging flow
-                flow_data['charging_flows'][f'charger_{start_node}'] = flow_data['total_flow']
+                flow_data['charging_flows'][start_node] = flow_data['total_flow']
             elif link_id < len(raw_link_flows): # Regular road link
                 flow_data['total_flow'] = float(raw_link_flows[link_id])
                 
@@ -267,8 +267,8 @@ def save_charger_flow_heatmaps(grid, output_folder, base_filename, use_cvxpy=Tru
     total_flows = grid.cvxpy_link_flows
     all_flows = [total_flows]
     all_flows.append(contributions["non_charging"])
-    for c in range(len(grid.chargers)):
-        all_flows.append(contributions[f"charger_{c}"])
+    for charger_id in grid.chargers:
+        all_flows.append(contributions[charger_id])
     
     global_max_flow = max([flow.max() for flow in all_flows])
     global_min_flow = 0  # Usually 0 is the minimum flow
@@ -287,12 +287,11 @@ def save_charger_flow_heatmaps(grid, output_folder, base_filename, use_cvxpy=Tru
                           global_min_flow, global_max_flow, flow_threshold=flow_threshold)
     
     # Plot each charger's contribution
-    for c in range(len(grid.chargers)):
+    for charger_id in grid.chargers:
         ax_idx += 1
         if ax_idx < len(axes_flat):
-            charger_id = grid.chargers[c]
             title = f"Charger {charger_id} Flow"
-            _plot_flow_on_axis(grid, axes_flat[ax_idx], title, contributions[f"charger_{c}"], 
+            _plot_flow_on_axis(grid, axes_flat[ax_idx], title, contributions[charger_id], 
                               global_min_flow, global_max_flow, flow_threshold=flow_threshold)
     
     # Add a note about the threshold in the figure title
@@ -594,25 +593,6 @@ def save_all_flow_heatmaps(grids, config, results_folder, time_history=None):
         print(f"Failed to save global optimization results to {global_pickle_path}: {e}")
 
     print(f"All flow heatmaps saved to {results_folder}")
-
-def find_latest_results_dir():
-    """Find the latest results directory matching the expected pattern"""
-    # Pattern to match: "YYYY-MM-DD_HH-MM-SS_n=xx d=yy possible_charger_positions=zz num_chargers=ww"
-    pattern = r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_n=\d+ d=\d+ possible_charger_positions=\d+ num_chargers=\d+"
-    
-    # Fix path due to src/ directory structure differences
-    result_dirs = glob.glob(os.path.join("results", "*"))
-    matching_dirs = [d for d in result_dirs if re.search(pattern, d)]
-    
-    if matching_dirs:
-        # Get the latest matching directory
-        return max(matching_dirs, key=os.path.getmtime)
-    else:
-        print("ERROR: Could not find a results directory matching the expected pattern.")
-        print("Available directories:")
-        for d in result_dirs:
-            print(f"  - {d}")
-        return None
 
 def outer_optimization(coordinates, num_chargers=None, possible_charger_positions=None, 
                        calculate_on_all_possible_positions=False, plot_info=False, use_derivatives=True, 
