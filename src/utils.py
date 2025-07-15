@@ -9,6 +9,7 @@ from datetime import datetime
 from itertools import combinations
 from math import comb
 import shutil # For copying the file
+import json # Added for loading config file
 
 from src.traffic_optimizer import Network
 
@@ -309,7 +310,25 @@ def save_charger_flow_heatmaps(grid, output_folder, base_filename, use_cvxpy=Tru
     return True
 
 def _plot_flow_on_axis(grid, ax, title, flows, min_flow=None, max_flow=None, flow_threshold=1.0):
-    """Helper function to plot a flow heatmap on a specific axis"""
+    """Helper function to plot a flow heatmap on a specific axis
+    
+    Parameters:
+    -----------
+    grid : Network
+        The network object containing nodes and edges
+    ax : matplotlib.axes.Axes
+        The axis to plot on
+    title : str
+        The title for the plot
+    flows : numpy.ndarray
+        Array of flow values for each link
+    min_flow : float, optional
+        Minimum flow value for colormap normalization. If None, uses min of flows.
+    max_flow : float, optional
+        Maximum flow value for colormap normalization. If None, uses max of flows.
+    flow_threshold : float, optional
+        Flows below this threshold will be shown with high transparency and dashed lines
+    """
     from matplotlib.cm import ScalarMappable
     import matplotlib.colors as mcolors
     import geopandas as gpd
@@ -409,6 +428,10 @@ def _plot_flow_on_axis(grid, ax, title, flows, min_flow=None, max_flow=None, flo
     sm.set_array(gdf["flow"])
     cbar = plt.colorbar(sm, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
     cbar.set_label("Link Flow", fontsize=10)
+    
+    # Add a note about the threshold
+    ax.text(0.01, 0.01, f"Links with flow < {flow_threshold} shown as dashed lines",
+            transform=ax.transAxes, fontsize=8, ha='left', va='bottom')
 
 def save_all_flow_heatmaps(grids, config, results_folder, time_history=None):
     """Generate and save flow heatmaps for all configurations in the results folder"""
@@ -544,15 +567,18 @@ def save_all_flow_heatmaps(grids, config, results_folder, time_history=None):
     for i, grid in enumerate(grids):
         is_best = (i == best_idx)
         marker = "BEST_" if is_best else ""
-        filename = f"{marker}config_{i+1}_chargers_{grid.chargers}_tt_{grid.travel_time_obj:.4f}"
-        filepath = os.path.join(results_folder, filename + ".png")
-        # pickle_filepath = os.path.join(results_folder, filename + ".pkl") # Removed individual pickle path
+        config_name = f"{marker}config_{i+1}_chargers_{grid.chargers}_tt_{grid.travel_time_obj:.4f}"
         
+        # Create configuration-specific directory
+        config_dir = os.path.join(results_folder, config_name)
+        os.makedirs(config_dir, exist_ok=True)
+        
+        # Save the standard flow heatmap in the config directory
+        filepath = os.path.join(config_dir, "flow_heatmap.png")
         title = f"Charger Placement: {grid.chargers}, Travel Time: {grid.travel_time_obj:.4f}"
         if is_best:
             title = f"BEST {title}"
         
-        # Save the standard flow heatmap
         success = save_flow_heatmap(
             grid=grid,
             output_path=filepath,
@@ -562,16 +588,15 @@ def save_all_flow_heatmaps(grids, config, results_folder, time_history=None):
         
         # Get the optimization results data for the current grid
         current_grid_data = save_optimization_pickle(grid)
-        # Use a frozenset of a sorted tuple of chargers as the key for the dictionary
         charger_key = frozenset(sorted(grid.chargers)) if grid.chargers is not None else frozenset()
         all_results_data['configurations'][charger_key] = current_grid_data
 
-        # For CVXPY optimized grids, also save the charger contribution plots
+        # For CVXPY optimized grids, also save the charger contribution plots in the config directory
         if config['use_cvxpy'] and hasattr(grid, 'get_charger_contributions'):
             charger_success = save_charger_flow_heatmaps(
                 grid=grid,
-                output_folder=results_folder,
-                base_filename=filename,
+                output_folder=config_dir,
+                base_filename="charger_flows",
                 use_cvxpy=True,
                 flow_threshold=1.0
             )
@@ -593,16 +618,20 @@ def save_all_flow_heatmaps(grids, config, results_folder, time_history=None):
         print(f"Failed to save global optimization results to {global_pickle_path}: {e}")
 
     print(f"All flow heatmaps saved to {results_folder}")
+    return True
 
 def outer_optimization(coordinates, num_chargers=None, possible_charger_positions=None, 
                        calculate_on_all_possible_positions=False, plot_info=False, use_derivatives=True, 
                        max_iter=1000, parameter_fit_results=None, single_swap=False, use_cvxpy=False, od_demand=None,
                        config_filepath=None):
-    """Run the outer optimization process to find optimal charger placements"""
-    # Parameters d, od_pairs, demands removed as od_demand is the primary source.
+    """
+    Outer optimization to find the best charger locations.
+    Includes configurable route analysis with top-k routes and parameter sweep.
+    """
     time_history = []
     iteration_count = 0
     grids = []  # array of grids with different chargers
+    configurations = {}  # Dictionary to store results for each configuration
 
     chargers_set = set()
     best_charger = None
@@ -689,14 +718,21 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
                 best_charger = chargers_i
                 best_grid = grid_i
 
-    # Create the results directory
+    # Create the results directory with timestamp
     filename = 'n=' + str(grid_i.n) + ' d=' + str(grids[-1].d) + ' possible_charger_positions=' + str(len(possible_charger_positions)) + ' num_chargers=' + str(num_chargers)
     today = datetime.now()
     foldername = "results/" + today.strftime('%Y-%m-%d_%H-%M-%S_') + filename
     filename = foldername + '/' + filename
     os.makedirs(foldername, exist_ok=True)
+
+    # Calculate phase boundaries for plotting
+    possible_charger_positions_count = len(possible_charger_positions)
+    phases = calculate_phase_boundaries(possible_charger_positions_count, num_chargers)
     
-    # Copy the config file to the results folder
+    # Generate travel time objectives plot
+    plot_travel_time_objectives(grids, time_history, phases, filename, single_swap)
+    
+    # Copy the config file if provided
     if config_filepath and os.path.exists(config_filepath):
         try:
             shutil.copy(config_filepath, os.path.join(foldername, "run_config.json"))
@@ -706,17 +742,8 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
     else:
         if config_filepath:
             print(f"Warning: Config file path provided ({config_filepath}) but file not found. Not copied.")
-        # else: # No config_filepath provided, so nothing to copy. This is fine if called programmatically without one.
-            # print("No config file path provided to outer_optimization. Not copied.")
 
-    # Calculate phase boundaries once
-    phases = calculate_phase_boundaries(len(possible_charger_positions), num_chargers)
-
-    # Generate and save plots
-    plot_travel_time_objectives(grids, time_history, phases, filename=filename, single_swap=single_swap)
-    print_stats(grids, time_history, phases) # Pass phases dict
-    
-    # Create config dictionary for saving and visualization, from outer_optimization parameters
+    # Create config dictionary for saving and visualization
     run_config_params = {
         'coordinates': coordinates,
         'num_chargers': num_chargers,
@@ -727,8 +754,7 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
         'use_cvxpy': use_cvxpy,
         'max_iter': max_iter,
         'plot_info': plot_info,
-        'od_demand': od_demand # od_demand is already in the correct format here
-        # config_filepath is also available if needed: 'config_filepath': config_filepath
+        'od_demand': od_demand
     }
 
     # Generate flow heatmaps and save all results
@@ -740,6 +766,94 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
     print(f"Best charger configuration: {best_grid.chargers}")
     print(f"Best travel time objective: {best_grid.travel_time_obj:.4f}")
     print(f"All results saved to: {foldername}")
+
+    # Load route analysis configuration
+    route_analysis_config = {}
+    if config_filepath and os.path.exists(config_filepath):
+        with open(config_filepath, 'r') as f:
+            config_data = json.load(f)
+            route_analysis_config = config_data.get('route_analysis', {})
+
+    # Store results for each configuration
+    if route_analysis_config.get('analyze_top_k_routes', True):
+        print("\nAnalyzing route reconstruction for each configuration...")
+        configurations = {}
+        for i, grid in enumerate(grids):
+            # Get optimization results including properly structured link flows
+            grid_results = save_optimization_pickle(grid)
+            chargers_tuple = tuple(sorted(grid.chargers))
+            
+            # Determine if this is the best configuration
+            is_best = (grid.travel_time_obj == best_grid.travel_time_obj)
+            marker = "BEST_" if is_best else ""
+            config_name = f"{marker}config_{i+1}_chargers_{grid.chargers}_tt_{grid.travel_time_obj:.4f}"
+            
+            # Use the existing configuration directory
+            config_dir = os.path.join(foldername, config_name)
+            recon_dir = os.path.join(config_dir, "reconstruction")
+            os.makedirs(recon_dir, exist_ok=True)
+            
+            reconstruction_results = None
+            param_sweep_results = None
+            
+            # Run top-k route analysis if enabled
+            k_values = route_analysis_config.get('k_values', [1, 2, 4, 8, 16, 32, 64])
+            print(f"\nAnalyzing top-{max(k_values)} routes for configuration {i+1}/{len(grids)}...")
+            reconstruction_results = analyze_route_reconstruction(
+                network=grid,
+                link_flows_dict=grid_results['link_flows'],
+                k_values=k_values,
+                save_dir=recon_dir
+            )
+                
+            # Run parameter sweep analysis if both flags are enabled
+            if route_analysis_config.get('run_parameter_sweep', True):
+                print(f"\nRunning parameter sweep analysis for configuration {i+1}/{len(grids)}...")
+                param_sweep_dir = os.path.join(recon_dir, "parameter_sweep")
+                os.makedirs(param_sweep_dir, exist_ok=True)
+                
+                # Get parameter sweep configuration
+                param_sweep_config = route_analysis_config.get('parameter_sweep', {})
+                paths_per_od_values = param_sweep_config.get('paths_per_od_values', [5, 10, 15, 20, 25, 30])
+                paths_per_oc_cd_values = param_sweep_config.get('paths_per_oc_cd_values', [3, 6, 9, 12, 15])
+                
+                param_sweep_results = analyze_path_parameters(
+                    network=grid,
+                    link_flows_dict=grid_results['link_flows'],
+                    paths_per_od_values=paths_per_od_values,
+                    paths_per_oc_cd_values=paths_per_oc_cd_values,
+                    save_dir=param_sweep_dir
+                )
+            
+            # Store all results
+            config_results = {
+                'charger_combination': chargers_tuple,
+                'objective_value': float(grid.travel_time_obj),
+                'link_flows': grid_results['link_flows'],
+                'method': grid_results.get('method', 'unknown')
+            }
+            
+            # Only include analysis results if they were generated
+            if reconstruction_results is not None:
+                config_results['reconstruction_results'] = reconstruction_results
+            if param_sweep_results is not None:
+                config_results['param_sweep_results'] = param_sweep_results
+                
+            configurations[chargers_tuple] = config_results
+
+        # Add route analysis config to run configuration
+        run_config_params['route_analysis'] = route_analysis_config
+
+        # Save all results to pickle file
+        results_dict = {
+            'run_configuration': run_config_params,
+            'configurations': configurations,
+            'time_history': time_history,
+            'iteration_count': iteration_count
+        }
+        
+        with open(os.path.join(foldername, 'all_optimization_results.pkl'), 'wb') as f:
+            pickle.dump(results_dict, f)
 
     return grids, time_history
 
@@ -765,6 +879,7 @@ def plot_travel_time_objectives(grids, time_history, phases, filename='1', singl
     """Plot travel time objectives and optimization progress as a static image"""
     travel_times = [grid.travel_time_obj for grid in grids]
 
+    # Find indices for different phases
     greedy_idx = np.argmin(travel_times[0:phases['Greedy']+1])
     greedy_result = grids[greedy_idx].travel_time_obj
 
@@ -786,8 +901,11 @@ def plot_travel_time_objectives(grids, time_history, phases, filename='1', singl
     ax.plot(range(1, len(time_history)+1), time_history, marker='o')
     ax.set_xlabel('Charger Combinations')
     ax.set_ylabel('Cumulative Computation Time (s)')
+    
+    # Add vertical lines for phase boundaries
     for i, (label, vertical_line_pos_i) in enumerate(phases.items()):
         ax.axvline(x=vertical_line_pos_i+1, label=label, linestyle='--', c=colors[i])
+    
     ax.legend(loc='upper left')
     ax.set_xticks(range(1, len(charger_names)+1))
     ax.set_xticklabels(charger_names, rotation=45, ha='right')
@@ -796,29 +914,28 @@ def plot_travel_time_objectives(grids, time_history, phases, filename='1', singl
     # Plot travel time objectives
     ax = axes[1]
     for j, grid_j in enumerate(grids):
+        ax.scatter(j + 1, grid_j.travel_time_obj, c='tab:blue', s=50)
+        
         if j == greedy_idx:
             ax.scatter(j + 1, greedy_result, marker='D', s=100, c='tab:gray', label='Greedy Min')
         if single_swap and j == single_swap_idx:
             ax.scatter(j + 1, single_swap_result, marker='s', s=100, c='tab:green', label='Greedy + Single Swap Min')
         if j == exhaustive_idx:
             ax.scatter(j + 1, exhaustive_result, marker='*', s=200, c='tab:red', label='Exhaustive Min')
-        else:
-            ax.scatter(j + 1, grid_j.travel_time_obj)
-    
-    ax.set_xlabel('Charger Combinations')
-    ax.set_ylabel('Travel Time Objective')
-    ax.grid(True)
 
+    # Add vertical lines for phase boundaries
     for i, (label, vertical_line_pos_i) in enumerate(phases.items()):
         ax.axvline(x=vertical_line_pos_i+1, label=label, linestyle='--', c=colors[i])
-    ax.set_xticks(range(1, len(charger_names)+1))
-    ax.set_xticklabels(charger_names, rotation=45, ha='right', fontsize=14)
-    ax.tick_params(axis='y', labelsize=13)
-    ax.legend(loc='upper left')
 
-    # Adjust layout and save as PNG
+    ax.set_xlabel('Charger Combinations')
+    ax.set_ylabel('Travel Time Objective')
+    ax.legend(loc='upper right')
+    ax.set_xticks(range(1, len(charger_names)+1))
+    ax.set_xticklabels(charger_names, rotation=45, ha='right')
+    ax.grid(True)
+
     plt.tight_layout()
-    plt.savefig(filename + '.png', dpi=300)
+    plt.savefig(filename + '.png', dpi=300, bbox_inches='tight')
     plt.close()
 
 
@@ -927,3 +1044,291 @@ def print_stats(grids, time_history, phases):
 
     # Braess paradoxes are found using all grids, so this remains unchanged.
     paradoxes = find_braess_paradoxes(grids)
+
+def analyze_route_reconstruction(network, link_flows_dict, k_values=[1, 2, 4, 8, 16, 32, 64], save_dir=None):
+    """
+    Analyze route reconstruction for a given network configuration.
+    Returns reconstruction metrics and route information for different k values.
+    
+    Args:
+        network: Network object with the current configuration
+        link_flows_dict: Dictionary of link flows from optimization
+        k_values: List of k values to analyze
+        save_dir: Directory to save visualizations (optional)
+    
+    Returns:
+        dict: Dictionary containing reconstruction metrics and routes
+    """
+    print("\nAnalyzing route reconstruction...")
+    
+    # Get original flows from link_flows_dict
+    original_flows = np.zeros(len(link_flows_dict))
+    for link_id, link_data in link_flows_dict.items():
+        original_flows[link_id] = link_data['total_flow']
+    
+    # Store metrics for each k value
+    k_metrics = {}
+    
+    # Get the maximum k value for full route analysis
+    max_k = max(k_values)
+    
+    # Reconstruct flows with maximum k to get all route information
+    reconstruction_result = network.reconstruct_route_flows(
+        link_flows_dict,
+        paths_per_od=max_k,
+        paths_per_oc_cd=max_k,
+        use_od_constraints=True,
+        use_charger_constraints=True
+    )
+    
+    if reconstruction_result is not None:
+        # Convert reconstruction result to flat list of routes with flows
+        routes_with_flows = []
+        route_id = 0
+        
+        for od_pair, flows in reconstruction_result.items():
+            # Add non-charging routes
+            for route_data in flows['non_charging']:
+                if route_data['flow'] > 1e-6:  # Only include routes with non-zero flow
+                    route_info = {
+                        'route_id': route_id,
+                        'flow': float(route_data['flow']),
+                        'links': route_data['path'],
+                        'type': 'non_charging',
+                        'origin': od_pair[0],
+                        'destination': od_pair[1]
+                    }
+                    routes_with_flows.append(route_info)
+                    route_id += 1
+            
+            # Add charging routes
+            for charger, charger_routes in flows['charging'].items():
+                for route_data in charger_routes:
+                    if route_data['flow'] > 1e-6:  # Only include routes with non-zero flow
+                        route_info = {
+                            'route_id': route_id,
+                            'flow': float(route_data['flow']),
+                            'links': route_data['path'],
+                            'type': 'charging',
+                            'origin': od_pair[0],
+                            'destination': od_pair[1],
+                            'charger': charger
+                        }
+                        routes_with_flows.append(route_info)
+                        route_id += 1
+        
+        if routes_with_flows:  # Only proceed if we have valid routes
+            # Sort routes by flow in descending order
+            sorted_routes = sorted(routes_with_flows, key=lambda x: x['flow'], reverse=True)
+            total_flow = sum(route['flow'] for route in sorted_routes)
+            
+            if total_flow > 0:  # Only update metrics if we have valid flow
+                # Calculate and store top-k metrics
+                for k in k_values:
+                    k = min(k, len(sorted_routes))  # Don't exceed available routes
+                    top_k_routes = sorted_routes[:k]
+                    k_flow = sum(route['flow'] for route in top_k_routes)
+                    
+                    # Calculate reconstructed flows for this k
+                    flows = np.zeros(len(link_flows_dict))
+                    for route in top_k_routes:
+                        path = route['links']
+                        flow = route['flow']
+                        for i in range(len(path) - 1):
+                            start_node = path[i]
+                            end_node = path[i + 1]
+                            for link_id, link_data in link_flows_dict.items():
+                                if link_data['start_node_id'] == start_node and link_data['end_node_id'] == end_node:
+                                    flows[link_id] += flow
+                                    break
+                    
+                    # Calculate error metrics
+                    flow_difference = flows - original_flows
+                    k_metrics[k] = {
+                        'coverage': float(k_flow / total_flow * 100),
+                        'mae': float(np.mean(np.abs(flow_difference))),
+                        'rmse': float(np.sqrt(np.mean(np.square(flow_difference)))),
+                        'max_diff': float(np.max(np.abs(flow_difference))),
+                        'correlation': float(np.corrcoef(original_flows, flows)[0, 1]),
+                        'routes': [
+                            {
+                                'route_id': route['route_id'],
+                                'flow': float(route['flow']),
+                                'links': route['links'],
+                                'type': route['type'],
+                                'origin': route['origin'],
+                                'destination': route['destination'],
+                                'charger': route.get('charger')  # Only included for charging routes
+                            }
+                            for route in top_k_routes
+                        ]
+                    }
+    
+    # Create visualizations if save_dir is provided and we have results
+    if save_dir and k_metrics:
+        print("\nGenerating visualizations...")
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Create metrics plot
+        fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+        axes = axes.flatten()
+        
+        metrics = ['coverage', 'mae', 'rmse', 'max_diff', 'correlation']
+        titles = ['Flow Coverage (%)', 'Mean Absolute Error', 'Root Mean Square Error', 
+                 'Maximum Absolute Difference', 'Correlation']
+        
+        for i, (metric, title) in enumerate(zip(metrics, titles)):
+            ax = axes[i]
+            y = [k_metrics[k][metric] for k in k_values if k in k_metrics]
+            k_vals = [k for k in k_values if k in k_metrics]
+            if k_vals:  # Only plot if we have data
+                ax.plot(k_vals, y, 'o-', linewidth=2)
+                ax.set_xlabel('Number of Routes (k)')
+                ax.set_ylabel(title)
+                ax.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'k_routes_analysis.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # Create flow visualizations in a single figure
+        n_plots = len(k_metrics) + 1  # +1 for original flows
+        n_cols = 4  # We want 4 columns
+        n_rows = (n_plots + n_cols - 1) // n_cols
+        
+        plt.ioff()  # Turn off interactive mode
+        fig = plt.figure(figsize=(20, 5*n_rows))
+        
+        # Plot original flows
+        ax = plt.subplot(n_rows, n_cols, 1)
+        network.cvxpy_link_flows = original_flows
+        _plot_flow_on_axis(network, ax, 'Original Flows', original_flows)
+        
+        # Plot flows for each k value
+        for idx, (k, metrics) in enumerate(sorted(k_metrics.items()), start=2):
+            ax = plt.subplot(n_rows, n_cols, idx)
+            # Calculate reconstructed flows
+            flows = np.zeros(len(link_flows_dict))
+            for route in metrics['routes']:
+                path = route['links']
+                flow = route['flow']
+                for i in range(len(path) - 1):
+                    start_node = path[i]
+                    end_node = path[i + 1]
+                    for link_id, link_data in link_flows_dict.items():
+                        if link_data['start_node_id'] == start_node and link_data['end_node_id'] == end_node:
+                            flows[link_id] += flow
+                            break
+            network.cvxpy_link_flows = flows
+            _plot_flow_on_axis(network, ax, 
+                             f'k={k}\nCoverage={metrics["coverage"]:.1f}%\nMAE={metrics["mae"]:.3f}', 
+                             flows)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'flow_reconstructions.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+    return {'k_metrics': k_metrics}
+
+def analyze_path_parameters(network, link_flows_dict, 
+                          paths_per_od_values=[5, 10, 15, 20, 25, 30],
+                          paths_per_oc_cd_values=[3, 6, 9, 12, 15],
+                          save_dir=None):
+    """
+    Analyze the impact of different path parameter combinations on reconstruction accuracy.
+    
+    Args:
+        network: Network object with the current configuration
+        link_flows_dict: Dictionary of link flows from optimization
+        paths_per_od_values: List of values to test for paths_per_od
+        paths_per_oc_cd_values: List of values to test for paths_per_oc_cd
+        save_dir: Directory to save visualizations (optional)
+    """
+    print("\nAnalyzing path parameter combinations...")
+    
+    # Store results for each combination
+    results = {}
+    original_flows = np.array([data['total_flow'] for data in link_flows_dict.values()])
+    
+    for paths_per_oc_cd in paths_per_oc_cd_values:
+        results[paths_per_oc_cd] = {
+            'mae': [],
+            'rmse': [],
+            'max_diff': [],
+            'correlation': []
+        }
+        
+        for paths_per_od in paths_per_od_values:
+            print(f"\nTesting paths_per_od={paths_per_od}, paths_per_oc_cd={paths_per_oc_cd}")
+            
+            # Get reconstruction result for this parameter combination
+            reconstruction_result = network.reconstruct_route_flows(
+                link_flows_dict,
+                paths_per_od=paths_per_od,
+                paths_per_oc_cd=paths_per_oc_cd,
+                use_od_constraints=True,
+                use_charger_constraints=True
+            )
+            
+            # Convert to format expected by analysis
+            all_routes = []
+            for od_pair, flows in reconstruction_result.items():
+                # Add non-charging routes
+                for route_data in flows['non_charging']:
+                    all_routes.append((route_data['path'], route_data['flow']))
+                
+                # Add charging routes
+                for charger_routes in flows['charging'].values():
+                    for route_data in charger_routes:
+                        all_routes.append((route_data['path'], route_data['flow']))
+            
+            # Calculate reconstructed flows
+            flows = np.zeros(len(link_flows_dict))
+            for route_data in all_routes:
+                route = route_data[0]  # path
+                flow = route_data[1]   # flow
+                for i in range(len(route) - 1):
+                    start_node = route[i]
+                    end_node = route[i + 1]
+                    for link_id, link_data in link_flows_dict.items():
+                        if link_data['start_node_id'] == start_node and link_data['end_node_id'] == end_node:
+                            flows[link_id] += flow
+                            break
+            
+            # Calculate metrics
+            flow_difference = flows - original_flows
+            results[paths_per_oc_cd]['mae'].append(float(np.mean(np.abs(flow_difference))))
+            results[paths_per_oc_cd]['rmse'].append(float(np.sqrt(np.mean(np.square(flow_difference)))))
+            results[paths_per_oc_cd]['max_diff'].append(float(np.max(np.abs(flow_difference))))
+            results[paths_per_oc_cd]['correlation'].append(float(np.corrcoef(original_flows, flows)[0, 1]))
+    
+    if save_dir:
+        print("\nGenerating visualizations...")
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Create subplots for each metric
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        axes = axes.flatten()
+        
+        metrics = ['mae', 'rmse', 'max_diff', 'correlation']
+        titles = ['MAE vs Paths per OD', 'RMSE vs Paths per OD', 
+                 'MAX_DIFF vs Paths per OD', 'CORRELATION vs Paths per OD']
+        
+        for i, (metric, title) in enumerate(zip(metrics, titles)):
+            ax = axes[i]
+            
+            for paths_per_oc_cd in paths_per_oc_cd_values:
+                ax.plot(paths_per_od_values, results[paths_per_oc_cd][metric], 
+                       'o-', label=f'paths_per_oc_cd={paths_per_oc_cd}')
+            
+            ax.set_xlabel('Paths per OD')
+            ax.set_ylabel(metric.upper())
+            ax.set_title(title)
+            ax.grid(True)
+            ax.legend()
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, 'path_parameter_analysis.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    return results

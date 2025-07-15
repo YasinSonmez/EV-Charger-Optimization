@@ -85,7 +85,16 @@ The configuration is specified in a JSON file with the following structure:
     "single_swap": true,
     "use_cvxpy": true,
     "plot_info": false,
-    "calculate_on_all_possible_positions": true
+    "calculate_on_all_possible_positions": true,
+    "route_analysis": {
+        "analyze_top_k_routes": true,        // Enable/disable top-k route analysis
+        "k_values": [1, 2, 4, 8, 16, 32, 64], // Values of k to analyze
+        "run_parameter_sweep": true,         // Enable/disable parameter sweep (requires analyze_top_k_routes=true)
+        "parameter_sweep": {
+            "paths_per_od_values": [5, 10, 15, 20, 25, 30],      // Values to test for paths_per_od
+            "paths_per_oc_cd_values": [3, 6, 9, 12, 15]          // Values to test for paths_per_oc_cd
+        }
+    }
 }
 ```
 
@@ -103,6 +112,7 @@ The configuration is specified in a JSON file with the following structure:
 | `use_cvxpy` | Use CVXPY solver | true |
 | `plot_info` | Plot detailed information | false |
 | `calculate_on_all_possible_positions` | Calculate all possible combinations | true |
+| `route_analysis` | Configuration for route flow analysis | See below |
 
 ## API Usage
 
@@ -193,12 +203,30 @@ The primary output of an optimization run is a single pickle file named `all_opt
             -   The value for each `link_id` is another dictionary with:
                 -   `'start_node_id'`: (integer) The starting node of the link.
                 -   `'end_node_id'`: (integer) The ending node of the link.
-                -   `'total_flow'`: (float) The total traffic flow on this link.
-                -   `'non_charging_flow'`: (float) The portion of flow that does not involve charging (only available in CVXPY case).
-                -   `'charging_flows'`: (dict) A dictionary containing the flow contributions from each charger:
-                    -   For regular links: Keys are `'charger_X'` where X is the charger node ID, values are the flow contribution from that charger.
-                    -   For charger self-links (where start_node_id == end_node_id and the node is a charger): Contains a single entry with the total demand serviced by that charger.
-                Note: In the SciPy case, only `total_flow` is available, and `non_charging_flow` equals `total_flow` since the separation is not possible.
+                -   `'flow'`: (float) The traffic flow on this link.
+        -   `'reconstruction_results'`: (dict) Route reconstruction analysis:
+            -   `'k_metrics'`: (dict) Performance metrics for different k values (k=[1,2,4,8,16,32,64]):
+                -   `'coverage'`: (float) Percentage of total flow covered by top-k routes
+                -   `'mae'`: (float) Mean Absolute Error between original and reconstructed flows
+                -   `'rmse'`: (float) Root Mean Square Error
+                -   `'max_diff'`: (float) Maximum Absolute Difference
+                -   `'correlation'`: (float) Correlation coefficient with original flows
+                -   `'routes'`: (list) Top-k routes sorted by flow volume, each containing:
+                    -   `'route_id'`: (integer) Unique identifier for the route
+                    -   `'flow'`: (float) Flow volume on this route
+                    -   `'links'`: (list) Sequence of link IDs in the route
+                    -   `'type'`: (string) Route type ('non_charging' or 'charging')
+                    -   `'origin'`: (integer) Starting node ID
+                    -   `'destination'`: (integer) Ending node ID
+                    -   `'charger'`: (integer, optional) Charger node ID for charging routes
+        -   `'param_sweep_results'`: (dict) Parameter sensitivity analysis:
+            -   `'paths_per_od'`: (list) Values tested [5, 10, 15, 20, 25, 30]
+            -   `'paths_per_oc_cd'`: (list) Values tested [3, 6, 9, 12, 15]
+            -   `'metrics'`: (dict) Performance metrics for each parameter combination:
+                -   `'mae'`: Mean Absolute Error
+                -   `'rmse'`: Root Mean Square Error
+                -   `'max_diff'`: Maximum Absolute Difference
+                -   `'correlation'`: Correlation with original flows
         -   `'method'`: (string) Indicates the optimization method used for this result (e.g., 'cvxpy' or 'scipy').
 
-This structure allows for a comprehensive analysis of the optimization process, providing details about the network, the run parameters, and the performance of each evaluated charger configuration. 
+Each configuration's results are stored in a dedicated subdirectory within the results folder, containing visualization plots for flows, reconstruction analysis, and parameter sweep results. 

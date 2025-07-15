@@ -1029,3 +1029,314 @@ class Network(RoadNet):
             
         self._save_individual_flow_contributions()
         return self.charger_flow_contributions 
+
+    def reconstruct_route_flows(self, link_flows_dict, paths_per_od=9, paths_per_oc_cd=4, use_od_constraints=True, use_charger_constraints=True):
+        """
+        Reconstructs route flows from link flows using CVXPY optimization.
+        
+        Args:
+            link_flows_dict (dict): Dictionary containing link flows from optimization results
+            paths_per_od (int): Number of paths to generate for OD pairs (default: 9)
+            paths_per_oc_cd (int): Number of paths to generate for OC and CD pairs (default: 4)
+            use_od_constraints (bool): Whether to enforce OD demand constraints (default: True)
+            use_charger_constraints (bool): Whether to enforce charger flow constraints (default: True)
+            
+        Returns:
+            dict: Dictionary containing reconstructed route flows
+        """
+        import cvxpy as cp
+        import networkx as nx
+        from itertools import islice
+        
+        if not hasattr(self, 'od_demand'):
+            raise ValueError("No OD demand information found. Make sure to initialize the Network with od_demand.")
+        
+        # Use existing OD pairs and demands
+        od_pairs = list(self.od_demand.keys())
+        
+        # Generate routes for each OD pair
+        routes = {}
+        routing_matrices = {}
+        
+        for od_pair in od_pairs:
+            o, d = od_pair
+            routes[od_pair] = {'non_charging': [], 'charging': {}}
+            
+            # Generate non-charging routes
+            paths = list(islice(nx.shortest_simple_paths(
+                self.DiGraph,
+                self.net.nid_to_osmid_dict[o],
+                self.net.nid_to_osmid_dict[d],
+                weight='length'), paths_per_od))
+            
+            routes[od_pair]['non_charging'] = [
+                [self.net.osmid_to_nid_dict[node] for node in path]
+                for path in paths
+            ]
+            
+            # Generate charging routes if chargers exist
+            if hasattr(self, 'chargers') and self.chargers is not None:
+                routes[od_pair]['charging'] = {}
+                
+                for charger in self.chargers:
+                    # Generate OC routes
+                    oc_paths = list(islice(nx.shortest_simple_paths(
+                        self.DiGraph,
+                        self.net.nid_to_osmid_dict[o],
+                        self.net.nid_to_osmid_dict[charger],
+                        weight='length'), paths_per_oc_cd))
+                    
+                    # Generate CD routes
+                    cd_paths = list(islice(nx.shortest_simple_paths(
+                        self.DiGraph,
+                        self.net.nid_to_osmid_dict[charger],
+                        self.net.nid_to_osmid_dict[d],
+                        weight='length'), paths_per_oc_cd))
+                    
+                    # Combine OC and CD paths
+                    charging_routes = []
+                    for oc_path in oc_paths:
+                        for cd_path in cd_paths:
+                            # Convert OSM IDs to node IDs for the path
+                            combined_path = [self.net.osmid_to_nid_dict[node] for node in oc_path]
+                            # Add the rest of the path (skip first node as it's the charger)
+                            combined_path.extend([self.net.osmid_to_nid_dict[node] for node in cd_path[1:]])
+                            charging_routes.append(combined_path)
+                    
+                    routes[od_pair]['charging'][charger] = charging_routes
+        
+        # Create routing matrices for the optimization
+        all_routes = []
+        route_info = []  # Store (od_pair, type, charger) for each route
+        
+        for od_pair in od_pairs:
+            # Add non-charging routes
+            all_routes.extend(routes[od_pair]['non_charging'])
+            route_info.extend([(od_pair, 'non_charging', None) for _ in routes[od_pair]['non_charging']])
+            
+            # Add charging routes
+            if 'charging' in routes[od_pair]:
+                for charger, charger_routes in routes[od_pair]['charging'].items():
+                    all_routes.extend(charger_routes)
+                    route_info.extend([(od_pair, 'charging', charger) for _ in charger_routes])
+        
+        # Create the routing matrix
+        num_links = len(link_flows_dict)
+        num_routes = len(all_routes)
+        routing_matrix = np.zeros((num_links, num_routes))
+        
+        # Create vector of target link flows
+        target_link_flows = np.zeros(num_links)
+        for link_id, link_data in link_flows_dict.items():
+            target_link_flows[link_id] = link_data['total_flow']
+        
+        # Find self-link IDs for each charger
+        charger_self_links = {}
+        for link_id, link_data in link_flows_dict.items():
+            if link_data['start_node_id'] == link_data['end_node_id'] and link_data['start_node_id'] in self.chargers:
+                charger_self_links[link_data['start_node_id']] = link_id
+        
+        # Create the routing matrix
+        for route_idx, route in enumerate(all_routes):
+            for i in range(len(route) - 1):
+                start_node = route[i]
+                end_node = route[i + 1]
+                
+                # Find the link_id for regular links
+                for link_id, link_data in link_flows_dict.items():
+                    if link_data['start_node_id'] == start_node and link_data['end_node_id'] == end_node:
+                        routing_matrix[link_id, route_idx] = 1
+                        break
+        
+        # Set up CVXPY optimization problem
+        route_flows = cp.Variable(num_routes, nonneg=True)
+        link_flows = routing_matrix @ route_flows
+        
+        # Create constraints
+        constraints = []
+        
+        if use_od_constraints:
+            # Flow conservation constraints for each OD pair
+            for od_pair in od_pairs:
+                # Non-charging flow constraint
+                nc_routes = [i for i, info in enumerate(route_info) 
+                            if info[0] == od_pair and info[1] == 'non_charging']
+                if nc_routes:
+                    constraints.append(cp.sum(route_flows[nc_routes]) == self.od_demand[od_pair][0])  # Type 1 demand
+                
+                # Charging flow constraints
+                if hasattr(self, 'chargers') and self.chargers is not None:
+                    # Total charging flow constraint for the OD pair
+                    charging_routes = [i for i, info in enumerate(route_info) 
+                                     if info[0] == od_pair and info[1] == 'charging']
+                    if charging_routes:
+                        constraints.append(cp.sum(route_flows[charging_routes]) == self.od_demand[od_pair][1])  # Type 2 demand
+        
+        if use_charger_constraints and hasattr(self, 'chargers') and self.chargers is not None:
+            # Individual charger flow constraints
+            for charger in self.chargers:
+                charger_routes = [i for i, info in enumerate(route_info) 
+                                if info[1] == 'charging' and info[2] == charger]
+                if charger_routes:
+                    # Get the charging flow for this charger from link_flows_dict
+                    charger_flow = 0
+                    for link_data in link_flows_dict.values():
+                        if str(charger) in link_data['charging_flows']:
+                            charger_flow += link_data['charging_flows'][str(charger)]
+                    if charger_flow > 0:
+                        # Add constraint for the self-link flow
+                        if charger in charger_self_links:
+                            link_id = charger_self_links[charger]
+                            # Add self-link flow to the objective
+                            link_flows = cp.vstack([link_flows, cp.sum(route_flows[charger_routes])])
+                            target_link_flows = np.append(target_link_flows, target_link_flows[link_id])
+        
+        # Objective: minimize L2 norm between reconstructed and target link flows
+        objective = cp.Minimize(cp.sum_squares(link_flows - target_link_flows))
+        
+        # Solve the problem
+        prob = cp.Problem(objective, constraints)
+        prob.solve(solver=cp.OSQP)  # OSQP is better for quadratic objectives
+        
+        if prob.status != 'optimal':
+            print(f"Warning: Problem status is {prob.status}")
+            return None
+        
+        # Reconstruct the results
+        result = {}
+        for od_pair in od_pairs:
+            result[od_pair] = {
+                'non_charging': [],
+                'charging': {}
+            }
+            
+            # Add non-charging routes
+            nc_indices = [i for i, info in enumerate(route_info) 
+                         if info[0] == od_pair and info[1] == 'non_charging']
+            for idx in nc_indices:
+                if route_flows.value[idx] > 1e-6:  # Filter out near-zero flows
+                    result[od_pair]['non_charging'].append({
+                        'path': all_routes[idx],
+                        'flow': float(route_flows.value[idx])
+                    })
+            
+            # Add charging routes
+            if hasattr(self, 'chargers') and self.chargers is not None:
+                for charger in self.chargers:
+                    charger_indices = [i for i, info in enumerate(route_info) 
+                                     if info[0] == od_pair and info[1] == 'charging' and info[2] == charger]
+                    
+                    charger_routes = []
+                    for idx in charger_indices:
+                        if route_flows.value[idx] > 1e-6:  # Filter out near-zero flows
+                            # Get the path and add the self-link
+                            path = list(all_routes[idx])
+                            # Find where the charger appears in the path
+                            charger_idx = path.index(charger)
+                            # Insert the charger again to represent the self-link
+                            path.insert(charger_idx + 1, charger)
+                            charger_routes.append({
+                                'path': path,
+                                'flow': float(route_flows.value[idx])
+                            })
+                    
+                    if charger_routes:
+                        result[od_pair]['charging'][charger] = charger_routes
+        
+        return result 
+
+    def compare_link_flows(self, link_flows_dict, reconstructed_route_flows):
+        """
+        Compares original link flows with reconstructed link flows using heatmaps.
+        
+        Args:
+            link_flows_dict (dict): Original link flows from optimization
+            reconstructed_route_flows (dict): Result from reconstruct_route_flows
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import geopandas as gpd
+        from matplotlib.cm import ScalarMappable
+        import matplotlib.colors as mcolors
+        
+        # Get original link flows
+        original_flows = np.zeros(len(link_flows_dict))
+        for link_id, link_data in link_flows_dict.items():
+            original_flows[link_id] = link_data['total_flow']
+            
+        # Calculate reconstructed link flows
+        reconstructed_flows = np.zeros(len(link_flows_dict))
+        
+        # Create routing matrix for all routes
+        all_routes = []
+        for od_pair, flows in reconstructed_route_flows.items():
+            # Add non-charging routes
+            for route_data in flows['non_charging']:
+                all_routes.append((route_data['path'], route_data['flow']))
+            
+            # Add charging routes
+            for charger_routes in flows['charging'].values():
+                for route_data in charger_routes:
+                    all_routes.append((route_data['path'], route_data['flow']))
+        
+        # Calculate reconstructed flows
+        for route, flow in all_routes:
+            for i in range(len(route) - 1):
+                start_node = route[i]
+                end_node = route[i + 1]
+                for link_id, link_data in link_flows_dict.items():
+                    if link_data['start_node_id'] == start_node and link_data['end_node_id'] == end_node:
+                        reconstructed_flows[link_id] += flow
+                        break
+        
+        # Calculate flow difference
+        flow_difference = reconstructed_flows - original_flows
+        
+        # Create three subplots for comparison
+        plt.figure(figsize=(20, 8))
+        
+        # Helper function to create flow heatmap
+        def create_flow_heatmap(flows, ax, title):
+            edges_df = self.net.edges.sort_values("link_id").copy()
+            edges_df["flow"] = flows
+            edges_df["geometry"] = gpd.GeoSeries.from_wkt(edges_df["geometry"])
+            gdf = gpd.GeoDataFrame(edges_df, geometry="geometry")
+            
+            max_linewidth = 10
+            min_linewidth = 1
+            cmap = "plasma"
+            norm = mcolors.Normalize(vmin=flows.min(), vmax=flows.max())
+            linewidths = min_linewidth + (gdf["flow"] - gdf["flow"].min()) / (gdf["flow"].max() - gdf["flow"].min()) * (max_linewidth - min_linewidth)
+            sm = ScalarMappable(norm=norm, cmap=cmap)
+            gdf["color"] = gdf["flow"].apply(lambda f: sm.to_rgba(f))
+            
+            gdf.plot(ax=ax, color=gdf["color"], linewidth=linewidths)
+            plt.colorbar(sm, ax=ax)
+            ax.set_title(title)
+            ax.set_axis_off()
+        
+        # Plot original flows
+        ax1 = plt.subplot(131)
+        create_flow_heatmap(original_flows, ax1, "Original Link Flows")
+        
+        # Plot reconstructed flows
+        ax2 = plt.subplot(132)
+        create_flow_heatmap(reconstructed_flows, ax2, "Reconstructed Link Flows")
+        
+        # Plot difference
+        ax3 = plt.subplot(133)
+        create_flow_heatmap(flow_difference, ax3, "Flow Difference (Reconstructed - Original)")
+        
+        plt.tight_layout()
+        
+        # Print some statistics
+        mae = np.mean(np.abs(flow_difference))
+        rmse = np.sqrt(np.mean(np.square(flow_difference)))
+        max_diff = np.max(np.abs(flow_difference))
+        
+        print("\nFlow Comparison Statistics:")
+        print(f"Mean Absolute Error: {mae:.6f}")
+        print(f"Root Mean Square Error: {rmse:.6f}")
+        print(f"Maximum Absolute Difference: {max_diff:.6f}")
+        
+        return plt.gcf()  # Return the figure for saving if needed 
