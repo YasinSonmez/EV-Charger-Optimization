@@ -637,12 +637,12 @@ class Network(RoadNet):
         warm_start_values = self._generate_warm_start_values(od_pairs, q_total, N, n_s, S)
         
         # === Variables - with warm start values
-        # Non-charging flows only exist at t=1
+        # Non-charging flows type t=1
         x_nc = {(i, 1): cp.Variable(self.l, nonneg=True, value=warm_start_values['x_nc'].get((i, 1), np.zeros(self.l))) 
                 for i in range(N)}
         q_nc = {(i, 1): q_total[i, 1] for i in range(N)}  # Fixed values, not variables
         
-        # Charging flows only exist at t=2
+        # Charging flows type t=2
         x_plus = {(i, 2, c): cp.Variable(self.l, nonneg=True, value=warm_start_values['x_plus'].get((i, 2, c), np.zeros(self.l))) 
                  for i in range(N) for c in range(n_s)}
         x_minus = {(i, 2, c): cp.Variable(self.l, nonneg=True, value=warm_start_values['x_minus'].get((i, 2, c), np.zeros(self.l))) 

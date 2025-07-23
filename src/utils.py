@@ -128,6 +128,7 @@ def save_optimization_pickle(grid):
 
     results_data = {}
     results_data['charger_combination'] = list(grid.chargers) if grid.chargers is not None else []
+    results_data['network'] = grid  # Add the network object to the results
 
     link_flows_dict = {}
     all_edges = grid.net.edges.sort_values("link_id").copy()
@@ -849,7 +850,16 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
             'run_configuration': run_config_params,
             'configurations': configurations,
             'time_history': time_history,
-            'iteration_count': iteration_count
+            'iteration_count': iteration_count,
+            'network_link_connectivity': [
+                {
+                    'link_id': int(edge_row['link_id']),
+                    'start_node_id': int(edge_row['start_node_id']),
+                    'end_node_id': int(edge_row['end_node_id'])
+                }
+                for _, edge_row in grids[0].net.edges.iterrows()
+            ],
+            'network': best_grid
         }
         
         with open(os.path.join(foldername, 'all_optimization_results.pkl'), 'wb') as f:

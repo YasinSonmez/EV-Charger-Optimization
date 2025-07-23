@@ -105,7 +105,7 @@ The configuration is specified in a JSON file with the following structure:
 | `coordinates` | Bounding box coordinates [north, south, east, west] | [38.98211, 38.975, -76.93006, -76.93704] |
 | `num_chargers` | Number of chargers to place | 2 |
 | `possible_charger_positions` | List of possible charger positions | [15, 20, 28, 6] |
-| `od_demand` | OD pairs and demands in format {"origin,dest": [demand1, demand2]} | {"0,26": [120, 60]} |
+| `od_demand` | OD pairs and demands in format {"origin,dest": [demand_type1, demand_type2]} | {"0,26": [60, 120]} |
 | `max_iter` | Maximum iterations for optimization | 1000 |
 | `use_derivatives` | Use derivatives in optimization | false |
 | `single_swap` | Use single swap optimization | true |
