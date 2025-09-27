@@ -613,6 +613,50 @@ class Network(RoadNet):
         
         return obj_term
 
+    def _compute_travel_time_objective(self, link_flows, charger_flows=None):
+        """
+        Compute travel time objective: Beckmann potential × flows (for evaluation)
+        This is different from the optimization objective which uses the integral.
+        
+        Parameters:
+        -----------
+        link_flows : array-like
+            Flow values for each link in the network
+        charger_flows : array-like, optional
+            Flow values for each charger
+            
+        Returns:
+        --------
+        float
+            Total travel time objective (Beckmann potential × flows)
+        """
+        # Initialize travel time objective
+        travel_time_obj = 0.0
+        
+        # Calculate link flow contribution (Beckmann potential × flows)
+        for l in range(self.l):
+            flow = link_flows[l]
+            fft = self.fft_cvxpy[l]
+            a = self.a_cvxpy[l]
+            cap = self.cap_cvxpy[l]
+            p = self.p_cvxpy[l]
+            
+            if flow > 0 and cap > 0:
+                # Beckmann potential: FFT * (1 + a * (flow/cap)^p)
+                beckmann_potential = fft * (1 + a * (flow/cap)**p)
+                # Travel time objective: potential × flow
+                travel_time_obj += beckmann_potential * flow
+        
+        # Add charger costs if provided
+        if charger_flows is not None:
+            charger_count = len(charger_flows)
+            for c in range(charger_count):
+                if charger_flows[c] is not None:
+                    # Charger delay: self_link_length × flow
+                    travel_time_obj += self.charger_self_link_length * charger_flows[c]
+        
+        return travel_time_obj
+
     def optimize_with_cvxpy(self, disp=True):
         print("Running structured CVXPY optimization with link-specific BPR delay...")
 
@@ -805,10 +849,11 @@ class Network(RoadNet):
             computed_obj_value = self._compute_objective(x_total.value, x_hat.value)
             print(f"Computed objective value manually: {computed_obj_value}")
             self.best_objective_value = computed_obj_value
-            self.travel_time_obj = computed_obj_value
         else:
             self.best_objective_value = prob.value
-            self.travel_time_obj = prob.value
+            
+        # Calculate travel time objective separately (Beckmann potential × flows)
+        self.travel_time_obj = self._compute_travel_time_objective(x_total.value, x_hat.value)
             
         # Store optimization results
         self.cvxpy_link_flows = x_total.value if x_total is not None else np.zeros(self.l)
