@@ -44,3 +44,6 @@ data/traffic_data_*_meta.json
 config copy*.json
 config_exp1.json
 config_old.json
+fitter_results.csv
+traffic_inputs_*
+traffic_outputs/
