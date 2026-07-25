@@ -1,0 +1,71 @@
+{
+    "coordinates": [
+        38.98211,
+        38.975,
+        -76.93006,
+        -76.93704
+    ],
+    "num_chargers": 2,
+    "possible_charger_positions": [
+        14,
+        20,
+        21
+    ],
+    "od_demand": {
+        "7,26": [
+            60,
+            120
+        ]
+    },
+    "max_iter": 1000,
+    "use_derivatives": false,
+    "single_swap": true,
+    "use_cvxpy": true,
+    "plot_info": false,
+    "calculate_on_all_possible_positions": true,
+    "route_analysis": {
+        "analyze_top_k_routes": true,
+        "k_values": [
+            1,
+            2,
+            4,
+            8
+        ],
+        "run_parameter_sweep": false,
+        "parameter_sweep": {
+            "paths_per_od_values": [
+                5,
+                10
+            ],
+            "paths_per_oc_cd_values": [
+                3,
+                6
+            ]
+        }
+    },
+    "queue_simulation": {
+        "enabled": true,
+        "K": 8,
+        "THRESH": 500,
+        "NUM_ITERS": 3,
+        "ENT_CAPACITY": 250,
+        "CHARGING_CAPACITY": 250,
+        "EXIT_CAPACITY": 250,
+        "COST": 0,
+        "WORKERS": null,
+        "N": 5,
+        "single_swap": true
+    },
+    "pipeline": {
+        "random_seed": 42,
+        "skip_bpr_fitting": true,
+        "skip_cg_optimization": false,
+        "skip_queue_simulation": false
+    },
+    "road_filter": {
+        "enabled": false,
+        "prune_dead_ends": false,
+        "merge_chains": false,
+        "suppress_t_junctions": false
+    }
+}

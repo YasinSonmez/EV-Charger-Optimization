@@ -1,0 +1,8 @@
+results/
+model_fit_plots/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.gitignore
+inspect.ipynb

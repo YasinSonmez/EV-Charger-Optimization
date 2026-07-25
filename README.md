@@ -1,58 +1,171 @@
 # EV Charger Optimization
 
-This project implements an optimization framework for determining the optimal placement of electric vehicle charging stations in a road network. The framework minimizes travel time across the network while accounting for vehicles that need to detour to charging stations.
+Unified framework for optimal EV charging station placement using congestion-game equilibrium and queue-based traffic simulation. Implements the methodology from "Congestion Reduction in EV Charger Placement Using Traffic Equilibrium Models" (Kara et al., 2025).
+
+## Quick Start
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the full pipeline (CG + queue simulation)
+python pipeline.py --config config.json
+
+# Fast test (~80 seconds)
+python pipeline.py --config config_test.json
+
+# Run only the congestion-game half (Linux/Docker compatible)
+python main.py --config config.json
+```
+
+## Pipeline Architecture
+
+```
+config.json
+    │
+    ▼
+┌─────────────────────────────────────────────┐
+│  pipeline.py                                │
+│                                             │
+│  1. BPR Fitting ──► cached_results.pkl     │
+│  2. CG Equilibrium ──► all_opt_results.pkl │
+│  3. Queue NE ──► NE_path_assignments.pkl   │
+│  4. Queue Comparison ──► results.json      │
+│  5. Report ──► report.md                   │
+└─────────────────────────────────────────────┘
+    │
+    ▼
+results/<timestamp>_n=.._chargers=../
+```
 
 ## Structure
 
-The codebase is organized into the following modules:
-
-- `src/road_network.py`: Contains the `RoadNet` class for downloading and processing road network data from OpenStreetMap
-- `src/traffic_optimizer.py`: Contains the main optimization model (`Network` class)
-- `src/model_fitter.py`: Contains the `TrafficModelFitter` class for fitting traffic flow models to data
-- `src/utils.py`: Utility functions for optimization and visualization
-- `main.py`: Main entry point that loads configuration from a JSON file
-- `config.json`: Default configuration file with optimization parameters
+| Module | Purpose |
+|---|---|
+| `pipeline.py` | Unified orchestrator — one command runs everything |
+| `main.py` | CG-only entry point (legacy, still works) |
+| `src/config.py` | Config loading + validation |
+| `src/model_fitter.py` | BPR delay function fitting (paper eq. 15) |
+| `src/traffic_optimizer.py` | Congestion-game equilibrium solver (CVXPY/Clarabel) |
+| `src/utils.py` | Outer optimization: greedy + single-swap + exhaustive |
+| `src/road_network.py` | OSM network builder (merged: CG + queue methods) |
+| `queue_sim/` | Queue-based simulation (macOS-only — requires `dlls/liblsp.dylib`) |
+| `queue_sim/find_nash.py` | NE assignment finder (better-response heuristic) |
+| `queue_sim/comparison.py` | Greedy vs exhaustive comparison (with swap refinement) |
+| `tests/` | Unit + integration tests |
+| `Dockerfile` | Docker container for CG half (Linux) |
 
 ## Project Layout
 
 ```
 EV-Charger-Optimization/
-│
-├── data/                 # Data files and cached results
-│
-├── results/              # Optimization results and visualizations
-│
-├── src/                  # Source code
-│   ├── __init__.py
+├── pipeline.py              # Unified entry point
+├── main.py                  # CG-only entry point
+├── config.json              # Full config (CG + queue)
+├── config_test.json         # Fast test config (~80s)
+├── src/
+│   ├── config.py
 │   ├── model_fitter.py
-│   ├── road_network.py
 │   ├── traffic_optimizer.py
-│   └── utils.py
-│
-├── README.md             # Project documentation
-├── requirements.txt      # Dependencies
-├── config.json           # Configuration file
-└── main.py               # Main execution script
+│   ├── utils.py
+│   └── road_network.py
+├── queue_sim/
+│   ├── interface.py         # ctypes → liblsp.dylib
+│   ├── queue_model_EV.py    # Link, Node, Agent, Simulation
+│   ├── runner_EV.py         # Runner orchestrator
+│   ├── find_nash.py         # NE assignments
+│   └── comparison.py        # Greedy vs exhaustive
+├── dlls/
+│   └── liblsp.dylib         # macOS arm64 only
+├── tests/
+├── Dockerfile
+├── environment.yml
+└── requirements.txt
 ```
 
 ## Installation
 
-This project requires several Python dependencies including optimization libraries. The recommended way to set up the environment is using Conda with the provided `environment.yml` file.
+### Option 1: pip (recommended)
 
-1.  **Create and activate Conda environment:**
-    ```bash
-    # Create a conda environment from the provided file
-    conda env create -f environment.yml
+```bash
+pip install -r requirements.txt
+```
 
-    # Activate the environment
-    conda activate evopt
-    ```
+### Option 2: Conda
 
-2.  **Verify the installation (optional):**
-    You can check if CVXPY and its solvers are correctly installed by running:
-    ```bash
-    python -c "import cvxpy; print('Available solvers:', cvxpy.installed_solvers())"
-    ```
+```bash
+conda env create -f environment.yml
+conda activate evopt
+```
+
+### macOS only: re-sign the simulator library
+
+```bash
+codesign -s - -f dlls/liblsp.dylib
+```
+
+This is a one-time step. The queue-based simulation (`queue_sim/`) requires this library and only works on macOS. On Linux/Docker, only the CG half runs.
+
+## Configuration
+
+The pipeline is driven by a single JSON config file. See `config.json` for the full schema.
+
+| Section | Key | Default | Description |
+|---|---|---|---|
+| top-level | `coordinates` | College Park, MD | OSM bounding box |
+| top-level | `num_chargers` | 2 | Chargers to place |
+| top-level | `possible_charger_positions` | [14,20,21,41,43] | Candidate node IDs |
+| top-level | `od_demand` | {"7,26": [60,120]} | OD pairs: [non-charging, charging] |
+| top-level | `use_cvxpy` | true | Use CVXPY/Clarabel solver |
+| top-level | `single_swap` | true | CG single-swap refinement |
+| `queue_simulation` | `K` | 16 | Routes per config |
+| `queue_simulation` | `THRESH` | 100 | NE convergence threshold (seconds) |
+| `queue_simulation` | `NUM_ITERS` | 50 | Sims per NE iteration |
+| `queue_simulation` | `N` | 750 | Monte Carlo reps |
+| `queue_simulation` | `single_swap` | true | Queue single-swap refinement |
+| `pipeline` | `skip_bpr_fitting` | false | Use cached BPR fit |
+| `pipeline` | `skip_cg_optimization` | false | Skip CG half |
+| `pipeline` | `skip_queue_simulation` | false | Skip queue half |
+
+## Running Tests
+
+```bash
+# Unit tests (fast, ~2s)
+python -m pytest tests/test_config.py tests/test_model_fitter.py tests/test_road_network.py tests/test_queue_sim.py -v
+
+# Integration test (~80s, requires macOS for queue sim)
+python -m pytest tests/test_pipeline.py -v -s
+```
+
+## Docker Deployment (CG half only)
+
+```bash
+docker build -t ev-charger-opt .
+docker run -v $(pwd)/results:/app/results ev-charger-opt
+```
+
+The Docker container runs the CG equilibrium + route recovery on Linux. The queue-based simulation requires `dlls/liblsp.dylib` (macOS) and is automatically skipped on Linux.
+
+## Output Structure
+
+Each run creates a timestamped directory under `results/`:
+
+```
+results/<timestamp>_n=<candidates>_chargers=<num>/
+├── run_config.json              # Config used
+├── all_optimization_results.pkl # CG equilibrium results
+├── report.md                    # Final report with timing
+├── heatmap_summary.txt
+├── *.png                        # Travel-time plot
+├── config_*/                    # Per-config CG results
+│   ├── flow_heatmap.png
+│   └── reconstruction/
+├── queue/                       # Queue half (macOS only)
+│   ├── NE_path_assignments.pkl
+│   ├── comparison_results.json
+│   ├── traffic_inputs_*.csv
+│   └── traffic_outputs/
+```
 
 ## Usage
 

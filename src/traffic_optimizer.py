@@ -14,7 +14,7 @@ import matplotlib.colors as mcolors
 from src.road_network import RoadNet
 
 class Network(RoadNet):
-    def __init__(self, coordinates=[38.98211, 38.979, -76.93006, -76.93704], chargers=None, parameter_fit_results=None, od_demand=None):
+    def __init__(self, coordinates=[38.98211, 38.979, -76.93006, -76.93704], chargers=None, parameter_fit_results=None, od_demand=None, highway_types=None, prune_dead_ends=False):
         # Parameters
         self.charging_to_no_charging_ratio = 0.5
         self.charger_self_link_length = 100  # this is important
@@ -24,9 +24,9 @@ class Network(RoadNet):
         self.use_cvxpy = False  # Flag to determine which optimization method to use
 
         self.net = RoadNet('College Park')
-        self.net.get_map(coordinates[0], coordinates[1], coordinates[2], coordinates[3])
+        self.net.get_map(coordinates[0], coordinates[1], coordinates[2], coordinates[3],
+                         highway_types=highway_types, prune_dead_ends=prune_dead_ends)
         self.DiGraph = nx.DiGraph(self.net.graph)  # DiGraph to find routes
-        self.net.rearrange_data()
 
         self.n = len(self.net.nodes)
         self.l = len(self.net.edges)  # Number of total links

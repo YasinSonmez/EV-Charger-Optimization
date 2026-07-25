@@ -624,7 +624,7 @@ def save_all_flow_heatmaps(grids, config, results_folder, time_history=None):
 def outer_optimization(coordinates, num_chargers=None, possible_charger_positions=None, 
                        calculate_on_all_possible_positions=False, plot_info=False, use_derivatives=True, 
                        max_iter=1000, parameter_fit_results=None, single_swap=False, use_cvxpy=False, od_demand=None,
-                       config_filepath=None):
+                       config_filepath=None, output_dir=None, highway_types=None, prune_dead_ends=False):
     """
     Outer optimization to find the best charger locations.
     Includes configurable route analysis with top-k routes and parameter sweep.
@@ -652,7 +652,7 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
                 chargers_i = (best_charger) + (charger_ji,)
                 chargers_i = tuple(sorted(chargers_i))
             chargers_set.add(chargers_i)
-            grid_i = Network(coordinates, chargers=chargers_i, parameter_fit_results=parameter_fit_results, od_demand=od_demand)
+            grid_i = Network(coordinates, chargers=chargers_i, parameter_fit_results=parameter_fit_results, od_demand=od_demand, highway_types=highway_types, prune_dead_ends=prune_dead_ends)
             iteration_count += 1
             print("*" * 80)
             print('Iteration: ', iteration_count)
@@ -686,7 +686,7 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
 
         # Evaluate each swap
         for swapped_chargers in all_possible_swaps:
-            grid_i = Network(coordinates, chargers=swapped_chargers, parameter_fit_results=parameter_fit_results, od_demand=od_demand)
+            grid_i = Network(coordinates, chargers=swapped_chargers, parameter_fit_results=parameter_fit_results, od_demand=od_demand, highway_types=highway_types, prune_dead_ends=prune_dead_ends)
             grid_i.optimize(use_cvxpy=use_cvxpy, use_derivatives=use_derivatives, max_iter=max_iter)
             time_history.append(time.time() - t0)
             if plot_info:
@@ -705,7 +705,7 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
             if chargers_i in chargers_set:
                 continue
             chargers_set.add(chargers_i)
-            grid_i = Network(coordinates, chargers=chargers_i, parameter_fit_results=parameter_fit_results, od_demand=od_demand)
+            grid_i = Network(coordinates, chargers=chargers_i, parameter_fit_results=parameter_fit_results, od_demand=od_demand, highway_types=highway_types, prune_dead_ends=prune_dead_ends)
             iteration_count += 1
             print('Iteration: ', iteration_count)
             grid_i.optimize(use_cvxpy=use_cvxpy, use_derivatives=use_derivatives, max_iter=max_iter)
@@ -721,8 +721,11 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
 
     # Create the results directory with timestamp
     filename = 'n=' + str(grid_i.n) + ' d=' + str(grids[-1].d) + ' possible_charger_positions=' + str(len(possible_charger_positions)) + ' num_chargers=' + str(num_chargers)
-    today = datetime.now()
-    foldername = "results/" + today.strftime('%Y-%m-%d_%H-%M-%S_') + filename
+    if output_dir:
+        foldername = output_dir
+    else:
+        today = datetime.now()
+        foldername = "results/" + today.strftime('%Y-%m-%d_%H-%M-%S_') + filename
     filename = foldername + '/' + filename
     os.makedirs(foldername, exist_ok=True)
 
@@ -865,7 +868,7 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
         with open(os.path.join(foldername, 'all_optimization_results.pkl'), 'wb') as f:
             pickle.dump(results_dict, f)
 
-    return grids, time_history
+    return grids, time_history, foldername
 
 
 def calculate_phase_boundaries(n, k):
@@ -878,9 +881,15 @@ def calculate_phase_boundaries(n, k):
         if i == k:
             phases['Greedy'] = idx
         if i == k+1:
-            phases['Greedy + Single Swap'] = phases['Greedy'] + (n-k)*(k-1)
+            swap_count = (n-k)*(k-1) if k > 1 else 0
+            phases['Greedy + Single Swap'] = phases['Greedy'] + swap_count
 
-    phases['Exhaustive'] = phases[list(phases.keys())[-3]] + comb(n, k)
+    if len(phases) >= 3:
+        phases['Exhaustive'] = phases[list(phases.keys())[-3]] + comb(n, k)
+    elif 'Greedy' in phases:
+        phases['Exhaustive'] = phases['Greedy'] + comb(n, k)
+    else:
+        phases['Exhaustive'] = comb(n, k)
     print("Phase boundaries are: ", phases)
     return phases
 

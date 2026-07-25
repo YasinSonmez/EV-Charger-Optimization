@@ -231,10 +231,9 @@ class TrafficModelFitter:
 def convert_string_to_array(df, column_name):
     if column_name not in df.columns:
         raise ValueError(f"Column '{column_name}' not found in the DataFrame.")
-    for index, row in df.iterrows():
+    def _convert(val):
         try:
-            array_list = ast.literal_eval(row[column_name])
-            df.at[index, column_name] = np.array(array_list)
-        except ValueError as e:
-            print(f"Error converting row {index}: {e}")
-            continue 
+            return np.array(ast.literal_eval(val))
+        except (ValueError, SyntaxError):
+            return val
+    df[column_name] = df[column_name].apply(_convert)

@@ -1,9 +1,9 @@
 {
-    "coordinates": [38.98211, 38.975, -76.93006, -76.93704],
+    "coordinates": [37.875, 37.865, -122.245, -122.265],
     "num_chargers": 2,
-    "possible_charger_positions": [14, 20, 21, 41, 43],
+    "possible_charger_positions": [5, 10, 15, 20, 25],
     "od_demand": {
-        "7,26": [60, 120]
+        "0,30": [30, 60]
     },
     "max_iter": 1000,
     "use_derivatives": false,
@@ -13,34 +13,38 @@
     "calculate_on_all_possible_positions": true,
     "route_analysis": {
         "analyze_top_k_routes": true,
-        "k_values": [1, 2, 4, 8, 16, 32, 64],
-        "run_parameter_sweep": true,
+        "k_values": [1, 2, 4, 8],
+        "run_parameter_sweep": false,
         "parameter_sweep": {
-            "paths_per_od_values": [5, 10, 15, 20, 25, 30],
-            "paths_per_oc_cd_values": [3, 6, 9, 12, 15]
+            "paths_per_od_values": [5],
+            "paths_per_oc_cd_values": [3]
         }
     },
     "queue_simulation": {
         "enabled": true,
-        "K": 16,
-        "THRESH": 100,
-        "NUM_ITERS": 50,
+        "K": 4,
+        "THRESH": 500,
+        "NUM_ITERS": 2,
         "ENT_CAPACITY": 250,
         "CHARGING_CAPACITY": 250,
         "EXIT_CAPACITY": 250,
         "COST": 0,
         "WORKERS": null,
-        "N": 750,
+        "N": 3,
         "single_swap": true
     },
     "pipeline": {
         "random_seed": 42,
         "skip_bpr_fitting": false,
         "skip_cg_optimization": false,
-        "skip_queue_simulation": false
+        "skip_queue_simulation": false,
+        "bpr_generation": {
+            "num_samples": 5,
+            "max_flow": 30
+        }
     },
     "road_filter": {
-        "enabled": false,
+        "enabled": true,
         "highway_types": ["motorway", "trunk", "primary", "secondary",
                           "motorway_link", "trunk_link", "primary_link", "secondary_link"],
         "prune_dead_ends": true
