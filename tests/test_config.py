@@ -40,6 +40,8 @@ def test_config_defaults_filled():
     cfg = Config.from_dict(raw)
     assert cfg.queue_simulation["K"] == QUEUE_DEFAULTS["K"]
     assert cfg.pipeline["random_seed"] == PIPELINE_DEFAULTS["random_seed"]
+    assert cfg.pipeline["cg_fit_policy"] == "allow_degraded"
+    assert cfg.pipeline["bpr_generation"]["missing_context_policy"] == "synthetic_boundary"
 
 
 def test_config_validation_errors():
@@ -61,6 +63,10 @@ def test_config_validation_errors():
     bad = {**VALID_CONFIG}
     bad["od_demand"] = {"7,26": [60]}
     with pytest.raises(ValueError, match="od_demand"):
+        Config.from_dict(bad)
+
+    bad = {**VALID_CONFIG, "pipeline": {"cg_fit_policy": "invalid"}}
+    with pytest.raises(ValueError, match="cg_fit_policy"):
         Config.from_dict(bad)
 
 

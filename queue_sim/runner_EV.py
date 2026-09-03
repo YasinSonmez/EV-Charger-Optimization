@@ -10,6 +10,7 @@ import networkx as nx
 from itertools import islice
 import osmnx as ox
 import itertools
+import os
 
 ###################################################################### ADDITION ENDS
 
@@ -19,15 +20,47 @@ from concurrent.futures import ProcessPoolExecutor
 import argparse
 
 
+def _legacy_flow_counts(routes, od_df, od, charging):
+    """Convert legacy aggregate flow records into deterministic route counts."""
+    if isinstance(od, str):
+        origin, destination = [int(value) for value in od.split(',')]
+    else:
+        origin, destination = [int(value) for value in od]
+    if 'is_EV' in od_df.columns and 'need_to_charge' in od_df.columns:
+        mask = (od_df['origin_node_id'] == origin) & (od_df['destin_node_id'] == destination)
+        if charging:
+            mask &= od_df['is_EV'].astype(bool) & od_df['need_to_charge'].astype(bool)
+        else:
+            mask &= ~(od_df['is_EV'].astype(bool) & od_df['need_to_charge'].astype(bool))
+        total = int(mask.sum())
+    else:
+        total = int(round(sum(float(route.get('flow', 0.0)) for route in routes)))
+    weights = [max(0.0, float(route.get('flow', 0.0))) for route in routes]
+    if not routes:
+        return []
+    weight_sum = sum(weights)
+    quotas = [weight / weight_sum * total for weight in weights] if weight_sum else [0.0] * len(weights)
+    counts = [int(np.floor(value)) for value in quotas]
+    for index in sorted(range(len(counts)), key=lambda i: (-(quotas[i] - counts[i]), i))[:total - sum(counts)]:
+        counts[index] += 1
+    return counts
+
+
 class Runner:
     def __init__(self,
                  links_csv: str, nodes_csv: str, od_csv: str,
                  contraflow_csv='',
-                 NodeClass=Node, LinkClass=Link, ChargingStationClass=EV_Charging_Station, reroute_freq=10800): ###################################################################### ADDITION INLINE
+                 NodeClass=Node, LinkClass=Link, ChargingStationClass=EV_Charging_Station,
+                 reroute_freq=10800, seed=None): ###################################################################### ADDITION INLINE
         self.nodes_df = pd.read_csv(nodes_csv)
         self.links_df = pd.read_csv(links_csv)
         self.od_df = pd.read_csv(od_csv)
         self.sim = Simulation(NodeClass, LinkClass, ChargingStationClass) ###################################################################### ADDITION INLINE
+        self.seed = seed
+        self.sim.random_seed = seed
+        if seed is not None:
+            random.seed(int(seed))
+            np.random.seed(int(seed) % (2**32 - 1))
         self.reroute_freq = reroute_freq
         self.running = True
 
@@ -35,6 +68,8 @@ class Runner:
 
         self.charging_stations_df = pd.DataFrame() #self.charging_stations_df = []
         self.tot_travel_time = 0
+        self.simulation_status = 'not_started'
+        self.simulation_error = None
 
         self.strategies = [] # For bpr function fitting
         self.ave_link_densities = {} # For bpr function fitting
@@ -43,6 +78,8 @@ class Runner:
 
         self.no_ch_routes = []
         self.ch_routes = []
+        self.route_groups = []
+        self.route_agent_ids = {}
 
         ###################################################################### ADDITION ENDS
 
@@ -50,6 +87,27 @@ class Runner:
             contraflow_df = pd.read_csv(contraflow_csv)
             self.links_df = self.links_df.merge(
                 contraflow_df[['link_id', 'new_lanes']], how='left', on='link_id')
+
+    def reset_for_new_simulation(self):
+        """Reset mutable simulation state while retaining immutable CSV inputs.
+
+        This is used by batched BPR workers so one Runner can execute a full
+        flow sweep without carrying agents, queues, or statistics between
+        samples.
+        """
+        self.sim = Simulation(self.sim.NodeClass, self.sim.LinkClass, self.sim.ChargingStationClass)
+        self.sim.random_seed = self.seed
+        self.running = True
+        self.tot_travel_time = 0
+        self.simulation_status = 'not_started'
+        self.simulation_error = None
+        self.strategies = []
+        self.ave_link_densities = {}
+        self.active_links = []
+        self.no_ch_routes = []
+        self.ch_routes = []
+        self.route_groups = []
+        self.route_agent_ids = {}
 
 ###################################################################### ADDITION STARTS
 
@@ -394,6 +452,7 @@ class Runner:
     # def init_sq_simulation_for_bpr_function_fitting_V2(self, od_pairs, k, network):
     def init_sq_simulation_for_bpr_function_fitting_V2(self, link, sa_il, sa_ol):
 
+        self.reset_for_new_simulation()
         self.sim.create_network(self.nodes_df, self.links_df, self.charging_stations_df)
         self.sim.create_demand(self.od_df)
 
@@ -411,9 +470,50 @@ class Runner:
                                 'sa_ol':self.find_sa_out_link(link)})
         '''
         
-        # We want the agents to originate from the start node of the sa in-link, use the main link, and arrive at the end node of the sa out-link
+        # We want the agents to originate from the start node of the sa in-link,
+        # use the main link, and arrive at the end node of the sa out-link.
+        # For links without a valid straight-ahead predecessor/successor, use
+        # a direct one-link route.  This is required for one-way boundary
+        # turns and avoids treating a physically valid canonical link as an
+        # unmeasurable BPR failure merely because the simulator forbids U-turns.
         for agent in self.sim.all_agents.values():
-            agent.route_igraph = [(agent.cls, agent.cle)] + [(sa_il.start_node_id,sa_il.end_node_id),(sa_il.end_node_id,link.end_node_id),(link.end_node_id,sa_ol.end_node_id)]
+            if sa_il is not None and sa_ol is not None:
+                agent.route_igraph = [
+                    (agent.cls, agent.cle),
+                    (sa_il.start_node_id, sa_il.end_node_id),
+                    (sa_il.end_node_id, link.end_node_id),
+                    (link.end_node_id, sa_ol.end_node_id),
+                ]
+                agent.route_link_ids = [
+                    int(sa_il.link_id), int(link.link_id), int(sa_ol.link_id),
+                ]
+            elif sa_ol is not None:
+                # Link-level BPR probe: inject at the target link's start,
+                # measure the target link alone, and use one continuation
+                # link so the target's downstream capacity is enforced.  The
+                # continuation may be a U-turn at a boundary, but its travel
+                # time is never included in the target observation.
+                continuation_links = (
+                    list(sa_ol)
+                    if isinstance(sa_ol, (list, tuple))
+                    else [sa_ol]
+                )
+                agent.route_igraph = [
+                    (agent.cls, agent.cle),
+                    (int(link.start_node_id), int(link.end_node_id)),
+                ] + [
+                    (int(continuation.start_node_id), int(continuation.end_node_id))
+                    for continuation in continuation_links
+                ]
+                agent.route_link_ids = [
+                    int(link.link_id),
+                ] + [int(continuation.link_id) for continuation in continuation_links]
+            else:
+                agent.route_igraph = [
+                    (agent.cls, agent.cle),
+                    (int(link.start_node_id), int(link.end_node_id)),
+                ]
+                agent.route_link_ids = [int(link.link_id)]
             # print(agent.route_igraph)
 
         for link in self.links_df.itertuples():
@@ -628,13 +728,36 @@ class Runner:
                 self.nodes_df[['node_id', 'lat', 'lon']], how='left', on='node_id')
             node_predepart.to_csv(save_path, index=False)
 
+    def _finalize_simulation(self):
+        """Compute completed-agent/link statistics exactly once."""
+        self.tot_travel_time = 0
+        for agent in self.sim.all_agents.values():
+            if np.isnan(agent.arrival_time):
+                raise RuntimeError(f'Agent {agent.aid} has no arrival time')
+            self.tot_travel_time += agent.arrival_time
+        for link in self.sim.all_links.values():
+            if link.ltype == 'vl_in' or not link.completed_travel_time_list:
+                continue
+            total = sum(travel_time for _, travel_time in link.completed_travel_time_list)
+            link.ave_travel_time = total / len(link.completed_travel_time_list)
+            occupancy = max(1, link.occup_time)
+            link.ave_flow = len(link.completed_travel_time_list) / occupancy
+            self.ave_link_densities[link.lid] = self.ave_link_densities[link.lid] / occupancy
+        self.simulation_status = 'completed'
+
     def spatial_queue_simulation(self, scenario_name, t_end=10801, output_dir='traffic_outputs'):
+        os.makedirs(output_dir, exist_ok=True)
+        for subdirectory in ('t_stats', 'link_stats', 'node_stats'):
+            os.makedirs(os.path.join(output_dir, subdirectory), exist_ok=True)
+        self.simulation_status = 'running'
         arrival_output_path = f'{output_dir}/t_stats/arrivals_{scenario_name}.csv'
         with open(arrival_output_path, 'w') as t_stats_outfile:
             t_stats_outfile.write("t,arrival_count"+"\n")
 
         # iterate through each time step
-        for t in range(t_end):
+        # Include the horizon boundary in the completion check so vehicles
+        # arriving exactly at ``t_end`` are not misreported as timed out.
+        for t in range(t_end + 1):
             # run the spatial-queue simulation for one step
             self.single_step_sq_sim(t)
 
@@ -654,41 +777,25 @@ class Runner:
 
             # break if all agents have reached their destinations
             if not self.running:
-
-###################################################################### ADDITION STARTS
-
-                for agent in self.sim.all_agents.values():
-                    if np.isnan(agent.arrival_time):
-                        print("Error with arrival time.")
-                    self.tot_travel_time = self.tot_travel_time + agent.arrival_time
-
-                for link in self.sim.all_links.values():
-                    if link.ltype != 'vl_in' and len(link.completed_travel_time_list) > 0:
-                        tot_travel_time = 0
-                        for aid, travel_time in link.completed_travel_time_list:
-                            tot_travel_time = tot_travel_time + travel_time
-                        link.ave_travel_time = tot_travel_time/(len(link.completed_travel_time_list))
-
-                        # print("Completed travel time list of link " + str(link.lid) + ": " + str(link.completed_travel_time_list))
-                        # print("Alternative completed travel time list of link " + str(link.lid) + ": " + str(link.completed_travel_time_list_test))
-                        # print("Occupation time of link " + str(link.lid) + ": " + str(link.occup_time))
-                        # print("Total travel time of link " + str(link.lid) + ": " + str(tot_travel_time))
-                        # print("Average travel time of link " + str(link.lid) + ": " + str(link.ave_travel_time))
-
-                        link.ave_flow = len(link.completed_travel_time_list)/link.occup_time         # UNCOMMENT FOR TRAFFIC DATA GENERATION
-
-                        self.ave_link_densities[link.lid] = self.ave_link_densities[link.lid]/link.occup_time         # UNCOMMENT FOR TRAFFIC DATA GENERATION
-                        # print("Average density of link " + str(link.lid) + ": " + str(self.ave_link_densities[link.lid]))
-
-###################################################################### ADDITION ENDS
-                
+                self._finalize_simulation()
                 return
             # output time-step results every 100 seconds
-            if t % 100 == 0 and self.arrival_counts(t, arrival_output_path):
+            if t % 100 == 0:
+                if not self.arrival_counts(t, arrival_output_path):
+                    self._finalize_simulation()
+                    return
                 link_output_path = f'{output_dir}/link_stats/l{scenario_name}_at_{t}.csv'
                 node_output_path = f'{output_dir}/node_stats/n{scenario_name}_at_{t}.csv'
                 self.write_link_outputs(link_output_path)
                 self.write_node_outputs(node_output_path)
+
+        self.simulation_status = 'timeout'
+        self.simulation_error = (
+            f'No completion by t_end={t_end}; '
+            f'{sum(agent.status == "arr" for agent in self.sim.all_agents.values())}/'
+            f'{len(self.sim.all_agents)} agents arrived'
+        )
+        raise TimeoutError(self.simulation_error)
 
 ###################################################################### ADDITION STARTS
 
@@ -735,472 +842,189 @@ class Runner:
         return traffic_df
 
     def init_sq_simulation_with_Nash_flows(self, data, num_of_vehs, num_need_to_charge):
-        
-        # Create the road network, including the charging stations
-        self.sim.create_network(self.nodes_df, self.links_df, self.charging_stations_df)
-        # Create the agents; we do not assign their routes yet
-        self.sim.create_demand(self.od_df)
-
-        # Keys of the 'data' dictionary should give the od-pairs
-        od_pairs = list(data.keys())
-
-        # Assume single od-pair
-        od_pair = od_pairs[0]
-        no_ch_paths_and_flows = data[od_pair]['no charging type']
-        ch_paths_and_flows = data[od_pair]['charging type']
-
-
-        '''
-        Implementation without randomness
-        '''
-
-        no_ch_path_dist = []
-        for elem in no_ch_paths_and_flows:
-            if elem['flow'] > 10e-4:
-                no_ch_path_dist.append(elem['flow'])
-            else:
-                no_ch_path_dist.append(0)
-        no_ch_demand = sum(no_ch_path_dist)
-        no_ch_path_dist = [i/no_ch_demand for i in no_ch_path_dist]
-        
-        ch_path_dist = []
-        for elem in ch_paths_and_flows:
-            if elem['flow'] > 10e-4:
-                ch_path_dist.append(elem['flow'])
-            else:
-                ch_path_dist.append(0)
-        ch_demand = sum(ch_path_dist)
-        ch_path_dist = [i/ch_demand for i in ch_path_dist]
-
-        num_for_no_ch_paths = [round(p*(num_of_vehs-num_need_to_charge)) for p in no_ch_path_dist]
-        num_for_ch_paths = [round(p*num_need_to_charge) for p in ch_path_dist]
-        # REVISE THE FOLLOWING TWO LINES
-        num_for_no_ch_paths[-1] = num_for_no_ch_paths[-1] - 1
-        num_for_ch_paths[-1] = num_for_ch_paths[-1] + 1
-
-        assert sum(num_for_no_ch_paths) + sum(num_for_ch_paths) == len(self.od_df), "Error: Number of agents do not match the flow input"
-
-        no_ch_path_assignments = []
-        for j in range(len(num_for_no_ch_paths)):
-            no_ch_path_assignments = no_ch_path_assignments + [j]*num_for_no_ch_paths[j]
-        ch_path_assignments = []
-        for j in range(len(num_for_ch_paths)):
-            ch_path_assignments = ch_path_assignments + [j]*num_for_ch_paths[j]
-
-        # Get ids of agents that are not charging
-        non_ch_agent_ids = []
-        for agent in self.sim.all_agents.values():
-            if (not agent.is_EV) or (not agent.need_to_charge):
-                non_ch_agent_ids.append(agent.aid)
-        # Check whether the total number of not charging vehicles is consistent with the inflow
-        assert len(non_ch_agent_ids) == round(no_ch_demand), "Error: Number of non-charging agents do not match the flow input" 
-        # Get ids of agents that are charging
-        ch_agent_ids = []
-        for agent in self.sim.all_agents.values():
-            if agent.is_EV and agent.need_to_charge:
-                ch_agent_ids.append(agent.aid)
-        # Check whether the total number of not charging vehicles is consistent with the inflow
-        assert len(ch_agent_ids) == round(ch_demand), "Error: Number of charging agents do not match the flow input" 
-
-        # Write the paths as tuples of nodes
-        no_charging_paths = [] 
-        for elem in no_ch_paths_and_flows:
-            no_charging_paths.append(elem['path'])
-        charging_paths = [] 
-        for elem in ch_paths_and_flows:
-            charging_paths.append(elem['path'])
-        no_ch_paths_as_tuples = []
-        for path in no_charging_paths:
-            no_ch_path_as_tuple = []
-            for i in range(len(path)-1):
-                no_ch_path_as_tuple.append((path[i],path[i+1]))
-            no_ch_paths_as_tuples.append(no_ch_path_as_tuple)
-        # Set no-charging path as global variable
-        self.no_ch_routes = no_ch_paths_as_tuples
-        ch_paths_as_tuples = []
-        for path in charging_paths:
-            ch_path_as_tuple = []
-            for i in range(len(path)-1):
-                ch_path_as_tuple.append((path[i],path[i+1]))
-            ch_paths_as_tuples.append(ch_path_as_tuple)
-        # Set charging path as global variable
-        self.ch_routes = ch_paths_as_tuples
-
-        # Assign the paths of non-charging vehicles
-        for i in range(len(non_ch_agent_ids)):
-            for agent in self.sim.all_agents.values():
-                if agent.aid == non_ch_agent_ids[i]:
-                    path = no_ch_paths_as_tuples[no_ch_path_assignments[i]]
-                    agent.route_igraph = [(agent.cls, agent.cle)] + [(start_nid, end_nid) for (start_nid, end_nid) in path]
-                    # print('Route: ' + str(agent.route_igraph))
-                    # print('Station id: Not charging')
-        # Assign the paths and charging stations of charging vehicles
-        for i in range(len(ch_agent_ids)):
-            for agent in self.sim.all_agents.values():
-                if agent.aid == ch_agent_ids[i]:
-                    path = ch_paths_as_tuples[ch_path_assignments[i]]
-                    agent.route_igraph = [(agent.cls, agent.cle)] + [(start_nid, end_nid) for (start_nid, end_nid) in path]
-                    agent.go_to_station_id = ch_paths_and_flows[ch_path_assignments[i]]['station node']
-                    # print('Route: ' + str(agent.route_igraph))
-                    # print('Station id: ' + str(agent.go_to_station_id))
-
-        for link in self.links_df.itertuples():
-            self.ave_link_densities[link.link_id] = 0
-
-
-
-        '''
-        Implementation with randomness
-        '''
-        '''
-        # For the non-charging vehicles, use the flows on the paths to get a probability distribution
-        # We will set the i-th component of this distribution to be the probability that a non-charging agent uses the i-th path, independent of the other agents
-        no_ch_path_dist = []
-        for elem in no_ch_paths_and_flows:
-            if elem['flow'] > 10e-4:
-                no_ch_path_dist.append(elem['flow'])
-            else:
-                no_ch_path_dist.append(0)
-        no_ch_demand = sum(no_ch_path_dist)
-        no_ch_path_dist = [i/no_ch_demand for i in no_ch_path_dist]
-        # Repeat for charging agents
-        ch_path_dist = []
-        for elem in ch_paths_and_flows:
-            if elem['flow'] > 10e-4:
-                ch_path_dist.append(elem['flow'])
-            else:
-                ch_path_dist.append(0)
-        ch_demand = sum(ch_path_dist)
-        ch_path_dist = [i/ch_demand for i in ch_path_dist]
-
-        # Check whether the total number of agents is close to the total demand
-        assert round(no_ch_demand)+round(ch_demand) == len(self.od_df), "Error: Number of agents do not match the flow input"
-
-        # Sample from the above distributions: These characterize the agents' paths and charging stations (if they are EV)
-        # (sampling returns a list of indices, where each index corresponds to the index of the path that the agent takes)
-        no_ch_path_assignments = list(np.random.choice(range(len(no_ch_path_dist)), round(no_ch_demand), p=no_ch_path_dist))
-        ch_path_assignments = list(np.random.choice(range(len(ch_path_dist)), round(ch_demand), p=ch_path_dist))
-
-        # Get ids of agents that are not charging
-        non_ch_agent_ids = []
-        for agent in self.sim.all_agents.values():
-            if (not agent.is_EV) or (not agent.need_to_charge):
-                non_ch_agent_ids.append(agent.aid)
-        # Check whether the total number of not charging vehicles is consistent with the inflow
-        assert len(non_ch_agent_ids) == round(no_ch_demand), "Error: Number of non-charging agents do not match the flow input" 
-        # Get ids of agents that are charging
-        ch_agent_ids = []
-        for agent in self.sim.all_agents.values():
-            if agent.is_EV and agent.need_to_charge:
-                ch_agent_ids.append(agent.aid)
-        # Check whether the total number of not charging vehicles is consistent with the inflow
-        assert len(ch_agent_ids) == round(ch_demand), "Error: Number of charging agents do not match the flow input" 
-
-        # Write the paths as tuples of nodes
-        no_charging_paths = [] 
-        for elem in no_ch_paths_and_flows:
-            no_charging_paths.append(elem['path'])
-        charging_paths = [] 
-        for elem in ch_paths_and_flows:
-            charging_paths.append(elem['path'])
-        no_ch_paths_as_tuples = []
-        for path in no_charging_paths:
-            no_ch_path_as_tuple = []
-            for i in range(len(path)-1):
-                no_ch_path_as_tuple.append((path[i],path[i+1]))
-            no_ch_paths_as_tuples.append(no_ch_path_as_tuple)
-        # Set no-charging path as global variable
-        self.no_ch_routes = no_ch_paths_as_tuples
-        ch_paths_as_tuples = []
-        for path in charging_paths:
-            ch_path_as_tuple = []
-            for i in range(len(path)-1):
-                ch_path_as_tuple.append((path[i],path[i+1]))
-            ch_paths_as_tuples.append(ch_path_as_tuple)
-        # Set charging path as global variable
-        self.ch_routes = ch_paths_as_tuples
-
-        # Assign the paths of non-charging vehicles
-        for i in range(len(non_ch_agent_ids)):
-            for agent in self.sim.all_agents.values():
-                if agent.aid == non_ch_agent_ids[i]:
-                    path = no_ch_paths_as_tuples[no_ch_path_assignments[i]]
-                    agent.route_igraph = [(agent.cls, agent.cle)] + [(start_nid, end_nid) for (start_nid, end_nid) in path]
-                    # print('Route: ' + str(agent.route_igraph))
-                    # print('Station id: Not charging')
-        # Assign the paths and charging stations of charging vehicles
-        for i in range(len(ch_agent_ids)):
-            for agent in self.sim.all_agents.values():
-                if agent.aid == ch_agent_ids[i]:
-                    path = ch_paths_as_tuples[ch_path_assignments[i]]
-                    agent.route_igraph = [(agent.cls, agent.cle)] + [(start_nid, end_nid) for (start_nid, end_nid) in path]
-                    agent.go_to_station_id = ch_paths_and_flows[ch_path_assignments[i]]['station node']
-                    # print('Route: ' + str(agent.route_igraph))
-                    # print('Station id: ' + str(agent.go_to_station_id))
-
-        for link in self.links_df.itertuples():
-            self.ave_link_densities[link.link_id] = 0
-        '''
+        # Route assignments are now always initialized through the shared
+        # multi-OD contract.  Keep this legacy entry point for callers that
+        # still provide aggregate vehicle counts.
+        assignments_ch = {}
+        assignments_no = {}
+        for od, group in data.items():
+            assignments_no[od] = _legacy_flow_counts(group.get('no charging type', []), self.od_df, od, False)
+            assignments_ch[od] = _legacy_flow_counts(group.get('charging type', []), self.od_df, od, True)
+        return self._init_multi_od_path_assignment(data, assignments_ch, assignments_no)
 
     def init_sq_simulation_with_switched_agent(self, data, num_of_vehs, num_need_to_charge):
+        assignments_ch = {}
+        assignments_no = {}
+        for od, group in data.items():
+            assignments_no[od] = _legacy_flow_counts(group.get('no charging type', []), self.od_df, od, False)
+            assignments_ch[od] = _legacy_flow_counts(group.get('charging type', []), self.od_df, od, True)
+        return self._init_multi_od_path_assignment(data, assignments_ch, assignments_no)
 
-        # Create the road network, including the charging stations
+    def return_Nash_path_assignment(self, data, num_of_vehs, num_need_to_charge):
+        assignments_ch = {}
+        assignments_no = {}
+        for od, group in data.items():
+            assignments_no[od] = _legacy_flow_counts(group.get('no charging type', []), self.od_df, od, False)
+            assignments_ch[od] = _legacy_flow_counts(group.get('charging type', []), self.od_df, od, True)
+        return {'F1': assignments_no, 'F2': assignments_ch}
+
+    def _init_multi_od_path_assignment(self, data, num_for_ch_paths, num_for_no_ch_paths):
+        """Assign exact F1/F2 route counts for all OD pairs jointly."""
         self.sim.create_network(self.nodes_df, self.links_df, self.charging_stations_df)
-        # Create the agents; we do not assign their routes yet
         self.sim.create_demand(self.od_df)
+        self.no_ch_routes = []
+        self.ch_routes = []
+        self.route_groups = []
+        self.route_agent_ids = {}
 
-        # Keys of the 'data' dictionary should give the od-pairs
-        od_pairs = list(data.keys())
+        def normalize_key(value):
+            if isinstance(value, str):
+                origin, destination = value.split(',')
+                return int(origin), int(destination)
+            return tuple(value)
 
-        # Assume single od-pair
-        od_pair = od_pairs[0]
-        no_ch_paths_and_flows = data[od_pair]['no charging type']
-        ch_paths_and_flows = data[od_pair]['charging type']
+        def entries_to_pairs(entries):
+            pairs = []
+            for entry in entries:
+                path = entry.get('path', entry.get('links', []))
+                if path and isinstance(path[0], (tuple, list)) and len(path[0]) == 2:
+                    pairs.append([tuple(edge) for edge in path])
+                else:
+                    pairs.append([(path[i], path[i + 1]) for i in range(len(path) - 1)])
+            return pairs
 
-
-        '''
-        Implementation without randomness
-        '''
-
-        no_ch_path_dist = []
-        for elem in no_ch_paths_and_flows:
-            if elem['flow'] > 10e-4:
-                no_ch_path_dist.append(elem['flow'])
-            else:
-                no_ch_path_dist.append(0)
-        no_ch_demand = sum(no_ch_path_dist)
-        no_ch_path_dist = [i/no_ch_demand for i in no_ch_path_dist]
-        
-        ch_path_dist = []
-        for elem in ch_paths_and_flows:
-            if elem['flow'] > 10e-4:
-                ch_path_dist.append(elem['flow'])
-            else:
-                ch_path_dist.append(0)
-        ch_demand = sum(ch_path_dist)
-        ch_path_dist = [i/ch_demand for i in ch_path_dist]
-
-        num_for_no_ch_paths = [round(p*(num_of_vehs-num_need_to_charge)) for p in no_ch_path_dist]
-        num_for_ch_paths = [round(p*num_need_to_charge) for p in ch_path_dist]
-        # REVISE THE FOLLOWING TWO LINES
-        num_for_no_ch_paths[-1] = num_for_no_ch_paths[-1] - 1
-        num_for_ch_paths[-1] = num_for_ch_paths[-1] + 1
-
-
-        # SWITCH THE STRATEGY OF ONE AGENT
-        num_for_no_ch_paths[0] = num_for_no_ch_paths[0] - 4
-        num_for_no_ch_paths[1] = num_for_no_ch_paths[1] - 3
-        num_for_no_ch_paths[2] = num_for_no_ch_paths[2] + 2
-        num_for_no_ch_paths[3] = num_for_no_ch_paths[3] + 5
-        
-        assert sum(num_for_no_ch_paths) + sum(num_for_ch_paths) == len(self.od_df), "Error: Number of agents do not match the flow input"
-
-        no_ch_path_assignments = []
-        for j in range(len(num_for_no_ch_paths)):
-            no_ch_path_assignments = no_ch_path_assignments + [j]*num_for_no_ch_paths[j]
-        ch_path_assignments = []
-        for j in range(len(num_for_ch_paths)):
-            ch_path_assignments = ch_path_assignments + [j]*num_for_ch_paths[j]
-
-        # Get ids of agents that are not charging
-        non_ch_agent_ids = []
+        grouped_agents = {}
         for agent in self.sim.all_agents.values():
-            if (not agent.is_EV) or (not agent.need_to_charge):
-                non_ch_agent_ids.append(agent.aid)
-        # Check whether the total number of not charging vehicles is consistent with the inflow
-        assert len(non_ch_agent_ids) == round(no_ch_demand), "Error: Number of non-charging agents do not match the flow input" 
-        # Get ids of agents that are charging
-        ch_agent_ids = []
-        for agent in self.sim.all_agents.values():
-            if agent.is_EV and agent.need_to_charge:
-                ch_agent_ids.append(agent.aid)
-        # Check whether the total number of not charging vehicles is consistent with the inflow
-        assert len(ch_agent_ids) == round(ch_demand), "Error: Number of charging agents do not match the flow input" 
+            vehicle_type = 'F2' if agent.is_EV and agent.need_to_charge else 'F1'
+            grouped_agents.setdefault(((agent.origin_nid, agent.destin_nid), vehicle_type), []).append(agent)
+        for agents in grouped_agents.values():
+            agents.sort(key=lambda agent: agent.aid)
 
-        # Write the paths as tuples of nodes
-        no_charging_paths = [] 
-        for elem in no_ch_paths_and_flows:
-            no_charging_paths.append(elem['path'])
-        charging_paths = [] 
-        for elem in ch_paths_and_flows:
-            charging_paths.append(elem['path'])
-        no_ch_paths_as_tuples = []
-        for path in no_charging_paths:
-            no_ch_path_as_tuple = []
-            for i in range(len(path)-1):
-                no_ch_path_as_tuple.append((path[i],path[i+1]))
-            no_ch_paths_as_tuples.append(no_ch_path_as_tuple)
-        # Set no-charging path as global variable
-        self.no_ch_routes = no_ch_paths_as_tuples
-        ch_paths_as_tuples = []
-        for path in charging_paths:
-            ch_path_as_tuple = []
-            for i in range(len(path)-1):
-                ch_path_as_tuple.append((path[i],path[i+1]))
-            ch_paths_as_tuples.append(ch_path_as_tuple)
-        # Set charging path as global variable
-        self.ch_routes = ch_paths_as_tuples
+        assigned_agent_ids = set()
 
-        # Assign the paths of non-charging vehicles
-        for i in range(len(non_ch_agent_ids)):
-            for agent in self.sim.all_agents.values():
-                if agent.aid == non_ch_agent_ids[i]:
-                    path = no_ch_paths_as_tuples[no_ch_path_assignments[i]]
-                    agent.route_igraph = [(agent.cls, agent.cle)] + [(start_nid, end_nid) for (start_nid, end_nid) in path]
-                    # print('Route: ' + str(agent.route_igraph))
-                    # print('Station id: Not charging')
-        # Assign the paths and charging stations of charging vehicles
-        for i in range(len(ch_agent_ids)):
-            for agent in self.sim.all_agents.values():
-                if agent.aid == ch_agent_ids[i]:
-                    path = ch_paths_as_tuples[ch_path_assignments[i]]
-                    agent.route_igraph = [(agent.cls, agent.cle)] + [(start_nid, end_nid) for (start_nid, end_nid) in path]
-                    agent.go_to_station_id = ch_paths_and_flows[ch_path_assignments[i]]['station node']
-                    # print('Route: ' + str(agent.route_igraph))
-                    # print('Station id: ' + str(agent.go_to_station_id))
+        for raw_od, group_data in data.items():
+            od = normalize_key(raw_od)
+            no_entries = group_data.get('no charging type', group_data.get('F1', []))
+            ch_entries = group_data.get('charging type', group_data.get('F2', []))
+            no_paths = entries_to_pairs(no_entries)
+            ch_paths = entries_to_pairs(ch_entries)
+            self.no_ch_routes.extend(no_paths)
+            self.ch_routes.extend(ch_paths)
+
+            for vehicle_type, entries, paths, counts_input in (
+                ('F1', no_entries, no_paths, num_for_no_ch_paths),
+                ('F2', ch_entries, ch_paths, num_for_ch_paths),
+            ):
+                if vehicle_type == 'F1' and any(
+                    entry.get('station node') is not None for entry in entries
+                ):
+                    raise ValueError(f'F1 route for {od} illegally contains a charger')
+                if vehicle_type == 'F2' and any(
+                    entry.get('station node') is None for entry in entries
+                ):
+                    raise ValueError(f'F2 route for {od} must contain exactly one charger')
+                if isinstance(counts_input, dict):
+                    counts = counts_input.get(od, counts_input.get(f'{od[0]},{od[1]}', []))
+                else:
+                    counts = counts_input if len(data) == 1 else []
+                counts = [int(value) for value in (counts or [0] * len(paths))]
+                agents = grouped_agents.get((od, vehicle_type), [])
+                if len(counts) != len(paths):
+                    raise ValueError(f'Count/route mismatch for {od} {vehicle_type}')
+                if sum(counts) != len(agents):
+                    raise ValueError(
+                        f'Assigned {sum(counts)} vehicles for {od} {vehicle_type}, '
+                        f'but demand contains {len(agents)}'
+                    )
+                group = {
+                    'od_pair': od,
+                    'vehicle_type': vehicle_type,
+                    'entries': entries,
+                    'paths': paths,
+                    'route_ids': [
+                        entry.get('route_id', f'{od[0]}_{od[1]}_{vehicle_type}_{index}')
+                        for index, entry in enumerate(entries)
+                    ],
+                    'agent_ids': [],
+                    'route_agent_ids': {i: [] for i in range(len(paths))},
+                }
+                self.route_groups.append(group)
+                assignments = [index for index, count in enumerate(counts) for _ in range(count)]
+                for agent, route_index in zip(agents, assignments):
+                    link_ids = entries[route_index].get('link_ids', [])
+                    if link_ids and len(link_ids) != len(paths[route_index]):
+                        raise ValueError(
+                            f'Route/link identity mismatch for {od} {vehicle_type} '
+                            f'route {route_index}'
+                        )
+                    agent.route_igraph = [(agent.cls, agent.cle)] + list(paths[route_index])
+                    agent.route_link_ids = [int(value) for value in link_ids]
+                    agent.route_group_key = (od, vehicle_type)
+                    agent.route_index = route_index
+                    if vehicle_type == 'F2':
+                        agent.go_to_station_id = entries[route_index].get('station node')
+                    group['agent_ids'].append(agent.aid)
+                    assigned_agent_ids.add(agent.aid)
+                    group['route_agent_ids'][route_index].append(agent.aid)
+                self.route_agent_ids[(od, vehicle_type)] = group['route_agent_ids']
 
         for link in self.links_df.itertuples():
             self.ave_link_densities[link.link_id] = 0
-
-    def return_Nash_path_assignment(self, data, num_of_vehs, num_need_to_charge):
-
-        # Keys of the 'data' dictionary should give the od-pairs
-        od_pairs = list(data.keys())
-
-        # Assume single od-pair
-        od_pair = od_pairs[0]
-        no_ch_paths_and_flows = data[od_pair]['no charging type']
-        ch_paths_and_flows = data[od_pair]['charging type']
-
-        no_ch_path_dist = []
-        for elem in no_ch_paths_and_flows:
-            if elem['flow'] > 10e-4:
-                no_ch_path_dist.append(elem['flow'])
-            else:
-                no_ch_path_dist.append(0)
-        no_ch_demand = sum(no_ch_path_dist)
-        no_ch_path_dist = [i/no_ch_demand for i in no_ch_path_dist]
-        
-        ch_path_dist = []
-        for elem in ch_paths_and_flows:
-            if elem['flow'] > 10e-4:
-                ch_path_dist.append(elem['flow'])
-            else:
-                ch_path_dist.append(0)
-        ch_demand = sum(ch_path_dist)
-        ch_path_dist = [i/ch_demand for i in ch_path_dist]
-
-        num_for_no_ch_paths = [round(p*(num_of_vehs-num_need_to_charge)) for p in no_ch_path_dist]
-        num_for_ch_paths = [round(p*num_need_to_charge) for p in ch_path_dist]
-
-        # while num_need_to_charge != sum(num_for_no_ch_paths):
-        #     if num_need_to_charge - sum(num_for_no_ch_paths) > 0:
-        #         max_ch_path_index = max(enumerate(num_for_ch_paths), key=lambda x: x[1])[0]
-        #         num_for_ch_paths[max_ch_path_index] -= 1
-        #         temp = [i if i>0 else num_of_vehs+2 for i in num_for_no_ch_paths]
-        #         min_no_ch_path_index = max(enumerate(temp), key=lambda x: x[1])[0]
-        #         num_for_no_ch_paths[min_no_ch_path_index] += 1
-        #     else:
-        #         max_no_ch_path_index = max(enumerate(num_for_no_ch_paths), key=lambda x: x[1])[0]
-        #         num_for_no_ch_paths[max_no_ch_path_index] -= 1
-        #         temp = [i if i>0 else num_of_vehs+2 for i in num_for_ch_paths]
-        #         min_ch_path_index = max(enumerate(temp), key=lambda x: x[1])[0]
-        #         num_for_ch_paths[min_ch_path_index] += 1
-        
-        assert sum(num_for_no_ch_paths) + sum(num_for_ch_paths) == len(self.od_df), "Error: Number of agents do not match the flow input"
-                
-        return num_for_ch_paths, num_for_no_ch_paths
+        if assigned_agent_ids != set(self.sim.all_agents):
+            missing = sorted(set(self.sim.all_agents) - assigned_agent_ids)
+            raise ValueError(
+                f'Not every demand agent received a route; missing agent IDs: {missing[:10]}'
+            )
 
     def init_sq_simulation_with_path_assignment(self,data,num_for_ch_paths,num_for_no_ch_paths):
 
-        # Create the road network, including the charging stations
-        self.sim.create_network(self.nodes_df, self.links_df, self.charging_stations_df)
-        # Create the agents; we do not assign their routes yet
-        self.sim.create_demand(self.od_df)
+        # Multi-OD assignments use exact per-OD/type counts for every caller.
+        return self._init_multi_od_path_assignment(data, num_for_ch_paths, num_for_no_ch_paths)
 
-        # Keys of the 'data' dictionary should give the od-pairs
-        od_pairs = list(data.keys())
+    def _check_route_details(self):
+        """Return agent-wise route travel-time summaries for multi-OD runs."""
+        details = {}
+        link_by_id = self.sim.all_links
+        for group in self.route_groups:
+            key = (tuple(group['od_pair']), group['vehicle_type'])
+            route_results = []
+            for route_index, path in enumerate(group['paths']):
+                agent_ids = group['route_agent_ids'].get(route_index, [])
+                observed = []
+                for agent_id in agent_ids:
+                    agent = self.sim.all_agents.get(agent_id)
+                    if agent is not None and np.isfinite(agent.arrival_time):
+                        observed.append(float(agent.arrival_time - agent.dept_time))
+                if observed:
+                    travel_time = float(np.mean(observed))
+                else:
+                    travel_time = 0.0
+                    for start_nid, end_nid in path:
+                        try:
+                            link_id = self.sim.resolve_link_id(start_nid, end_nid)
+                        except ValueError:
+                            # Route records with explicit link IDs are allowed.
+                            entry = group['entries'][route_index]
+                            link_ids = entry.get('link_ids', [])
+                            edge_index = list(path).index((start_nid, end_nid))
+                            link_id = link_ids[edge_index]
+                        link = link_by_id[int(link_id)]
+                        travel_time += float(link.fft if np.isfinite(link.fft) else link.ave_travel_time)
+                    if group['vehicle_type'] == 'F2':
+                        travel_time += float(group['entries'][route_index].get('station_cost', 0.0) or 0.0)
+                details.setdefault(key, []).append({
+                    'route_id': group.get('route_ids', [])[route_index]
+                    if route_index < len(group.get('route_ids', [])) else None,
+                    'route_index': route_index,
+                    'travel_time': travel_time,
+                    'agent_count': len(agent_ids),
+                    'used': bool(agent_ids),
+                })
+        return details
 
-        # Assume single od-pair
-        od_pair = od_pairs[0]
-        no_ch_paths_and_flows = data[od_pair]['no charging type']
-        ch_paths_and_flows = data[od_pair]['charging type']
-
-        no_ch_path_assignments = []
-        for j in range(len(num_for_no_ch_paths)):
-            no_ch_path_assignments = no_ch_path_assignments + [j]*num_for_no_ch_paths[j]
-        ch_path_assignments = []
-        for j in range(len(num_for_ch_paths)):
-            ch_path_assignments = ch_path_assignments + [j]*num_for_ch_paths[j]
-
-        # Get ids of agents that are not charging
-        non_ch_agent_ids = []
-        for agent in self.sim.all_agents.values():
-            if (not agent.is_EV) or (not agent.need_to_charge):
-                non_ch_agent_ids.append(agent.aid)
-        # # Check whether the total number of not charging vehicles is consistent with the inflow
-        # assert len(non_ch_agent_ids) == round(no_ch_demand), "Error: Number of non-charging agents do not match the flow input" 
-        # Get ids of agents that are charging
-        ch_agent_ids = []
-        for agent in self.sim.all_agents.values():
-            if agent.is_EV and agent.need_to_charge:
-                ch_agent_ids.append(agent.aid)
-        # # Check whether the total number of not charging vehicles is consistent with the inflow
-        # assert len(ch_agent_ids) == round(ch_demand), "Error: Number of charging agents do not match the flow input" 
-
-        # Write the paths as tuples of nodes
-        no_charging_paths = [] 
-        for elem in no_ch_paths_and_flows:
-            no_charging_paths.append(elem['path'])
-        charging_paths = [] 
-        for elem in ch_paths_and_flows:
-            charging_paths.append(elem['path'])
-        
-        no_ch_paths_as_tuples = []
-        for path in no_charging_paths:
-            no_ch_path_as_tuple = []
-            for i in range(len(path)-1):
-                no_ch_path_as_tuple.append((path[i],path[i+1]))
-            no_ch_paths_as_tuples.append(no_ch_path_as_tuple)
-        # Set no-charging path as global variable
-        self.no_ch_routes = no_ch_paths_as_tuples
-
-        ch_paths_as_tuples = []
-        for path in charging_paths:
-            ch_path_as_tuple = []
-            for i in range(len(path)-1):
-                ch_path_as_tuple.append((path[i],path[i+1]))
-            ch_paths_as_tuples.append(ch_path_as_tuple)
-        # Set charging path as global variable
-        self.ch_routes = ch_paths_as_tuples
-
-        # Assign the paths of non-charging vehicles
-        for i in range(len(non_ch_agent_ids)):
-            for agent in self.sim.all_agents.values():
-                if agent.aid == non_ch_agent_ids[i]:
-                    path = no_ch_paths_as_tuples[no_ch_path_assignments[i]]
-                    agent.route_igraph = [(agent.cls, agent.cle)] + [(start_nid, end_nid) for (start_nid, end_nid) in path]
-                    # print('Route: ' + str(agent.route_igraph))
-                    # print('Station id: Not charging')
-        # Assign the paths and charging stations of charging vehicles
-        for i in range(len(ch_agent_ids)):
-            for agent in self.sim.all_agents.values():
-                if agent.aid == ch_agent_ids[i]:
-                    path = ch_paths_as_tuples[ch_path_assignments[i]]
-                    agent.route_igraph = [(agent.cls, agent.cle)] + [(start_nid, end_nid) for (start_nid, end_nid) in path]
-                    agent.go_to_station_id = ch_paths_and_flows[ch_path_assignments[i]]['station node']
-                    # print('Route: ' + str(agent.route_igraph))
-                    # print('Station id: ' + str(agent.go_to_station_id))
-
-        # # Prints paths of all agents:
-        # for agent in self.sim.all_agents.values():
-        #     print(agent.route_igraph)
-        #     print(agent.go_to_station_id)
-
-        for link in self.links_df.itertuples():
-            self.ave_link_densities[link.link_id] = 0
-
-    def check_NE(self):
+    def check_NE(self, return_details=False):
+        if return_details and self.route_groups:
+            return self._check_route_details()
         
         ch_routes_links = []
         for route in self.ch_routes:

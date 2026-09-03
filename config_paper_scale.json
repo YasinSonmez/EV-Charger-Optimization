@@ -1,0 +1,74 @@
+{
+  "coordinates": [38.902, 38.888, -77.023, -77.037],
+  "num_chargers": 2,
+  "possible_charger_positions": [0, 1, 2],
+  "od_demand": {
+    "0,1": [60, 120]
+  },
+  "max_iter": 1000,
+  "use_derivatives": false,
+  "single_swap": true,
+  "use_cvxpy": true,
+  "plot_info": false,
+  "calculate_on_all_possible_positions": true,
+  "route_analysis": {
+    "analyze_top_k_routes": true,
+    "k_values": [16],
+    "run_parameter_sweep": false
+  },
+  "queue_simulation": {
+    "enabled": true,
+    "K": 16,
+    "ALPHA": 0.01,
+    "NUM_ITERS": 100,
+    "MAX_NE_ITERATIONS": 200,
+    "N": 100,
+    "WORKERS": null,
+    "single_swap": true,
+    "SIMULATION_HORIZON": 10801
+  },
+  "pipeline": {
+    "random_seed": 42,
+    "parallel_workers": null,
+    "skip_bpr_fitting": false,
+    "skip_cg_optimization": false,
+    "skip_queue_simulation": false,
+    "cg_fit_policy": "allow_degraded",
+    "bpr_generation": {
+      "mode": "historical_artifact_compatible",
+      "num_samples": 25,
+      "max_flow": 250,
+      "fit_validation": "parameter_complete",
+      "fallback_policy": "legacy_proxy_and_constant",
+      "historical_reference_commit": "37eab33",
+      "capacity_source": "simulator",
+      "capacity_per_lane": 1900.0,
+      "calibration_window_hours": 0.1,
+      "workers": null,
+      "fit_workers": null,
+      "save_fit_plots": true,
+      "timeout": 300,
+      "failure_policy": "proxy",
+      "allow_proxy": true,
+      "missing_context_policy": "synthetic_boundary",
+      "synthetic_context_capacity_multiplier": 10.0,
+      "synthetic_context_length_m": 1.0,
+      "simulation_horizon": 10801,
+      "require_full_fit": false,
+      "min_r2": 0.0,
+      "fit_screening": "none",
+      "correlation_threshold": 0.0,
+      "variation_ratio_threshold": 0.0,
+      "accept_low_r2": true,
+      "route_mode": "contextual",
+      "fixed_references": false,
+      "force_regenerate": true,
+      "min_samples": 2
+    }
+  },
+  "road_filter": {
+    "enabled": true,
+    "merge_chains": true,
+    "highway_types": ["motorway", "trunk", "primary", "secondary"]
+  }
+}

@@ -14,22 +14,59 @@ import matplotlib.colors as mcolors
 from src.road_network import RoadNet
 
 class Network(RoadNet):
-    def __init__(self, coordinates=[38.98211, 38.979, -76.93006, -76.93704], chargers=None, parameter_fit_results=None, od_demand=None, highway_types=None, prune_dead_ends=False):
+    def __init__(self, coordinates=[38.98211, 38.979, -76.93006, -76.93704], chargers=None, parameter_fit_results=None, od_demand=None, road_net=None, charger_self_link_length=100.0, cg_fit_policy='allow_degraded'):
         # Parameters
         self.charging_to_no_charging_ratio = 0.5
-        self.charger_self_link_length = 100  # this is important
+        self.charger_self_link_length = float(charger_self_link_length)
         self.paths_per_od = 9
         self.paths_per_oc_and_cd = 4
         self.parameter_fit_results = parameter_fit_results
+        self.cg_fit_policy = str(cg_fit_policy)
         self.use_cvxpy = False  # Flag to determine which optimization method to use
 
-        self.net = RoadNet('College Park')
-        self.net.get_map(coordinates[0], coordinates[1], coordinates[2], coordinates[3],
-                         highway_types=highway_types, prune_dead_ends=prune_dead_ends)
-        self.DiGraph = nx.DiGraph(self.net.graph)  # DiGraph to find routes
+        if road_net is not None:
+            # Create a detached copy so mutations don't affect the shared instance
+            self.net = RoadNet('__copy__')
+            self.net.graph = road_net.graph.copy()
+            self.net.nodes = road_net.nodes.copy()
+            self.net.edges = road_net.edges.copy()
+            self.net.osmid_to_nid_dict = dict(road_net.osmid_to_nid_dict)
+            self.net.nid_to_osmid_dict = dict(road_net.nid_to_osmid_dict)
+            self.net.stage_counts = road_net.stage_counts
+            self.net.stage_maps = road_net.stage_maps
+        else:
+            self.net = RoadNet('College Park')
+            self.net.get_map(coordinates[0], coordinates[1], coordinates[2], coordinates[3])
+        # Keep a deterministic routing view while preserving the canonical
+        # link identity in edge attributes.  Parallel links are never scanned
+        # repeatedly or selected by DataFrame position.
+        self.DiGraph = nx.DiGraph()
+        for node in self.net.graph.nodes:
+            self.DiGraph.add_node(node)
+        for u, v, key, attrs in self.net.graph.edges(keys=True, data=True):
+            candidate = dict(attrs)
+            candidate['_edge_key'] = key
+            previous = self.DiGraph.get_edge_data(u, v)
+            if previous is None or (float(candidate.get('length', 0)), str(key)) < (float(previous.get('length', 0)), str(previous.get('_edge_key', ''))):
+                self.DiGraph.add_edge(u, v, **candidate)
 
         self.n = len(self.net.nodes)
         self.l = len(self.net.edges)  # Number of total links
+        self.pair_to_link_ids = {}
+        for edge in self.net.edges.itertuples():
+            self.pair_to_link_ids.setdefault(
+                (int(edge.start_node_id), int(edge.end_node_id)), []
+            ).append(int(edge.link_id))
+        for pair in self.pair_to_link_ids:
+            self.pair_to_link_ids[pair].sort()
+        edge_identity_to_link_id = {}
+        for edge in self.net.edges.itertuples():
+            edge_identity_to_link_id[(str(edge.start_osmid), str(edge.end_osmid), str(getattr(edge, 'edge_key', '')))] = int(edge.link_id)
+        for start_osmid, end_osmid, attrs in self.DiGraph.edges(data=True):
+            edge_key = attrs.get('_edge_key', '')
+            attrs['link_id'] = edge_identity_to_link_id.get(
+                (str(start_osmid), str(end_osmid), str(edge_key))
+            )
 
         # Chargers can be a list of node IDs
         if chargers is not None:
@@ -59,6 +96,8 @@ class Network(RoadNet):
         self.objective_second_derivative_count = 0
 
         self.obj_history = []
+        self.solver_metadata = {}
+        self.bpr_provenance = {}
 
         # CVXPY related attributes
         self.cvxpy_link_flows = None
@@ -136,6 +175,13 @@ class Network(RoadNet):
             return
 
         edges_df = self.net.edges.sort_values("link_id").copy()
+        flows = np.asarray(flows, dtype=float)
+        if len(flows) != len(edges_df):
+            active_indices = getattr(self, 'active_link_indices', None)
+            if active_indices is not None and len(active_indices) == len(flows):
+                expanded = np.zeros(len(edges_df), dtype=float)
+                expanded[np.asarray(active_indices, dtype=int)] = flows
+                flows = expanded
         if len(flows) != len(edges_df):
             print(f"Flow length {len(flows)} does not match number of edges {len(edges_df)}.")
             return
@@ -245,6 +291,7 @@ class Network(RoadNet):
             'length': [self.charger_self_link_length] * len(chargers_list),
             'start_osmid': chargers_osmid_list,
             'end_osmid': chargers_osmid_list,
+            'edge_key': [f'charger_{charger}' for charger in chargers_list],
             'geometry': circle_wkts,
         })
         # charger link parameters
@@ -258,6 +305,8 @@ class Network(RoadNet):
                 'cap_fit': 0.527778,
                 'a_fit': 0.0,
                 'b_fit': 1,
+                'fit_status': 'derived_charger_link',
+                'observation_source': 'derived_charger_self_link',
                 })
             self.parameter_fit_results = pd.concat([self.parameter_fit_results, self_links_parameters_df], ignore_index=True)
 
@@ -266,6 +315,12 @@ class Network(RoadNet):
 
         # Append self_links_df to self.net.edges
         self.net.edges = pd.concat([self.net.edges, self_links_df], ignore_index=True)
+        for row in self_links_df.itertuples():
+            self.pair_to_link_ids.setdefault(
+                (int(row.start_node_id), int(row.end_node_id)), []
+            ).append(int(row.link_id))
+        for pair in self.pair_to_link_ids:
+            self.pair_to_link_ids[pair].sort()
 
     def create_random_chargers(self, c):
         chargers = set()
@@ -280,6 +335,35 @@ class Network(RoadNet):
             self.net.nid_to_osmid_dict[destination_node_id],
             weight=weight), k))
         return paths
+
+    def _link_id_for_node_pair(self, start_node_id, end_node_id):
+        candidates = self.pair_to_link_ids.get((int(start_node_id), int(end_node_id)), [])
+        if len(candidates) != 1:
+            raise ValueError(
+                f'Route edge {start_node_id}->{end_node_id} is ambiguous; '
+                f'candidate link_ids={candidates}'
+            )
+        return candidates[0]
+
+    def _path_to_link_ids(self, path):
+        link_ids = []
+        for index in range(len(path) - 1):
+            start_node, end_node = path[index], path[index + 1]
+            candidates = self.pair_to_link_ids.get((int(start_node), int(end_node)), [])
+            if len(candidates) == 1:
+                link_ids.append(candidates[0])
+                continue
+            start_osmid = self.net.nid_to_osmid_dict.get(int(start_node), start_node)
+            end_osmid = self.net.nid_to_osmid_dict.get(int(end_node), end_node)
+            edge_data = self.DiGraph.get_edge_data(start_osmid, end_osmid)
+            selected = edge_data.get('link_id') if edge_data else None
+            if selected is None:
+                raise ValueError(
+                    f'Route edge {start_node}->{end_node} is ambiguous; '
+                    f'candidate link_ids={candidates}'
+                )
+            link_ids.append(int(selected))
+        return link_ids
 
     def create_OD_paths(self, od_pair, k):
         # creates different paths for the given OD pair
@@ -343,11 +427,7 @@ class Network(RoadNet):
                 t = len(od_pair_routes)
                 self.A[2*i+c][route_idx:route_idx+t] = 1
                 for j, od_pair_route_j in enumerate(od_pair_routes):
-                    for k, route_j_elem in enumerate(od_pair_route_j):
-                        if k == len(od_pair_route_j)-1:
-                            break
-                        links_df = self.net.edges
-                        link_idx = int(links_df[(links_df['start_node_id'] == route_j_elem) & (links_df['end_node_id'] == od_pair_route_j[k+1])]['link_id'].iloc[0])
+                    for link_idx in self._path_to_link_ids(od_pair_route_j):
                         self.R[link_idx][route_idx+j] = 1
                 route_idx += t
 
@@ -359,6 +439,8 @@ class Network(RoadNet):
 
         # Optionally, you can create a mapping or list of active link indices if needed for other purposes
         self.active_link_indices = np.where(active_links)[0]
+
+        self._validate_active_bpr_provenance()
 
         # BPR function values for each link (should be same size as number of links)
         # Extracting the 'a_fit' values for the active links using the active link indices
@@ -379,6 +461,79 @@ class Network(RoadNet):
         self.flow = np.zeros(self.l)
 
         assert len(self.a) == len(self.active_link_indices), (len(self.a), len(self.active_link_indices))
+
+    def _validate_active_bpr_provenance(self):
+        """Validate and report BPR provenance for links used by CG routes."""
+        policy = self.cg_fit_policy
+        if policy not in {'allow_degraded', 'reject_proxy_or_constant', 'validated_only'}:
+            raise ValueError(
+                'cg_fit_policy must be allow_degraded, reject_proxy_or_constant, or validated_only'
+            )
+        fit_table = self.parameter_fit_results
+        if fit_table is None:
+            raise ValueError('CG requires a BPR fit table')
+        active_ids = [int(value) for value in self.active_link_indices]
+        rows = fit_table.loc[fit_table['link_id'].astype(int).isin(active_ids)].copy()
+        missing = sorted(set(active_ids) - set(rows['link_id'].astype(int)))
+        if missing:
+            raise ValueError(f'CG BPR table is missing active link_ids={missing[:10]}')
+        statuses = rows.get(
+            'fit_status', pd.Series('unknown', index=rows.index)
+        ).fillna('unknown').astype(str)
+        sources = rows.get(
+            'observation_source', pd.Series('simulated_contextual', index=rows.index)
+        ).fillna('simulated_contextual').astype(str)
+        status_counts = statuses.value_counts().to_dict()
+        source_counts = sources.value_counts().to_dict()
+        derived_mask = (
+            sources.eq('derived_charger_self_link')
+            | statuses.eq('derived_charger_link')
+        )
+        degraded_mask = (
+            (~derived_mask)
+            & (
+                sources.eq('proxy')
+                | statuses.isin({'proxy', 'constant', 'constant_fallback', 'failed', 'failed_quality', 'full_relaxed'})
+            )
+        )
+        degraded_ids = rows.loc[degraded_mask, 'link_id'].astype(int).tolist()
+        errors = []
+        if policy in {'reject_proxy_or_constant', 'validated_only'}:
+            rejected = (~derived_mask) & (
+                sources.eq('proxy') | statuses.isin({
+                    'proxy', 'constant', 'constant_fallback', 'failed', 'failed_quality'
+                })
+            )
+            if policy == 'validated_only':
+                rejected = rejected | (
+                    (~derived_mask)
+                    & ((statuses != 'full') | (sources != 'simulated_contextual'))
+                )
+            if rejected.any():
+                errors.append(
+                    f'active degraded BPR links={rows.loc[rejected, "link_id"].astype(int).tolist()[:20]}'
+                )
+        if errors:
+            raise ValueError(
+                f'CG BPR provenance policy {policy} rejected active links: ' + '; '.join(errors)
+            )
+        self.bpr_provenance = {
+            'policy': policy,
+            'active_link_count': int(len(rows)),
+            'fit_status_counts': {str(key): int(value) for key, value in status_counts.items()},
+            'observation_source_counts': {str(key): int(value) for key, value in source_counts.items()},
+            'degraded_link_ids': degraded_ids,
+            'degraded': bool(degraded_ids),
+            'warning': (
+                'CG used degraded BPR provenance on active links'
+                if degraded_ids else None
+            ),
+        }
+        if degraded_ids:
+            print(
+                f'CG provenance warning: {len(degraded_ids)} active links have '
+                f'degraded BPR data under policy={policy}'
+            )
 
     def create_random_od_pairs_and_demands(self, d = 3):
         # Create a random demand for charging and no charging cars
@@ -483,17 +638,81 @@ class Network(RoadNet):
                 lc1 = LinearConstraint(self.A, self.b, self.b)
 
                 # Either use the derivatives or not
+                primary_kwargs = {
+                    'bounds': bounds,
+                    'constraints': lc1,
+                    'method': "trust-constr",
+                    'options': {'disp': disp, 'maxiter': max_iter},
+                    'callback': self.optimization_callback,
+                }
                 if use_derivatives:
-                    self.res = minimize(self.objective, self.x0,
-                                        jac=self.objective_first_derivative, hess=self.objective_second_derivative,
-                                        bounds=bounds, constraints=lc1,
-                                        method="trust-constr", options={'disp': disp, 'maxiter': max_iter},
-                                        callback=self.optimization_callback)
+                    primary_kwargs.update({
+                        'jac': self.objective_first_derivative,
+                        'hess': self.objective_second_derivative,
+                    })
+                self.res = minimize(self.objective, self.x0, **primary_kwargs)
+                feasibility_tolerance = 1e-5
+
+                def constraint_residual(result):
+                    if getattr(result, 'x', None) is None:
+                        return float('inf')
+                    return float(np.max(np.abs(self.A @ result.x - self.b)))
+
+                primary_residual = constraint_residual(self.res)
+                self.solver_metadata = {
+                    'requested': 'scipy_trust-constr',
+                    'status': str(getattr(self.res, 'message', 'unknown')),
+                    'success': bool(getattr(self.res, 'success', False)),
+                    'iterations': int(getattr(self.res, 'nit', 0) or 0),
+                    'function_evaluations': int(getattr(self.res, 'nfev', 0) or 0),
+                    'constraint_violation': primary_residual,
+                    'optimality': float(getattr(self.res, 'optimality', 0.0) or 0.0),
+                    'max_iter': int(max_iter),
+                    'attempts': [{'method': 'trust-constr', 'success': bool(getattr(self.res, 'success', False)), 'constraint_residual': primary_residual}],
+                }
+                if not self.res.success or primary_residual > feasibility_tolerance:
+                    # trust-constr can stop at a finite but infeasible point on
+                    # route libraries with many equality constraints.  SLSQP
+                    # is a bounded, deterministic feasibility fallback; a
+                    # result is accepted only when demand constraints close.
+                    fallback = minimize(
+                        self.objective,
+                        self.x0,
+                        bounds=bounds,
+                        constraints=lc1,
+                        method='SLSQP',
+                        options={'disp': disp, 'maxiter': max_iter, 'ftol': 1e-9},
+                    )
+                    fallback_residual = constraint_residual(fallback)
+                    self.solver_metadata['attempts'].append({
+                        'method': 'SLSQP',
+                        'success': bool(getattr(fallback, 'success', False)),
+                        'constraint_residual': fallback_residual,
+                        'status': str(getattr(fallback, 'message', 'unknown')),
+                    })
+                    if fallback.success and fallback_residual <= feasibility_tolerance:
+                        self.res = fallback
+                        self.solver_metadata.update({
+                            'selected': 'SLSQP',
+                            'status': str(fallback.message),
+                            'success': True,
+                            'iterations': int(getattr(fallback, 'nit', 0) or 0),
+                            'function_evaluations': int(getattr(fallback, 'nfev', 0) or 0),
+                            'constraint_violation': fallback_residual,
+                        })
+                    else:
+                        self.solver_metadata.update({
+                            'selected': None,
+                            'success': False,
+                            'constraint_violation': fallback_residual,
+                        })
+                        self.travel_time_obj = float('inf')
+                        return False
                 else:
-                    self.res = minimize(self.objective, self.x0,
-                                        bounds=bounds, constraints=lc1,
-                                        method="trust-constr", options={'disp': disp, 'maxiter': max_iter},
-                                        callback=self.optimization_callback)
+                    self.solver_metadata['selected'] = 'trust-constr'
+                self.solver_metadata = {
+                    **self.solver_metadata,
+                }
                 # Calculate the travel time objective
                 self.travel_time_objective()
 
@@ -766,6 +985,24 @@ class Network(RoadNet):
         solver_order = []
         if 'CLARABEL' in available_solvers:
             solver_order.append(("CLARABEL", clarabel_params))
+        # Clarabel is the preferred solver for the conic BPR formulation.  It
+        # can report ``InsufficientProgress`` on some ill-conditioned charger
+        # placements even when the problem is feasible.  SCS supports the
+        # same cone family and is an explicit fallback; do not rely on
+        # CVXPY's default retry because that usually selects Clarabel again.
+        if 'SCS' in available_solvers:
+            solver_order.append(("SCS", {
+                'eps': 1e-4,
+                'max_iters': 100000,
+            }))
+        if not solver_order and available_solvers:
+            solver_order.append((available_solvers[0], {}))
+
+        self.solver_metadata = {
+            'requested': 'cvxpy_default',
+            'available': list(available_solvers),
+            'attempts': [],
+        }
         
         # If CLARABEL is not available or if it fails, CVXPY will try its default solver.
         # The loop below handles trying solvers from solver_order first.
@@ -773,9 +1010,11 @@ class Network(RoadNet):
         # or simply let the error propagate if no solver works.
         # For now, we ensure that if CLARABEL is not in solver_order, the list remains empty, prompting CVXPY default.
             
-        if not solver_order and available_solvers: # This will now only trigger if CLARABEL isn't available
-            print("CLARABEL not found or not in available_solvers. Will attempt CVXPY default solver if primary fails.")
-            # solver_order.append((available_solvers[0], {})) # No, let CVXPY pick its default if CLARABEL fails
+        if not solver_order and not available_solvers:
+            self.solver_metadata.update({
+                'status': 'no_solver_available',
+                'error': 'CVXPY reports no installed solver',
+            })
             
         # Try solvers in priority order (CLARABEL if present)
         solver_success = False
@@ -785,11 +1024,20 @@ class Network(RoadNet):
             try:
                 print(f"Trying solver: {solver}")
                 result = prob.solve(solver=solver, verbose=True, **params)
+                self.solver_metadata['attempts'].append({
+                    'solver': solver,
+                    'options': params,
+                    'status': prob.status,
+                })
                 
                 # Check the problem status to determine if it actually succeeded
                 if prob.status in ["optimal", "optimal_inaccurate"]:
                     print(f"Solver {solver} succeeded with status: {prob.status}")
                     solver_success = True
+                    self.solver_metadata.update({
+                        'selected': solver,
+                        'status': prob.status,
+                    })
                     break  # Exit the loop if solver succeeds with optimal solution
                 else:
                     print(f"Solver {solver} completed but returned status: {prob.status}")
@@ -800,10 +1048,20 @@ class Network(RoadNet):
                         np.isfinite(prob.value)):
                         print(f"Solution appears usable with objective value: {prob.value}")
                         solver_success = True
+                        self.solver_metadata.update({
+                            'selected': solver,
+                            'status': prob.status,
+                        })
                         break
                     # Continue to next solver since this one didn't get an optimal solution
             except Exception as e:
                 last_exception = e
+                self.solver_metadata['attempts'].append({
+                    'solver': solver,
+                    'options': params,
+                    'status': 'error',
+                    'error': str(e),
+                })
                 print(f"Solver {solver} failed with exception: {e}")
                 # Continue to the next solver automatically
         
@@ -814,9 +1072,18 @@ class Network(RoadNet):
                 print("Trying CVXPY default solver...")
                 try:
                     result = prob.solve(verbose=True) # Try CVXPY default
+                    self.solver_metadata['attempts'].append({
+                        'solver': 'cvxpy_default',
+                        'options': {},
+                        'status': prob.status,
+                    })
                     if prob.status in ["optimal", "optimal_inaccurate"]:
                         print(f"CVXPY default solver succeeded with status: {prob.status}")
                         solver_success = True
+                        self.solver_metadata.update({
+                            'selected': 'cvxpy_default',
+                            'status': prob.status,
+                        })
                     else:
                         print(f"CVXPY default solver completed but returned status: {prob.status}")
                         if (x_total.value is not None and 
@@ -825,6 +1092,10 @@ class Network(RoadNet):
                             np.isfinite(prob.value)):
                             print(f"Solution from default solver appears usable with objective value: {prob.value}")
                             solver_success = True
+                            self.solver_metadata.update({
+                                'selected': 'cvxpy_default',
+                                'status': prob.status,
+                            })
                 except Exception as e:
                     print(f"CVXPY default solver failed: {e}")
                     last_exception = e # Update last_exception to reflect default solver failure
@@ -837,6 +1108,10 @@ class Network(RoadNet):
             self.cvxpy_link_flows = np.zeros(self.l)
             self.best_objective_value = float('inf')
             self.travel_time_obj = float('inf')
+            self.solver_metadata.update({
+                'status': self.solver_metadata.get('status', 'failed'),
+                'error': str(last_exception) if last_exception else 'solver failure',
+            })
             return None
             
         print(f"CVXPY optimization complete. Objective value: {prob.value}")
@@ -1166,7 +1441,7 @@ class Network(RoadNet):
                     route_info.extend([(od_pair, 'charging', charger) for _ in charger_routes])
         
         # Create the routing matrix
-        num_links = len(link_flows_dict)
+        num_links = max((int(link_id) for link_id in link_flows_dict), default=-1) + 1
         num_routes = len(all_routes)
         routing_matrix = np.zeros((num_links, num_routes))
         
@@ -1181,17 +1456,14 @@ class Network(RoadNet):
             if link_data['start_node_id'] == link_data['end_node_id'] and link_data['start_node_id'] in self.chargers:
                 charger_self_links[link_data['start_node_id']] = link_id
         
-        # Create the routing matrix
+        # Create the routing matrix using canonical link IDs.  This avoids a
+        # repeated DataFrame scan and rejects ambiguous parallel edges.
         for route_idx, route in enumerate(all_routes):
-            for i in range(len(route) - 1):
-                start_node = route[i]
-                end_node = route[i + 1]
-                
-                # Find the link_id for regular links
-                for link_id, link_data in link_flows_dict.items():
-                    if link_data['start_node_id'] == start_node and link_data['end_node_id'] == end_node:
-                        routing_matrix[link_id, route_idx] = 1
-                        break
+            for link_id in self._path_to_link_ids(route):
+                routing_matrix[link_id, route_idx] = 1
+            route_od, route_type, route_charger = route_info[route_idx]
+            if route_type == 'charging' and route_charger in charger_self_links:
+                routing_matrix[charger_self_links[route_charger], route_idx] = 1
         
         # Set up CVXPY optimization problem
         route_flows = cp.Variable(num_routes, nonneg=True)
@@ -1226,23 +1498,47 @@ class Network(RoadNet):
                     # Get the charging flow for this charger from link_flows_dict
                     charger_flow = 0
                     for link_data in link_flows_dict.values():
-                        if str(charger) in link_data['charging_flows']:
-                            charger_flow += link_data['charging_flows'][str(charger)]
+                        charging_flows = link_data.get('charging_flows', {})
+                        charger_flow += charging_flows.get(charger, charging_flows.get(str(charger), 0))
                     if charger_flow > 0:
-                        # Add constraint for the self-link flow
-                        if charger in charger_self_links:
-                            link_id = charger_self_links[charger]
-                            # Add self-link flow to the objective
-                            link_flows = cp.vstack([link_flows, cp.sum(route_flows[charger_routes])])
-                            target_link_flows = np.append(target_link_flows, target_link_flows[link_id])
+                        pass
         
         # Objective: minimize L2 norm between reconstructed and target link flows
         objective = cp.Minimize(cp.sum_squares(link_flows - target_link_flows))
         
         # Solve the problem
         prob = cp.Problem(objective, constraints)
-        prob.solve(solver=cp.OSQP)  # OSQP is better for quadratic objectives
-        
+        # Route reconstruction is a feasibility-sensitive quadratic problem.
+        # OSQP's small default iteration budget can return ``user_limit`` for
+        # otherwise feasible charger configurations, which used to remove
+        # their route library and later crash the queue stage.  Use explicit,
+        # reproducible tolerances and a sufficiently large iteration budget;
+        # the status is still checked below and is never treated as success.
+        prob.solve(
+            solver=cp.OSQP,
+            max_iter=100000,
+            eps_abs=1e-6,
+            eps_rel=1e-6,
+            polish=True,
+            verbose=False,
+        )
+
+        if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+            # Clarabel provides a robust conic fallback for the same convex
+            # quadratic formulation when OSQP stalls on ill-conditioned
+            # route-incidence matrices.
+            try:
+                prob.solve(
+                    solver=cp.CLARABEL,
+                    max_iter=1000,
+                    tol_gap_abs=1e-7,
+                    tol_gap_rel=1e-7,
+                    tol_feas=1e-7,
+                    verbose=False,
+                )
+            except Exception as exc:
+                print(f"Warning: route reconstruction fallback failed: {exc}")
+
         if prob.status != 'optimal':
             print(f"Warning: Problem status is {prob.status}")
             return None
@@ -1262,6 +1558,7 @@ class Network(RoadNet):
                 if route_flows.value[idx] > 1e-6:  # Filter out near-zero flows
                     result[od_pair]['non_charging'].append({
                         'path': all_routes[idx],
+                        'link_ids': self._path_to_link_ids(all_routes[idx]),
                         'flow': float(route_flows.value[idx])
                     })
             
@@ -1282,6 +1579,7 @@ class Network(RoadNet):
                             path.insert(charger_idx + 1, charger)
                             charger_routes.append({
                                 'path': path,
+                                'link_ids': self._path_to_link_ids(path),
                                 'flow': float(route_flows.value[idx])
                             })
                     
@@ -1384,4 +1682,4 @@ class Network(RoadNet):
         print(f"Root Mean Square Error: {rmse:.6f}")
         print(f"Maximum Absolute Difference: {max_diff:.6f}")
         
-        return plt.gcf()  # Return the figure for saving if needed 
+        return plt.gcf()  # Return the figure for saving if needed

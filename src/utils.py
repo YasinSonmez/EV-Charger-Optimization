@@ -29,6 +29,13 @@ def save_flow_heatmap(grid, output_path, title, use_cvxpy=True, flows=None, flow
     
     # Create GeoDataFrame for plotting
     edges_df = grid.net.edges.sort_values("link_id").copy()
+    flows = np.asarray(flows, dtype=float)
+    if len(flows) != len(edges_df):
+        active_indices = getattr(grid, 'active_link_indices', None)
+        if active_indices is not None and len(active_indices) == len(flows):
+            expanded = np.zeros(len(edges_df), dtype=float)
+            expanded[np.asarray(active_indices, dtype=int)] = flows
+            flows = expanded
     if len(flows) != len(edges_df):
         print(f"Flow length {len(flows)} does not match number of edges {len(edges_df)}.")
         plt.close(fig)
@@ -439,102 +446,9 @@ def save_all_flow_heatmaps(grids, config, results_folder, time_history=None):
     # Find the best configuration
     best_idx = np.argmin([grid.travel_time_obj for grid in grids])
     
-    # Generate file with summary information
-    summary_path = os.path.join(results_folder, "heatmap_summary.txt")
-    with open(summary_path, 'w') as f:
-        f.write(f"EV Charger Optimization Results\n")
-        f.write(f"===============================\n")
-        f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Coordinates: {config['coordinates']}\n")
-        f.write(f"Number of chargers: {config['num_chargers']}\n")
-        f.write(f"Possible positions: {config['possible_charger_positions']}\n\n")
-        
-        f.write(f"Results Summary:\n")
-        f.write(f"---------------\n")
-        f.write(f"Total configurations evaluated: {len(grids)}\n")
-        f.write(f"Best configuration: {grids[best_idx].chargers}\n")
-        f.write(f"Best travel time objective: {grids[best_idx].travel_time_obj:.4f}\n\n")
-        
-        # Add network statistics
-        f.write(f"Network Statistics:\n")
-        f.write(f"------------------\n")
-        f.write(f"Number of nodes (n): {grids[0].n}\n")
-        f.write(f"Number of links (l): {grids[0].l}\n")
-        f.write(f"Dimensions (d): {grids[0].d}\n")
-        
-        # Calculate route statistics
-        route_counts = [grid.r for grid in grids]
-        f.write(f"Number of routes: {np.mean(route_counts):.2f} ± {np.sqrt(np.var(route_counts)):.2f}\n\n")
-        
-        # Add computation statistics if time_history is available
-        if time_history is not None:
-            f.write(f"Computation Statistics:\n")
-            f.write(f"----------------------\n")
-            
-            # Try to determine phase boundaries for greedy and full optimization
-            possible_charger_positions = len(config['possible_charger_positions'])
-            num_chargers = config['num_chargers']
-            vertical_line_pos = calculate_phase_boundaries(possible_charger_positions, num_chargers)
-            
-            # Greedy results
-            if 'Greedy' in vertical_line_pos:
-                greedy_boundary_idx = vertical_line_pos['Greedy']
-                if greedy_boundary_idx >= len(grids):
-                    greedy_boundary_idx = len(grids)-1
-                
-                greedy_result_idx = np.argmin([grid.travel_time_obj for grid in grids[:greedy_boundary_idx+1]])
-                
-                if greedy_boundary_idx < len(time_history):
-                    greedy_time = time_history[greedy_boundary_idx]
-                else:
-                    greedy_time = time_history[-1] if time_history else 0
-                    
-                f.write(f"Greedy algorithm result: {grids[greedy_result_idx].travel_time_obj:.4f}\n")
-                f.write(f"Greedy algorithm chargers: {grids[greedy_result_idx].chargers}\n")
-                f.write(f"Greedy algorithm computation time: {greedy_time:.2f} seconds\n\n")
-            
-            # Full optimization results
-            full_idx_key = list(vertical_line_pos.keys())[-3] if len(vertical_line_pos) >= 3 else None
-            if full_idx_key and vertical_line_pos[full_idx_key] < len(grids):
-                full_chargers_idx = vertical_line_pos[full_idx_key]
-                full_charger_results = [grid.travel_time_obj for grid in grids[full_chargers_idx:]]
-                full_best_idx = full_chargers_idx + np.argmin(full_charger_results)
-                
-                if full_chargers_idx < len(time_history):
-                    full_time = time_history[-1] - time_history[full_chargers_idx]
-                else:
-                    full_time = 0
-                
-                f.write(f"Full optimization minimum result: {min(full_charger_results):.4f}\n")
-                f.write(f"Full optimization mean result: {np.mean(full_charger_results):.4f} ± {np.sqrt(np.var(full_charger_results)):.4f}\n")
-                f.write(f"Full optimization best chargers: {grids[full_best_idx].chargers}\n")
-                f.write(f"Full optimization computation time: {full_time:.2f} seconds\n\n")
-            
-            # Total computation time
-            if time_history:
-                f.write(f"Total computation time: {time_history[-1]:.2f} seconds\n\n")
-        
-        # Add Braess paradoxes
-        paradoxes = find_braess_paradoxes(grids)
-        f.write(f"Braess Paradoxes:\n")
-        f.write(f"----------------\n")
-        f.write(f"Number of paradoxes found: {len(paradoxes)}\n")
-        for i, p in enumerate(paradoxes):
-            f.write(f"{i+1}. Subset: {sorted(p[0])}, Superset: {sorted(p[1])}\n")
-            f.write(f"   Subset Value: {p[2]:.4f}, Superset Value: {p[3]:.4f}\n")
-            f.write(f"   Efficiency Loss: {(p[3] - p[2])/p[2]*100:.2f}%\n")
-        
-        if not paradoxes:
-            f.write("No Braess paradoxes found in this configuration.\n\n")
-        
-        f.write(f"\nAll Configurations:\n")
-        f.write(f"-----------------\n")
-        
-        # Sort grids by travel time objective
-        sorted_indices = np.argsort([grid.travel_time_obj for grid in grids])
-        for i, idx in enumerate(sorted_indices):
-            f.write(f"{i+1}. Chargers: {grids[idx].chargers}, Travel Time: {grids[idx].travel_time_obj:.4f}\n")
+    # heatmap_summary.txt replaced by unified run_summary.txt from pipeline.py
     
+    # Save each configuration's heatmap
     print(f"Generating flow heatmaps for {len(grids)} configurations...")
     
     all_results_data = {} # Initialize dictionary to store all results
@@ -624,7 +538,9 @@ def save_all_flow_heatmaps(grids, config, results_folder, time_history=None):
 def outer_optimization(coordinates, num_chargers=None, possible_charger_positions=None, 
                        calculate_on_all_possible_positions=False, plot_info=False, use_derivatives=True, 
                        max_iter=1000, parameter_fit_results=None, single_swap=False, use_cvxpy=False, od_demand=None,
-                       config_filepath=None, output_dir=None, highway_types=None, prune_dead_ends=False):
+                       config_filepath=None, output_dir=None,
+                       road_net=None, charger_self_link_length=100.0,
+                       cg_fit_policy='allow_degraded'):
     """
     Outer optimization to find the best charger locations.
     Includes configurable route analysis with top-k routes and parameter sweep.
@@ -652,11 +568,15 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
                 chargers_i = (best_charger) + (charger_ji,)
                 chargers_i = tuple(sorted(chargers_i))
             chargers_set.add(chargers_i)
-            grid_i = Network(coordinates, chargers=chargers_i, parameter_fit_results=parameter_fit_results, od_demand=od_demand, highway_types=highway_types, prune_dead_ends=prune_dead_ends)
+            grid_i = Network(coordinates, chargers=chargers_i, parameter_fit_results=parameter_fit_results, od_demand=od_demand, road_net=road_net, charger_self_link_length=charger_self_link_length, cg_fit_policy=cg_fit_policy)
             iteration_count += 1
             print("*" * 80)
             print('Iteration: ', iteration_count)
-            grid_i.optimize(use_cvxpy=use_cvxpy, use_derivatives=use_derivatives, max_iter=max_iter)
+            if not grid_i.optimize(use_cvxpy=use_cvxpy, use_derivatives=use_derivatives, max_iter=max_iter):
+                raise RuntimeError(
+                    f"Congestion-game solver failed for chargers {chargers_i}: "
+                    f"{getattr(grid_i, 'solver_metadata', {})}"
+                )
             time_history.append(time.time() - t0)
             if plot_info:
                 grid_i.plot_info()
@@ -686,8 +606,12 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
 
         # Evaluate each swap
         for swapped_chargers in all_possible_swaps:
-            grid_i = Network(coordinates, chargers=swapped_chargers, parameter_fit_results=parameter_fit_results, od_demand=od_demand, highway_types=highway_types, prune_dead_ends=prune_dead_ends)
-            grid_i.optimize(use_cvxpy=use_cvxpy, use_derivatives=use_derivatives, max_iter=max_iter)
+            grid_i = Network(coordinates, chargers=swapped_chargers, parameter_fit_results=parameter_fit_results, od_demand=od_demand, road_net=road_net, charger_self_link_length=charger_self_link_length, cg_fit_policy=cg_fit_policy)
+            if not grid_i.optimize(use_cvxpy=use_cvxpy, use_derivatives=use_derivatives, max_iter=max_iter):
+                raise RuntimeError(
+                    f"Congestion-game solver failed for chargers {swapped_chargers}: "
+                    f"{getattr(grid_i, 'solver_metadata', {})}"
+                )
             time_history.append(time.time() - t0)
             if plot_info:
                 grid_i.plot_info()
@@ -705,10 +629,14 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
             if chargers_i in chargers_set:
                 continue
             chargers_set.add(chargers_i)
-            grid_i = Network(coordinates, chargers=chargers_i, parameter_fit_results=parameter_fit_results, od_demand=od_demand, highway_types=highway_types, prune_dead_ends=prune_dead_ends)
+            grid_i = Network(coordinates, chargers=chargers_i, parameter_fit_results=parameter_fit_results, od_demand=od_demand, road_net=road_net, charger_self_link_length=charger_self_link_length, cg_fit_policy=cg_fit_policy)
             iteration_count += 1
             print('Iteration: ', iteration_count)
-            grid_i.optimize(use_cvxpy=use_cvxpy, use_derivatives=use_derivatives, max_iter=max_iter)
+            if not grid_i.optimize(use_cvxpy=use_cvxpy, use_derivatives=use_derivatives, max_iter=max_iter):
+                raise RuntimeError(
+                    f"Congestion-game solver failed for chargers {chargers_i}: "
+                    f"{getattr(grid_i, 'solver_metadata', {})}"
+                )
             time_history.append(time.time() - t0)
             if plot_info:
                 grid_i.plot_info()
@@ -834,6 +762,22 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
                 'charger_combination': chargers_tuple,
                 'objective_value': float(grid.travel_time_obj),
                 'link_flows': grid_results['link_flows'],
+                # Self-links are derived per charger configuration.  Their
+                # numeric IDs therefore cannot be described by the first
+                # grid's connectivity table when configurations contain
+                # different charger sets.  Keep the exact identity beside
+                # the configuration that owns it.
+                'link_connectivity': [
+                    {
+                        'link_id': int(link_id),
+                        'start_node_id': int(flow_data['start_node_id']),
+                        'end_node_id': int(flow_data['end_node_id']),
+                    }
+                    for link_id, flow_data in sorted(
+                        grid_results['link_flows'].items(),
+                        key=lambda item: int(item[0]),
+                    )
+                ],
                 'method': grid_results.get('method', 'unknown')
             }
             
@@ -849,6 +793,16 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
         run_config_params['route_analysis'] = route_analysis_config
 
         # Save all results to pickle file
+        # The immutable artifact is the source of truth for road-link
+        # connectivity.  Derived charger self-links are represented in each
+        # configuration above and must not be mixed into this canonical list.
+        if road_net is not None:
+            canonical_edges = road_net.edges.sort_values('link_id')
+        else:
+            canonical_edges = grids[0].net.edges[
+                grids[0].net.edges['start_node_id'] != grids[0].net.edges['end_node_id']
+            ].sort_values('link_id')
+
         results_dict = {
             'run_configuration': run_config_params,
             'configurations': configurations,
@@ -860,7 +814,7 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
                     'start_node_id': int(edge_row['start_node_id']),
                     'end_node_id': int(edge_row['end_node_id'])
                 }
-                for _, edge_row in grids[0].net.edges.iterrows()
+                for _, edge_row in canonical_edges.iterrows()
             ],
             'network': best_grid
         }
@@ -1113,6 +1067,7 @@ def analyze_route_reconstruction(network, link_flows_dict, k_values=[1, 2, 4, 8,
                         'route_id': route_id,
                         'flow': float(route_data['flow']),
                         'links': route_data['path'],
+                        'link_ids': route_data.get('link_ids', network._path_to_link_ids(route_data['path'])),
                         'type': 'non_charging',
                         'origin': od_pair[0],
                         'destination': od_pair[1]
@@ -1128,6 +1083,7 @@ def analyze_route_reconstruction(network, link_flows_dict, k_values=[1, 2, 4, 8,
                             'route_id': route_id,
                             'flow': float(route_data['flow']),
                             'links': route_data['path'],
+                            'link_ids': route_data.get('link_ids', network._path_to_link_ids(route_data['path'])),
                             'type': 'charging',
                             'origin': od_pair[0],
                             'destination': od_pair[1],
@@ -1142,38 +1098,54 @@ def analyze_route_reconstruction(network, link_flows_dict, k_values=[1, 2, 4, 8,
             total_flow = sum(route['flow'] for route in sorted_routes)
             
             if total_flow > 0:  # Only update metrics if we have valid flow
-                # Calculate and store top-k metrics
+                # Calculate and store top-k metrics.  K is a route-library
+                # budget per OD/type group, not a global budget: a global top-K
+                # list can contain only F1 routes and silently make F2 (or a
+                # second OD pair) impossible for the queue stage.
                 for k in k_values:
-                    k = min(k, len(sorted_routes))  # Don't exceed available routes
-                    top_k_routes = sorted_routes[:k]
+                    grouped_routes = {}
+                    for route in sorted_routes:
+                        group_key = (
+                            int(route['origin']),
+                            int(route['destination']),
+                            route['type'],
+                        )
+                        grouped_routes.setdefault(group_key, []).append(route)
+                    top_k_routes = [
+                        route
+                        for group_key in sorted(grouped_routes)
+                        for route in grouped_routes[group_key][:int(k)]
+                    ]
                     k_flow = sum(route['flow'] for route in top_k_routes)
                     
                     # Calculate reconstructed flows for this k
                     flows = np.zeros(len(link_flows_dict))
                     for route in top_k_routes:
-                        path = route['links']
+                        path_link_ids = route.get('link_ids')
                         flow = route['flow']
-                        for i in range(len(path) - 1):
-                            start_node = path[i]
-                            end_node = path[i + 1]
-                            for link_id, link_data in link_flows_dict.items():
-                                if link_data['start_node_id'] == start_node and link_data['end_node_id'] == end_node:
-                                    flows[link_id] += flow
-                                    break
+                        if path_link_ids is None:
+                            path_link_ids = network._path_to_link_ids(route['links'])
+                        for link_id in path_link_ids:
+                            flows[int(link_id)] += flow
                     
                     # Calculate error metrics
                     flow_difference = flows - original_flows
+                    if np.std(original_flows) > 0 and np.std(flows) > 0:
+                        correlation = float(np.corrcoef(original_flows, flows)[0, 1])
+                    else:
+                        correlation = 1.0 if np.allclose(original_flows, flows) else 0.0
                     k_metrics[k] = {
                         'coverage': float(k_flow / total_flow * 100),
                         'mae': float(np.mean(np.abs(flow_difference))),
                         'rmse': float(np.sqrt(np.mean(np.square(flow_difference)))),
                         'max_diff': float(np.max(np.abs(flow_difference))),
-                        'correlation': float(np.corrcoef(original_flows, flows)[0, 1]),
+                        'correlation': correlation,
                         'routes': [
                             {
                                 'route_id': route['route_id'],
                                 'flow': float(route['flow']),
                                 'links': route['links'],
+                                'link_ids': route.get('link_ids', network._path_to_link_ids(route['links'])),
                                 'type': route['type'],
                                 'origin': route['origin'],
                                 'destination': route['destination'],

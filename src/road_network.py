@@ -8,6 +8,7 @@ import osmnx as ox
 import networkx as nx
 import matplotlib.pyplot as plt
 from src.graph_cache import get_graph
+from src.network_artifact import write_network_artifact
 
 
 MAJOR_ROAD_TYPES = [
@@ -27,53 +28,145 @@ class RoadNet:
         self.osmid_to_nid_dict = {}
         self.nid_to_osmid_dict = {}
         self.stage_counts = {}  # {stage_name: {'nodes': n, 'edges': e}}
+        self.stage_maps = {}    # {stage_name: {'nodes_xy': [...], 'edges_pairs': [...]}}
+
+    def _snapshot_map(self):
+        """Capture node coords, edge pairs, and edge geometry polylines."""
+        nids = sorted(self.graph.nodes, key=str)
+        nodes_xy = [(self.graph.nodes[n].get('x', 0), self.graph.nodes[n].get('y', 0))
+                    for n in nids]
+        pos = {n: nodes_xy[i] for i, n in enumerate(nids)}
+        edges_pairs = []
+        edges_geom = []
+        edge_keys = []
+        for u, v, k, d in self.graph.edges(keys=True, data=True):
+            edges_pairs.append((u, v))
+            edge_keys.append(k)
+            geom = d.get('geometry')
+            if geom is not None and hasattr(geom, 'coords'):
+                coords = [(c[0], c[1]) for c in geom.coords]
+            elif u in pos and v in pos:
+                coords = [pos[u], pos[v]]
+            else:
+                coords = []
+            edges_geom.append(coords)
+        return {'_node_ids': nids, 'nodes_xy': nodes_xy,
+                'edges_pairs': edges_pairs, 'edges_geom': edges_geom,
+                'edge_keys': edge_keys,
+                '_n': len(nids), '_e': len(edges_pairs)}
+
+    def _keep_largest_scc(self):
+        """Keep only the largest strongly connected component."""
+        sccs = list(nx.strongly_connected_components(self.graph))
+        if len(sccs) <= 1:
+            return
+        largest = max(sccs, key=len)
+        removed = len(self.graph.nodes) - len(largest)
+        if removed == 0:
+            return
+        self.graph = self.graph.subgraph(largest).copy()
+        print(f"  Kept largest SCC: {len(self.graph.nodes)} nodes, "
+              f"{len(self.graph.edges)} edges ({removed} nodes removed)")
 
     def get_map(self, no_lat, so_lat, east_long, west_long,
-                highway_types=None, prune_dead_ends=False, merge_chains=True,
-                suppress_t_junctions=True, cross_threshold=200):
-        """Download OSM street graph and apply cleaning pipeline.
+                highway_types=None, merge_chains=True, contract_threshold=30,
+                prune_dead_ends=False, suppress_t_junctions=False,
+                apply_cleaning=True):
+        """Download OSM graph and apply simplified cleaning pipeline.
 
-        Pipeline: LSCC → merge chains → prune leaves → 
-                   T-junction suppression (short cross-streets) → 
-                   LSCC re-extraction → merge → prune → rearrange_data
+        Stages:
+          01_all         -- raw OSM download (all drivable roads)
+          02_filtered    -- filtered to *highway_types* (if provided)
+          03_contract    -- close-node clusters merged into centroids
+          04_merged      -- degree-2 pass-through chains merged
+          05_final_scc   -- optional dead-end pruning and largest SCC
 
         Args:
-            highway_types: If provided, filter OSM to these types. None = all drivable.
-            prune_dead_ends: Enable leaf pruning.
-            merge_chains: Enable degree-2 chain merging.
-            suppress_t_junctions: Enable T-junction suppression (removes cross-streets
-                                  shorter than cross_threshold at T-junctions).
-            cross_threshold: Max cross-street length (m) to suppress at T-junctions.
+            highway_types: OSM highway filter, e.g. ['motorway','trunk',...]
+            merge_chains: Enable pass‑through chain merging.
+            contract_threshold: Max internal edge length (m) for centroid merge.
+            prune_dead_ends: Iteratively remove directed source/sink dead ends
+                before the final SCC extraction.
+            suppress_t_junctions: Reserved compatibility option. T-junction
+                suppression is not applied implicitly; callers must use an
+                explicit contraction threshold instead.
+            apply_cleaning: If false, retain the filtered raw graph and record
+                the skipped cleaning stages explicitly.
         """
+        if suppress_t_junctions:
+            raise ValueError(
+                'suppress_t_junctions is not implemented; use contract_threshold '
+                'and merge_chains explicitly'
+            )
+        self.graph = get_graph((west_long, so_lat, east_long, no_lat))
+        self.stage_counts['01_all'] = {'nodes': len(self.graph.nodes), 'edges': len(self.graph.edges)}
+        self.stage_maps['01_all'] = self._snapshot_map()
+
         if highway_types:
-            self.graph = get_graph(
-                (west_long, so_lat, east_long, no_lat), highway_types=highway_types)
-            self._keep_largest_scc()
-        else:
-            self.graph = get_graph(
-                (west_long, so_lat, east_long, no_lat))
-        if highway_types is not None or prune_dead_ends:
-            if merge_chains:
-                self._merge_degree2_chains()
-            if prune_dead_ends:
-                self._prune_dead_ends_graph()
-            if suppress_t_junctions:
-                self._suppress_t_junctions(threshold=cross_threshold)
-                # Remove only orphan chain fragments (no intersections)
-                self._remove_chain_fragments()
-                # Re-merge and re-prune
-                self._merge_degree2_chains()
-                self._prune_dead_ends_graph()
-            # Safety: guarantee connectivity — keep only largest SCC
-            self._keep_largest_scc()
-            # Merge close-node clusters at interchanges
-            self._merge_junctions(threshold=80)
+            self._filter_by_highway(highway_types)
+            self.stage_counts['02_filtered'] = {'nodes': len(self.graph.nodes), 'edges': len(self.graph.edges)}
+            self.stage_maps['02_filtered'] = self._snapshot_map()
+
+        if apply_cleaning:
+            self._merge_junctions(threshold=contract_threshold)
+        self.stage_counts['03_contract'] = {'nodes': len(self.graph.nodes), 'edges': len(self.graph.edges)}
+        self.stage_maps['03_contract'] = self._snapshot_map()
+
+        if apply_cleaning and merge_chains:
+            self._merge_degree2_chains()
+        self.stage_counts['04_merged'] = {'nodes': len(self.graph.nodes), 'edges': len(self.graph.edges)}
+        self.stage_maps['04_merged'] = self._snapshot_map()
+
+        if prune_dead_ends:
+            self._prune_dead_ends()
+        self._keep_largest_scc()
+        self.stage_counts['05_final_scc'] = {'nodes': len(self.graph.nodes), 'edges': len(self.graph.edges)}
+        self.stage_maps['05_final_scc'] = self._snapshot_map()
         self.rearrange_data()
+
+    def _prune_dead_ends(self):
+        """Remove directed source/sink dead ends before SCC extraction.
+
+        This is intentionally conservative and deterministic.  The final SCC
+        pass remains mandatory, so disabling this option never leaves a graph
+        with disconnected optimization components.
+        """
+        removed = 0
+        while self.graph.number_of_nodes():
+            dead = sorted(
+                [n for n in self.graph.nodes
+                 if self.graph.in_degree(n) == 0 or self.graph.out_degree(n) == 0],
+                key=str,
+            )
+            if not dead:
+                break
+            self.graph.remove_nodes_from(dead)
+            removed += len(dead)
+        if removed:
+            print(f"  Pruned {removed} directed dead-end nodes.")
+
+    def _filter_by_highway(self, highway_types):
+        """Remove edges whose highway tag is not in the given list."""
+        if not highway_types:
+            return
+        to_remove = []
+        for u, v, k, d in self.graph.edges(keys=True, data=True):
+            hw = d.get('highway')
+            if isinstance(hw, list):
+                hw = hw[0]
+            if hw not in highway_types:
+                to_remove.append((u, v, k))
+        self.graph.remove_edges_from(to_remove)
+        # Remove orphaned nodes
+        orphans = [n for n, deg in self.graph.degree() if deg == 0]
+        self.graph.remove_nodes_from(orphans)
+        if to_remove:
+            print(f"  Filtered {len(to_remove)} edges to highway types: {highway_types}")
 
     def _merge_degree2_chains(self):
         """Merge all pass-through nodes (undirected-degree = 2).
 
-        A node with exactly 2 unique neighbors is a pass-through — traffic
+        A node with exactly 2 unique neighbors is a pass-through -- traffic
         enters from one side and exits the other. There is no routing
         decision to make, so the node can be eliminated.
 
@@ -96,10 +189,30 @@ class RoadNet:
             try: return int(str(v))
             except: return default
 
-        def _build_merged(in_e, out_e):
+        def _build_merged(in_e, out_e, mid_xy=None):
             ie = in_e[3]; oe = out_e[3]
             gi = ie.get('geometry'); go = oe.get('geometry')
-            geom = LineString(list(gi.coords)+list(go.coords)[1:]) if (gi is not None and go is not None) else (gi or go)
+            if gi is not None and go is not None:
+                if mid_xy:
+                    inc = list(gi.coords); inc[-1] = mid_xy
+                    out = list(go.coords); out[0] = mid_xy
+                    geom = LineString(inc + out[1:])
+                else:
+                    geom = LineString(list(gi.coords) + list(go.coords)[1:])
+            elif gi is not None:
+                if mid_xy:
+                    inc = list(gi.coords); inc[-1] = mid_xy
+                    geom = LineString(inc)
+                else:
+                    geom = gi
+            elif go is not None:
+                if mid_xy:
+                    out = list(go.coords); out[0] = mid_xy
+                    geom = LineString(out)
+                else:
+                    geom = go
+            else:
+                geom = None
             li = float(ie.get('length',0)); lo = float(oe.get('length',0))
             tot = li + lo
             na = dict(ie)
@@ -147,13 +260,21 @@ class RoadNet:
                     else:
                         continue
 
-                new_fwd = _build_merged(n1_to_n[0], n_to_n2[0])
-                new_rev = _build_merged(n2_to_n[0], n_to_n1[0]) if n2_to_n and n_to_n1 else None
+                # Get pass-through node position for geometry fallback
+                n_x = self.graph.nodes[n].get('x')
+                n_y = self.graph.nodes[n].get('y')
+                mid_xy = (float(n_x), float(n_y)) if n_x is not None and n_y is not None else None
 
                 self.graph.remove_node(n)
-                self.graph.add_edge(n1, n2, **new_fwd)
-                if new_rev:
-                    self.graph.add_edge(n2, n1, **new_rev)
+                # Merge all parallel edge pairs to preserve distinct paths
+                for ie in n1_to_n:
+                    for oe in n_to_n2:
+                        merged = _build_merged(ie, oe, mid_xy=mid_xy)
+                        self.graph.add_edge(n1, n2, **merged)
+                for ie in n2_to_n:
+                    for oe in n_to_n1:
+                        merged = _build_merged(ie, oe, mid_xy=mid_xy)
+                        self.graph.add_edge(n2, n1, **merged)
                 iter_merged += 1
 
             total_merged += iter_merged
@@ -161,171 +282,18 @@ class RoadNet:
         if total_merged > 0:
             print(f"  Merged {total_merged} pass-through nodes.")
 
-    def _suppress_t_junctions(self, threshold=200):
-        """Suppress short cross-streets at T-junctions, then merge and prune.
-
-        At each T-junction (undirected-degree=3), removes the shortest edge
-        if it's under the threshold. This converts T-junctions into pass-through
-        nodes, which get merged away. Both endpoints must have degree > 2 to
-        ensure connectivity is preserved.
-        """
-        def _num(val, d=25):
-            v = val[0] if isinstance(val, list) else val
-            v = str(v)
-            try: return int(v.split()[0]) if v.split()[0].isdigit() else d
-            except: return d
-
-        removed = 0
-        for iteration in range(5):
-            to_remove = []
-            for n in list(self.graph.nodes):
-                nb = set(self.graph.successors(n)) | set(self.graph.predecessors(n))
-                if len(nb) != 3:
-                    continue
-                edges = []
-                for nbr in nb:
-                    for e in self.graph.in_edges(n, data=True, keys=True):
-                        if e[0] == nbr:
-                            edges.append((float(e[3].get('length', 0)),
-                                          (e[0], e[1], e[2]), nbr))
-                    for e in self.graph.out_edges(n, data=True, keys=True):
-                        if e[1] == nbr:
-                            edges.append((float(e[3].get('length', 0)),
-                                          (e[0], e[1], e[2]), nbr))
-                if len(edges) < 3:
-                    continue
-                edges.sort(key=lambda x: x[0])
-                if edges[0][0] >= threshold:
-                    continue
-                # Other endpoint must have degree > 2 (not a dead-end)
-                other_nbr = edges[0][2]
-                other_udeg = len(set(self.graph.successors(other_nbr))
-                                 | set(self.graph.predecessors(other_nbr)))
-                if other_udeg <= 2:
-                    continue
-                # Node n's other 2 edges must go to 2 different neighbors
-                other_dests = set()
-                for ed in edges[1:]:
-                    other_dests.add(ed[2])
-                if len(other_dests) != 2:
-                    continue
-                to_remove.append(edges[0][1])
-
-            if not to_remove:
-                break
-
-            # Connectivity-aware removal: only suppress if SCC stays intact
-            for key in set(to_remove):
-                # Save edge data before removal
-                saved_data = None
-                try:
-                    saved_data = dict(self.graph.edges[key])
-                except Exception:
-                    pass
-                scc_before = len(list(nx.strongly_connected_components(self.graph)))
-                try:
-                    self.graph.remove_edge(key[0], key[1], key=key[2])
-                    scc_after = len(list(nx.strongly_connected_components(self.graph)))
-                    if scc_after > scc_before:
-                        # This edge was a bridge — undo the removal
-                        if saved_data:
-                            self.graph.add_edge(key[0], key[1], key=key[2], **saved_data)
-                        continue
-                    removed += 1
-                except Exception:
-                    pass
-
-            # Re-merge + re-prune after removing edges
-            self._merge_degree2_chains()
-            self._prune_dead_ends_graph()
-
-        if removed > 0:
-            print(f"  Suppressed {removed} short cross-streets "
-                  f"(< {threshold}m at T-junctions).")
-
-    def _remove_chain_fragments(self):
-        """Remove SCCs that contain only chain nodes (no intersections).
-
-        After T-junction suppression, some small fragments may become disconnected.
-        This removes only those fragments that have no degree-3+ nodes (i.e.,
-        they're just chains/dead-ends, not genuine sub-networks).
-        """
-        sccs = list(nx.strongly_connected_components(self.graph))
-        if len(sccs) <= 1:
-            return
-        largest = max(sccs, key=len)
-        to_remove = []
-        for scc in sccs:
-            if scc is largest:
-                continue
-            sub = self.graph.subgraph(scc)
-            has_intersection = any(
-                len(set(sub.successors(n)) | set(sub.predecessors(n))) >= 3
-                for n in scc
-            )
-            if not has_intersection:
-                to_remove.append(scc)
-        if to_remove:
-            removed = sum(len(s) for s in to_remove)
-            for scc in to_remove:
-                self.graph.remove_nodes_from(scc)
-            print(f"  Removed {removed} orphan chain nodes "
-                  f"({len(to_remove)} fragments).")
-
-    def _prune_dead_ends_graph(self):
-        """Iteratively remove degree-1 and undirected-degree-1 nodes from the OSM graph.
-
-        Runs BEFORE rearrange_data so subsequent rearrange naturally gives contiguous IDs.
-        """
-        removed = 0
-        while True:
-            to_remove = set()
-            for n in self.graph.nodes:
-                deg = self.graph.in_degree(n) + self.graph.out_degree(n)
-                if deg <= 1:
-                    to_remove.add(n)
-                    continue
-                neighbors = set(self.graph.successors(n)) | set(self.graph.predecessors(n))
-                if len(neighbors) == 1:
-                    to_remove.add(n)
-            if not to_remove:
-                break
-            self.graph.remove_nodes_from(to_remove)
-            removed += len(to_remove)
-        if removed > 0:
-            print(f"  Pruned {removed} leaf nodes from graph.")
-
-    def _keep_largest_scc(self):
-        """Keep only the largest strongly connected component of the OSM graph.
-
-        Filtering to major roads can create one-way segments that are unreachable
-        in one direction. This ensures every remaining node is reachable from
-        every other node in both directions.
-        """
-        sccs = list(nx.strongly_connected_components(self.graph))
-        if len(sccs) <= 1:
-            return
-        largest = max(sccs, key=len)
-        removed = len(self.graph.nodes) - len(largest)
-        if removed == 0:
-            return
-        self.graph = self.graph.subgraph(largest).copy()
-        print(f"  Kept largest SCC: {len(self.graph.nodes)} nodes, "
-              f"{len(self.graph.edges)} edges ({removed} nodes removed)")
-
-    def _merge_junctions(self, threshold=80):
+    def _merge_junctions(self, threshold=30):
         """Merge close-node clusters at interchanges into single junction nodes.
 
-        Finds connected components of edges shorter than threshold. Each
-        component with 3+ nodes is a "junction cluster" — ramp connections
+        Finds connected components of edges shorter than *threshold*. Each
+        component with 3+ nodes is a "junction cluster" -- ramp connections
         at an interchange that should be a single routing node. Merges each
-        cluster to a centroid node, preserving all external edges.
+        cluster to a centroid node, preserving external edge properties
+        (FFT, capacity, original road geometry snapped to the centroid).
 
-        This is mathematically rigorous: the junction subsumes internal
-        navigation (ramp-to-ramp), while external edges retain their
-        original physical properties (FFT, capacity, geometry).
+        Internal short edges connecting cluster members are subsumed --
+        the centroid already represents the entire interchange.
         """
-        # Build subgraph of short edges
         cluster_graph = nx.Graph()
         cluster_graph.add_nodes_from(self.graph.nodes)
         for u, v, k, d in self.graph.edges(keys=True, data=True):
@@ -334,11 +302,10 @@ class RoadNet:
                 cluster_graph.add_edge(u, v)
 
         clusters = list(nx.connected_components(cluster_graph))
-        junctions = [c for c in clusters if len(c) >= 3]
+        junctions = [c for c in clusters if len(c) >= 2]
         if not junctions:
             return
 
-        # Get node positions from nodes_df (built during rearrange_data or from graph)
         node_lonlat = {}
         for n in self.graph.nodes:
             lon = self.graph.nodes[n].get('x') or self.graph.nodes[n].get('lon')
@@ -354,24 +321,25 @@ class RoadNet:
             if not lons:
                 continue
             cx, cy = np.mean(lons), np.mean(lats)
-            new_id = f'_J{jid}'
+            new_id = f'_C{jid}'
             self.graph.add_node(new_id, x=cx, y=cy, lon=cx, lat=cy)
 
             for n in nodes:
                 if n not in self.graph.nodes:
                     continue
-                # Redirect inbound edges from outside
                 for u, v, k, d in list(self.graph.in_edges(n, keys=True, data=True)):
                     if u not in cluster:
-                        self.graph.add_edge(u, new_id, **dict(d))
-                # Redirect outbound edges to outside
+                        nd = dict(d)
+                        self._snap_geom_to_node(nd, u, new_id, (cx, cy), snap_end=True)
+                        self.graph.add_edge(u, new_id, **nd)
                 for u, v, k, d in list(self.graph.out_edges(n, keys=True, data=True)):
                     if v not in cluster:
-                        self.graph.add_edge(new_id, v, **dict(d))
+                        nd = dict(d)
+                        self._snap_geom_to_node(nd, new_id, v, (cx, cy), snap_end=False)
+                        self.graph.add_edge(new_id, v, **nd)
                 self.graph.remove_node(n)
             total_merged += len(nodes)
 
-        # Clean self-loops
         for n in list(self.graph.nodes):
             while self.graph.has_edge(n, n):
                 self.graph.remove_edge(n, n)
@@ -379,41 +347,27 @@ class RoadNet:
         if total_merged > 0:
             print(f"  Merged {total_merged} close nodes into {len(junctions)} junctions "
                   f"(< {threshold}m).")
-            self._keep_largest_scc()
-            self._merge_degree2_chains()
-            self._prune_dead_ends_graph()
 
-    def _contract_short_edges(self, threshold=100):
-        """Contract edges shorter than threshold, merging endpoints into one node.
-
-        Uses networkx.contracted_edge — preserves all other edges and attributes.
-        This is the principled way to eliminate node clusters at complex
-        junctions where multiple nodes are connected by very short links.
-        """
-        contracted = 0
-        for _ in range(20):
-            short = sorted(
-                [(float(d.get('length', 0)), u, v)
-                 for u, v, k, d in self.graph.edges(keys=True, data=True)
-                 if 0 < float(d.get('length', 0)) < threshold]
-            )
-            if not short:
-                break
-            _, u, v = short[0]
-            self.graph = nx.contracted_edge(self.graph, (u, v), self_loops=False, copy=True)
-            # Remove self-loops created by contraction
-            for n in list(self.graph.nodes):
-                while self.graph.has_edge(n, n):
-                    self.graph.remove_edge(n, n)
-            contracted += 1
-        if contracted > 0:
-            print(f"  Contracted {contracted} short edges (< {threshold}m).")
+    def _snap_geom_to_node(self, edge_data, src, dst, mid_xy, snap_end=True):
+        """Snap edge geometry start or end to the centroid position."""
+        geom = edge_data.get('geometry')
+        if geom is not None and hasattr(geom, 'coords'):
+            coords = list(geom.coords)
+            if len(coords) >= 2:
+                idx = -1 if snap_end else 0
+                coords[idx] = (mid_xy[0], mid_xy[1])
+                edge_data['geometry'] = LineString(coords)
 
     def rearrange_data(self):
         nodesOX, edgesOX = ox.graph_to_gdfs(self.graph)
 
-        raw_nodes = nodesOX.copy().reset_index()
-        raw_nodes['node_id'] = np.arange(raw_nodes.shape[0])
+        raw_nodes = nodesOX.copy()
+        if 'osmid' not in raw_nodes.columns:
+            raw_nodes['osmid'] = raw_nodes.index
+        raw_nodes = raw_nodes.reset_index(drop=True)
+        raw_nodes['_stable_node_key'] = raw_nodes['osmid'].map(str)
+        raw_nodes = raw_nodes.sort_values('_stable_node_key', kind='mergesort').reset_index(drop=True)
+        raw_nodes['node_id'] = np.arange(raw_nodes.shape[0], dtype=int)
         raw_nodes['lon'] = raw_nodes['x']
         raw_nodes['lat'] = raw_nodes['y']
         raw_nodes['node_osmid'] = raw_nodes['osmid'].astype(object)
@@ -422,11 +376,19 @@ class RoadNet:
         self.nid_to_osmid_dict = {r.node_id: r.osmid for r in raw_nodes.itertuples()}
 
         raw_edges = edgesOX.copy().reset_index()
-        raw_edges['link_id'] = np.arange(raw_edges.shape[0])
+        for col in ('u', 'v', 'key'):
+            if col not in raw_edges.columns:
+                raw_edges[col] = ''
+        raw_edges['_stable_edge_key'] = raw_edges.apply(
+            lambda row: (str(row['u']), str(row['v']), str(row['key'])), axis=1
+        )
+        raw_edges = raw_edges.sort_values('_stable_edge_key', kind='mergesort').reset_index(drop=True)
+        raw_edges['link_id'] = np.arange(raw_edges.shape[0], dtype=int)
         raw_edges['start_node_id'] = raw_edges['u'].map(self.osmid_to_nid_dict)
         raw_edges['end_node_id'] = raw_edges['v'].map(self.osmid_to_nid_dict)
         raw_edges['start_osmid'] = raw_edges['u'].astype(object)
         raw_edges['end_osmid'] = raw_edges['v'].astype(object)
+        raw_edges['edge_key'] = raw_edges['key'].astype(object)
         raw_edges['type'] = raw_edges['highway']
         raw_edges['length'] = raw_edges['length'].astype(float)
         raw_edges['lanes'] = raw_edges['lanes'].fillna('1')
@@ -443,10 +405,13 @@ class RoadNet:
         raw_edges['geometry'] = raw_edges['geometry'].apply(wkt.dumps)
         raw_edges['capacity'] = raw_edges['lanes'].astype(int) * 1000
 
-        self.nodes = raw_nodes.drop(['x', 'y', 'street_count', 'geometry', 'highway', 'osmid'], axis=1)
+        drop_node_columns = [c for c in ['x', 'y', 'street_count', 'geometry', 'highway', 'osmid', '_stable_node_key'] if c in raw_nodes]
+        self.nodes = raw_nodes.drop(drop_node_columns, axis=1)
         self.edges = raw_edges[['link_id', 'start_node_id', 'end_node_id', 'type',
                                 'length', 'maxmph', 'lanes', 'capacity',
-                                'start_osmid', 'end_osmid', 'geometry']]
+                                'start_osmid', 'end_osmid', 'edge_key', 'geometry']]
+        self.nodes = self.nodes.sort_values('node_id').reset_index(drop=True)
+        self.edges = self.edges.sort_values('link_id').reset_index(drop=True)
 
     def set_exit(self, random_flag, des_ex_id):
         exit_id = self.nodes.sample(n=1).node_id.values[0] if random_flag else des_ex_id
@@ -479,12 +444,62 @@ class RoadNet:
         }] * num_of_vehs
         self.demand = pd.DataFrame(rows)
 
+    def create_demand_for_classes(self, demand_classes):
+        """Create an exact, jointly simulated demand table.
+
+        ``demand_classes`` may contain :class:`DemandClass` instances or
+        mappings with ``origin``, ``destination``, ``vehicle_type``/``type``,
+        and ``demand`` fields.  Unlike ``add_charging_info`` this preserves
+        F1/F2 counts for every OD pair and never samples vehicle types.
+        """
+        rows = []
+        for item in demand_classes:
+            if isinstance(item, dict):
+                origin = int(item['origin'])
+                destination = int(item['destination'])
+                vehicle_type = str(item.get('vehicle_type', item.get('type'))).upper()
+                demand = int(item['demand'])
+            else:
+                origin = int(item.origin)
+                destination = int(item.destination)
+                vehicle_type = str(item.vehicle_type).upper()
+                demand = int(item.demand)
+            if vehicle_type not in {'F1', 'F2'}:
+                raise ValueError(f'Unsupported vehicle type: {vehicle_type}')
+            for _ in range(demand):
+                rows.append({
+                    'origin_node_id': origin,
+                    'destin_node_id': destination,
+                    'origin_osmid': self.nid_to_osmid_dict.get(origin, origin),
+                    'destin_osmid': self.nid_to_osmid_dict.get(destination, destination),
+                    'is_EV': vehicle_type == 'F2',
+                    'need_to_charge': vehicle_type == 'F2',
+                    'current_charge': 0,
+                    'target_charge': 100,
+                    'go_to_station_id': np.nan,
+                })
+        self.demand = pd.DataFrame(rows)
+        return self.demand
+
     def save_data(self, save_dir=None):
         save_name = self.name.lower().replace(' ', '_').replace(',', '')
         cwd = save_dir if save_dir else os.getcwd()
         self.demand.to_csv(os.path.join(cwd, f'traffic_inputs_{save_name}_od.csv'), index=False)
         self.nodes.to_csv(os.path.join(cwd, f'traffic_inputs_{save_name}_nodes.csv'), index=False)
         self.edges.to_csv(os.path.join(cwd, f'traffic_inputs_{save_name}_edges.csv'), index=False)
+
+    def export_artifact(self, output_dir, source=None):
+        """Serialize the exact cleaned graph consumed by all later stages."""
+        if not hasattr(self.edges, 'columns') or 'link_id' not in self.edges.columns:
+            raise ValueError('RoadNet must be rearranged before exporting an artifact')
+        return write_network_artifact(
+            self.nodes,
+            self.edges,
+            output_dir,
+            stage_counts=self.stage_counts,
+            stage_maps=self.stage_maps,
+            source=source,
+        )
 
     def plot_links_and_nodes(self, link_ids, node_ids=None, origin=None, destination=None):
         link_geos = gpd.GeoDataFrame(geometry=gpd.GeoSeries.from_wkt(self.edges.iloc[link_ids].geometry.tolist()))

@@ -3,6 +3,7 @@ import random
 from ctypes import c_double
 from . import interface
 import numpy as np
+import pandas as pd
 
 ###################################################################### ADDITION STARTS
 
@@ -345,7 +346,36 @@ class Node:
             veh_len = agent_id_dict[agent_id].veh_len
             station_id = [s for s in station_id_dict.keys() if (station_id_dict[s].ent_ex_node_id == self.nid)][0]
 
-            # The station entrance/exit can't be a destination, so we don't consider the "arrival case"
+            # A candidate charger may be located at an OD destination.  In
+            # that case ``prepare_agent`` correctly returns no next link, but
+            # the old code indexed ``link_id_dict[None]`` and crashed with
+            # ``KeyError(None)``.  Handle this exactly like ordinary arrival,
+            # also removing a vehicle that is leaving the station.
+            if next_node is None:
+                if self.nid != agent_id_dict[agent_id].destin_nid:
+                    raise RuntimeError(
+                        f'Agent {agent_id} has no next link at non-destination '
+                        f'node {self.nid}'
+                    )
+                if link_id_dict[il].ltype == 'Out_Station':
+                    if (station_id_dict[station_id].exit_queue and
+                            station_id_dict[station_id].exit_queue[0][0] == agent_id):
+                        station_id_dict[station_id].exit_queue.pop(0)
+                else:
+                    link_id_dict[il].send_veh(t_now, agent_id, agent_id_dict)
+                agent_id_dict[agent_id].move_agent(
+                    t_now, self.nid, None, 'arr'
+                )
+                agent_id_dict[agent_id].arrival_time = t_now
+                agent_id_dict[agent_id].travel_time = (
+                    t_now - agent_id_dict[agent_id].dept_time
+                )
+                continue
+
+            # In terms of the agent's current/next link type, there are 3 cases:
+            #   1. Agent goes from road to station
+            #   2. Agent goes from station to road
+            #   3. Agent goes from road to road
 
             # In terms of the agent's current/next link type, there are 3 cases:
             #   1. Agent goes from road to station
@@ -569,6 +599,7 @@ class Agent:
         self.cle = self.origin_nid  # current link end node
         # Empty
         self.route_igraph = []
+        self.route_link_ids = []
         self.find_route = None
         self.status = None
         self.cl_enter_time = None
@@ -616,7 +647,11 @@ class Agent:
 
 ###################################################################### ADDITION STARTS
 
-        ol = node2link_dict[(node_id, agent_next_node)]
+        route_edge_index = self.route_pointer - 1
+        if self.route_link_ids and route_edge_index < len(self.route_link_ids):
+            ol = int(self.route_link_ids[route_edge_index])
+        else:
+            ol = node2link_dict[(node_id, agent_next_node)]
         x_start, y_start = node_id_dict[self.cls].lon, node_id_dict[self.cls].lat
         x_mid, y_mid = node_id_dict[node_id].lon, node_id_dict[node_id].lat
         x_end, y_end = node_id_dict[agent_next_node].lon, node_id_dict[agent_next_node].lat
@@ -719,6 +754,10 @@ class Simulation:
     def create_network(self, nodes_df, links_df, charging_stations_df): ###################################################################### ADDITION INLINE
 
         # create graph
+        nodes_df = nodes_df.copy()
+        links_df = links_df.copy()
+        charging_stations_df = charging_stations_df.copy()
+        links_df['lanes'] = pd.to_numeric(links_df['lanes'], errors='coerce').fillna(1.0)
         links_df['capacity'] = links_df['lanes'] * 1900 ###################################################################### ADDITION INLINE
 ###################################################################### ADDITION STARTS
         links_df.loc[links_df['type'] == 'In_Station','capacity'] = np.nan
@@ -746,10 +785,18 @@ class Simulation:
                                        getattr(row, 'fft'), getattr( row, 'capacity'), getattr(row, 'type'), getattr(row, 'start_node_id'), getattr(row, 'end_node_id'), getattr(row, 'geometry'), simulation=self)
             links.append(real_link)
 
-        # dictionaries for quick look-up
-        self.node2link_dict = {
-            (link.start_nid, link.end_nid): link.lid for link in links}
         self.all_links = {link.lid: link for link in links}
+        self.pair_to_link_ids = {}
+        for link in links:
+            self.pair_to_link_ids.setdefault((link.start_nid, link.end_nid), []).append(link.lid)
+        for pair in self.pair_to_link_ids:
+            self.pair_to_link_ids[pair] = sorted(self.pair_to_link_ids[pair])
+        # Kept for legacy simulator internals only when the pair is unique.
+        self.node2link_dict = {
+            pair: link_ids[0]
+            for pair, link_ids in self.pair_to_link_ids.items()
+            if len(link_ids) == 1
+        }
         self.all_nodes = {node.nid: node for node in nodes}
         for link_id, link in self.all_links.items():
             self.all_nodes[link.start_nid].out_links.append(link_id)
@@ -773,14 +820,36 @@ class Simulation:
          
 ###################################################################### ADDITION ENDS
 
+    def resolve_link_id(self, start_nid, end_nid, link_id=None):
+        """Resolve a route edge without silently collapsing parallel links."""
+        if link_id is not None:
+            if int(link_id) not in self.all_links:
+                raise KeyError(f"Unknown link_id {link_id}")
+            link = self.all_links[int(link_id)]
+            if link.start_nid != start_nid or link.end_nid != end_nid:
+                raise ValueError(f"link_id {link_id} does not connect {start_nid}->{end_nid}")
+            return int(link_id)
+        candidates = self.pair_to_link_ids.get((start_nid, end_nid), [])
+        if len(candidates) != 1:
+            raise ValueError(
+                f"Edge pair {start_nid}->{end_nid} is ambiguous; provide link_id. "
+                f"Candidates: {candidates}"
+            )
+        return candidates[0]
+
     def create_demand(self, od_df):
 
         if 'agent_id' not in od_df.columns:
             od_df['agent_id'] = np.arange(od_df.shape[0])
-        od_df['dept_time'] = 0
+        # Preserve an explicitly supplied departure schedule.  The BPR
+        # calibration uses this to inject a controlled rate over a finite
+        # window; overwriting it here collapses every sweep level into a
+        # single time-zero batch and makes the measured x/y pairs invalid.
+        if 'dept_time' not in od_df.columns:
+            od_df['dept_time'] = 0
         od_df['veh_len'] = 8
         od_df['gps_reroute'] = 0
-        od_df = od_df.sample(frac=1).reset_index(
+        od_df = od_df.sample(frac=1, random_state=getattr(self, 'random_seed', None)).reset_index(
             drop=True)  # randomly shuffle rows
         # print('# trips {}'.format(od_df.shape[0]))
 

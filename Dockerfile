@@ -23,4 +23,4 @@ RUN conda run -n evopt python -c "from queue_sim import Runner; print('Queue sim
 
 ENV CONDA_DEFAULT_ENV=evopt
 
-ENTRYPOINT ["conda", "run", "-n", "evopt", "python", "pipeline.py", "--config", "config_docker.json"]
+ENTRYPOINT ["conda", "run", "-n", "evopt", "python", "pipeline.py"]
