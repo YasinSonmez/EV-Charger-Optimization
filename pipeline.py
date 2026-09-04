@@ -45,7 +45,7 @@ try:
     from queue_sim import QUEUE_SIM_AVAILABLE, _QUEUE_SIM_ERROR
 except (ImportError, ModuleNotFoundError):
     QUEUE_SIM_AVAILABLE = False
-    _QUEUE_SIM_ERROR = "queue_sim package not found (macOS-only)"
+    _QUEUE_SIM_ERROR = "queue_sim package or platform-native library not found"
 
 
 def _fill_missing_links_to_count(pandas_df, target_count, allow_missing=False):
@@ -258,7 +258,6 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
         print("Loaded cached BPR fit results.")
     elif os.path.exists(data_path) and not force_regenerate and cache_compatible:
         print("No cache found. Fitting BPR models from existing data...")
-        import pandas as pd
         pandas_df = pd.read_csv(data_path)
         convert_string_to_array(pandas_df, 'x_vector')
         convert_string_to_array(pandas_df, 'y_vector')
@@ -338,7 +337,6 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
             active_link_ids=bpr_config.get('active_link_ids'),
             resume=bpr_config.get('resume', True),
         )
-        import pandas as pd
         pandas_df = pd.read_csv(data_path)
         convert_string_to_array(pandas_df, 'x_vector')
         convert_string_to_array(pandas_df, 'y_vector')
@@ -383,7 +381,7 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
     else:
         raise FileNotFoundError(
             f"No BPR data found at {data_path} or {cache_path}. "
-            f"Provide coordinates and run on macOS to generate data via queue simulation."
+            f"Provide coordinates and run where the queue native library is available."
         )
     if artifact_dir is not None:
         pandas_df = _ensure_bpr_link_length(pandas_df, artifact_dir)
@@ -1039,7 +1037,7 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
             "",
             "## Queue-Based Simulation",
             "",
-            f"**SKIPPED** — queue simulation requires macOS (liblsp.dylib).",
+            f"**SKIPPED** — a platform-native liblsp shared library is unavailable.",
             f"Error: {_QUEUE_SIM_ERROR}",
         ])
 
@@ -1492,6 +1490,7 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
                     convergence_data, network_stages)
 
     provenance = {
+        **process_provenance(),
         'random_seed': seed_manager.seed,
         'parallel_workers_requested': config.pipeline.get('parallel_workers'),
         'parallel_workers_available': available_cpus(),

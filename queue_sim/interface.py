@@ -5,7 +5,7 @@ from ctypes import *
 from numpy.ctypeslib import ndpointer
 import pandas as pd
 import numpy as np
-from os import path, listdir
+from os import environ, path, listdir
 import platform
 
 
@@ -16,6 +16,15 @@ _SUFFIXES = {'Darwin': ('.dylib', '.so'),
 
 
 def _find_library():
+    override = environ.get('EVOPT_LIBLSP_PATH')
+    if override:
+        candidate = path.abspath(path.expanduser(override))
+        if not path.isfile(candidate):
+            raise OSError(
+                'EVOPT_LIBLSP_PATH points to a missing file: {}'.format(candidate)
+            )
+        return candidate
+
     here = path.dirname(path.abspath(__file__))
     roots = [here] + [path.dirname(here)] + [path.abspath('.')]
     parent = path.dirname(here)

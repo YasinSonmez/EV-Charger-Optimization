@@ -1,8 +1,21 @@
-results/
-model_fit_plots/
-__pycache__/
-*.pyc
-.pytest_cache/
-.git/
-.gitignore
-inspect.ipynb
+# Keep the build context limited to the executable pipeline. This prevents
+# local OSM caches, results, papers, exploratory files, and unrelated working
+# tree changes from being baked into an image.
+**
+!Dockerfile
+!environment.yml
+!build_liblsp.sh
+!pipeline.py
+!run_suite.py
+!validate_outputs.py
+!src/
+!src/**
+!queue_sim/
+!queue_sim/**
+!configs/
+!configs/rebuttal/
+!configs/rebuttal/**
+
+**/__pycache__/
+**/*.py[cod]
+**/.DS_Store

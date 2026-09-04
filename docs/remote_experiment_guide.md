@@ -73,34 +73,127 @@ network entered exact cycles at iterations 5--6; this is why production runs
 retain cycle detection and must not infer a production iteration count from
 the two-vehicle sanity result.
 
-## Container and cluster launch
+## Container runtime model
+
+The image contains the pinned Conda environment and Linux C++ shortest-path
+library. `scripts/run_container.sh` supports two deliberately distinct modes:
+
+- `workspace` (default) mounts a host Git checkout read-only at `/workspace`.
+  Python and configuration changes therefore do not require an image rebuild.
+  The checkout commit and dirty/clean state are recorded in every run.
+- `image` runs the code baked into the image. Use this with an immutable image
+  digest for final paper results.
+
+In both modes, results and the OSM cache are host directories. The native
+library is loaded from `/opt/evopt/lib/liblsp.so`, outside either code
+directory, so mounting a checkout cannot hide it.
+
+Build the runtime once. Rebuild only after dependencies, the native library,
+or the desired immutable image-mode source changes:
 
 ```bash
-docker build --platform linux/amd64 -t USER/evopt:rebuttal-scalable .
-docker push USER/evopt:rebuttal-scalable
+docker build \
+  --build-arg VCS_REF="$(git rev-parse HEAD)" \
+  -t evopt:rebuttal-runtime .
+```
 
-git clone --branch rebuttal-scalable-pipeline REPOSITORY_URL evopt
+Run any checked-out configuration and inspect outputs on the host immediately:
+
+```bash
+scripts/run_container.sh \
+  --engine docker \
+  --image evopt:rebuttal-runtime \
+  --mode workspace \
+  --config configs/rebuttal/sanity_small.json \
+  --results results/docker-sanity \
+  --cache data/graphs \
+  --cpus 8
+```
+
+Add `--resume`, `--network-only`, or `--validate-config` as needed. The script
+prints the resolved image, execution mode, commit, result path, cache path, and
+CPU count before starting.
+
+## Apptainer and Slurm
+
+Build and publish the cluster image for `linux/amd64` from an amd64 machine or
+with Docker Buildx:
+
+```bash
+docker buildx build --platform linux/amd64 \
+  --build-arg VCS_REF="$(git rev-parse HEAD)" \
+  -t REGISTRY/evopt:rebuttal-runtime --push .
+```
+
+On the cluster login node, clone the same branch and convert the OCI image
+once. Keeping both the checkout and SIF makes the executed source inspectable:
+
+```bash
+git clone --branch rebuttal-scalable-pipeline \
+  https://github.com/YasinSonmez/EV-Charger-Optimization.git evopt
 cd evopt
-mkdir -p slurm_logs /path/to/results /path/to/osm-cache
-export EVOPT_IMAGE=docker://USER/evopt:rebuttal-scalable
+apptainer pull evopt-rebuttal.sif docker://REGISTRY/evopt:rebuttal-runtime
+mkdir -p results osm-cache slurm_logs
+```
+
+After that preparation, a complete configurable run is one command:
+
+```bash
+scripts/run_container.sh \
+  --engine apptainer \
+  --image "$PWD/evopt-rebuttal.sif" \
+  --mode workspace \
+  --config configs/rebuttal/sanity_small.json \
+  --results "$PWD/results" \
+  --cache "$PWD/osm-cache" \
+  --cpus 16
+```
+
+For immutable final execution, replace `--mode workspace` with `--mode image`.
+The selected host configuration is still mounted at `/inputs/config.json`.
+
+Submit the three independent scale configurations as a Slurm array:
+
+```bash
+export EVOPT_IMAGE="$PWD/evopt-rebuttal.sif"
 export EVOPT_PROJECT_DIR="$PWD"
-export EVOPT_RESULTS_DIR=/path/to/results
-export EVOPT_CACHE_DIR=/path/to/osm-cache
+export EVOPT_RESULTS_DIR="$PWD/results"
+export EVOPT_CACHE_DIR="$PWD/osm-cache"
+export EVOPT_EXECUTION_MODE=workspace
 sbatch scripts/run_slurm_suite.sh
 ```
 
-The Slurm array requests 16 CPUs, 64 GiB, 72 hours, and a five-minute
-preemption signal. BLAS/OpenMP are limited to one thread per worker. Each scale
-is independent.
+The array script delegates to the same container launcher, mounts source
+read-only, and propagates the Slurm CPU allocation. Create `slurm_logs/` before
+`sbatch`, because Slurm opens log files before the job body starts. The array
+requests 16 CPUs, 64 GiB, 72 hours, and a five-minute preemption signal.
+BLAS/OpenMP are limited to one thread per worker, and each scale is independent.
 
-Resume or summarize with:
+Resume or summarize through the same interface:
 
 ```bash
-python run_suite.py --manifest configs/rebuttal/suite.json \
-  --results-root /path/to/results --index 0 --resume
-python run_suite.py --manifest configs/rebuttal/suite.json \
-  --results-root /path/to/results --summarize
+scripts/run_container.sh --engine apptainer \
+  --image "$PWD/evopt-rebuttal.sif" --mode workspace \
+  --manifest configs/rebuttal/suite.json --index 0 \
+  --results "$PWD/results" --cache "$PWD/osm-cache" --cpus 16 --resume
+
+scripts/run_container.sh --engine apptainer \
+  --image "$PWD/evopt-rebuttal.sif" --mode workspace \
+  --manifest configs/rebuttal/suite.json \
+  --results "$PWD/results" --cache "$PWD/osm-cache" --summarize
 ```
+
+Docker was exercised end-to-end with the sanity configuration: every stage
+passed in 265.1 seconds on Docker Desktop with eight CPUs. It reproduced the
+same topology size, BPR pass count, charger choice, Nash status, queue travel
+time, and greedy/exhaustive conclusion as the native run. Tiny projection
+floating-point differences across macOS and Linux intentionally produce a
+different byte-level network hash. Final experiments should all use the same
+`linux/amd64` image digest and compare native/container runs by recorded
+scientific invariants rather than claiming byte-identical artifacts. The
+revised amd64 image also passed immutable-image validation, mounted-workspace
+suite validation, native-library loading, and a complete checkpoint-resume
+run under amd64 emulation.
 
 ## BPR worker benchmark
 

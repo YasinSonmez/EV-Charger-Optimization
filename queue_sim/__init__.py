@@ -1,4 +1,4 @@
-"""Queue-based traffic simulation package (macOS-only due to liblsp.dylib)."""
+"""Queue-based traffic simulation package with a platform-native liblsp."""
 import os
 
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

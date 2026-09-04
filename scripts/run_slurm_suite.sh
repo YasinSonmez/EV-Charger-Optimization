@@ -10,13 +10,14 @@
 
 set -euo pipefail
 
-: "${EVOPT_IMAGE:?Set EVOPT_IMAGE to a Docker/Apptainer image URI or local .sif}"
-: "${EVOPT_PROJECT_DIR:?Set EVOPT_PROJECT_DIR to the pulled Git repository}"
+: "${EVOPT_IMAGE:?Set EVOPT_IMAGE to an Apptainer .sif or docker:// image URI}"
+: "${EVOPT_PROJECT_DIR:=${SLURM_SUBMIT_DIR:-$PWD}}"
 : "${EVOPT_RESULTS_DIR:?Set EVOPT_RESULTS_DIR to persistent result storage}"
 : "${EVOPT_CACHE_DIR:?Set EVOPT_CACHE_DIR to persistent OSM cache storage}"
 
 SUITE_MANIFEST="${SUITE_MANIFEST:-configs/rebuttal/suite.json}"
-mkdir -p "$EVOPT_RESULTS_DIR" "$EVOPT_CACHE_DIR" "$EVOPT_PROJECT_DIR/slurm_logs"
+EVOPT_EXECUTION_MODE="${EVOPT_EXECUTION_MODE:-workspace}"
+mkdir -p "$EVOPT_RESULTS_DIR" "$EVOPT_CACHE_DIR"
 
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -24,13 +25,6 @@ export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export MPLCONFIGDIR="${SLURM_TMPDIR:-/tmp}/matplotlib-${SLURM_JOB_ID}"
 mkdir -p "$MPLCONFIGDIR"
-
-if [[ "$EVOPT_IMAGE" == docker://* ]]; then
-    SIF_PATH="$EVOPT_CACHE_DIR/evopt-${SLURM_JOB_ID}.sif"
-    apptainer pull --force "$SIF_PATH" "$EVOPT_IMAGE"
-else
-    SIF_PATH="$EVOPT_IMAGE"
-fi
 
 child=""
 checkpoint_and_exit() {
@@ -42,13 +36,16 @@ checkpoint_and_exit() {
 }
 trap checkpoint_and_exit USR1 TERM
 
-apptainer exec --cleanenv \
-    --env "EVOPT_GRAPH_CACHE_DIR=/cache" \
-    --env "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK}" \
-    --bind "$EVOPT_PROJECT_DIR:/workspace:ro" \
-    --bind "$EVOPT_RESULTS_DIR:/results" \
-    --bind "$EVOPT_CACHE_DIR:/cache" \
-    "$SIF_PATH" \
-    bash -lc "cd /workspace && python run_suite.py --manifest '$SUITE_MANIFEST' --results-root /results --index '${SLURM_ARRAY_TASK_ID}' --resume" &
+"$EVOPT_PROJECT_DIR/scripts/run_container.sh" \
+    --engine apptainer \
+    --image "$EVOPT_IMAGE" \
+    --mode "$EVOPT_EXECUTION_MODE" \
+    --workspace "$EVOPT_PROJECT_DIR" \
+    --manifest "$EVOPT_PROJECT_DIR/$SUITE_MANIFEST" \
+    --results "$EVOPT_RESULTS_DIR" \
+    --cache "$EVOPT_CACHE_DIR" \
+    --cpus "$SLURM_CPUS_PER_TASK" \
+    --index "$SLURM_ARRAY_TASK_ID" \
+    --resume &
 child=$!
 wait "$child"

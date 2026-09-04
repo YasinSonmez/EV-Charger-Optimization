@@ -65,6 +65,11 @@ def process_provenance() -> dict:
         "available_cpus": available_cpus(),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
         "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+        "containerized": os.environ.get("EVOPT_CONTAINERIZED") == "1",
+        "container_image": os.environ.get("EVOPT_IMAGE_REF"),
+        "container_image_digest": os.environ.get("EVOPT_IMAGE_DIGEST"),
+        "execution_mode": os.environ.get("EVOPT_EXECUTION_MODE", "native"),
+        "code_commit": os.environ.get("EVOPT_CODE_COMMIT"),
         "peak_rss_raw": usage.ru_maxrss,
     }
 

@@ -34,6 +34,9 @@ data/graphs/
 
 # Docker
 dlls/liblsp.so  # Linux binary — built by build_liblsp.sh, not committed
+*.sif
+osm-cache/
+slurm_logs/
 
 # Generated BPR caches (keep only the original data/cached_results.pkl)
 data/cached_results_*.pkl

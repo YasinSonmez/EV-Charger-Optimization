@@ -44,20 +44,18 @@ CONFIG_NAME=$(basename "$CONFIG_ABS")
 if [ "$USE_DOCKER" = true ]; then
     if [ "$DOCKER_BUILD" = true ]; then
         echo "Building Docker image..."
-        docker build -t "$DOCKER_IMAGE" .
+        VCS_REF=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+        docker build --build-arg "VCS_REF=$VCS_REF" -t "$DOCKER_IMAGE" .
     fi
 
     RESULTS_DIR=$(pwd)/results
-    mkdir -p "$RESULTS_DIR"
-
-    echo "Running via Docker: $CONFIG_NAME"
-    docker run --rm \
-        -v "$CONFIG_ABS:/app/$CONFIG_NAME:ro" \
-        -v "$RESULTS_DIR:/app/results" \
-        "$DOCKER_IMAGE" \
-        --config "/app/$CONFIG_NAME"
-
-    echo "Results saved to: $RESULTS_DIR"
+    exec scripts/run_container.sh \
+        --engine docker \
+        --image "$DOCKER_IMAGE" \
+        --mode workspace \
+        --config "$CONFIG_ABS" \
+        --results "$RESULTS_DIR" \
+        --cache "$(pwd)/data/graphs"
 else
     echo "Running locally: $CONFIG_NAME"
     python3 pipeline.py --config "$CONFIG_ABS"
