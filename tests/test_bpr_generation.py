@@ -229,6 +229,8 @@ def test_bpr_worker_measures_link_without_straight_ahead_continuation(tmp_path):
     assert result["errors"] == []
     assert result["x_vector"] == [1.0]
     assert result["y_vector"] == [9.0]
+    assert result["observations"][0]["replications"] == 1
+    assert result["complete"] is True
 
 
 def test_historical_worker_uses_synthetic_boundary_for_single_boundary_link(tmp_path, monkeypatch):

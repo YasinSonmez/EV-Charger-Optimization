@@ -12,6 +12,7 @@ from itertools import combinations
 from multiprocessing import Pool
 
 import numpy as np
+import pandas as pd
 
 warnings.filterwarnings('ignore')
 
@@ -19,6 +20,7 @@ from queue_sim import Runner, QUEUE_SIM_AVAILABLE
 from queue_sim.find_nash import _prune_flow_data
 from src.contracts import normalize_od_demand, SeedManager
 from src.network_artifact import load_network_artifact
+from src.run_state import available_cpus
 
 
 def _placement_seed(rep, positions):
@@ -154,7 +156,7 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
     workers = workers_requested
     if workers is None:
         workers = config.pipeline.get('parallel_workers')
-    available_workers = max(1, os.cpu_count() or 1)
+    available_workers = available_cpus()
     workers = available_workers if workers is None else max(1, min(int(workers), available_workers))
     work_dir = os.path.join(experiment_dir, 'queue')
     input_paths = (
@@ -178,6 +180,15 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
         raise ValueError(
             f'Queue assignments use network hashes {sorted(ne_hashes)}, '
             f'but the requested artifact is {network_manifest["network_hash"]}'
+        )
+    invalid = {
+        key: value.get('status', 'invalid')
+        for key, value in ne.items()
+        if not isinstance(value, dict) or not value.get('converged', False)
+    }
+    if invalid:
+        raise RuntimeError(
+            f'Queue comparison requires converged Nash assignments: {invalid}'
         )
     demand_classes = normalize_od_demand(data['run_configuration']['od_demand'])
     seed = seed_manager.seed if seed_manager is not None else config.pipeline.get('random_seed', 0)

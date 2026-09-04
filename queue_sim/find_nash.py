@@ -17,6 +17,7 @@ warnings.filterwarnings('ignore')
 from queue_sim import Runner, QUEUE_SIM_AVAILABLE
 from src.contracts import DemandClass, SeedManager, normalize_od_demand
 from src.network_artifact import load_network_artifact
+from src.run_state import available_cpus
 
 
 def _collapse_repeats(lst):
@@ -145,7 +146,7 @@ def _simulate(args):
     for rep in range(int(num_iters)):
         rep_dir = os.path.join(output_root, f'rep_{rep}')
         os.makedirs(rep_dir, exist_ok=True)
-        rep_seed = SeedManager(seed).derive('queue-rep', scenario_name, rep)
+        rep_seed = SeedManager(seed).derive('queue-common-rep', rep)
         runner = Runner(
             nodes_csv=nodes_path,
             links_csv=edges_path,
@@ -197,7 +198,7 @@ def _simulate_rep(args):
     rep_dir = os.path.join(output_root, f'rep_{rep}')
     try:
         os.makedirs(rep_dir, exist_ok=True)
-        rep_seed = SeedManager(seed).derive('queue-rep', scenario_name, rep)
+        rep_seed = SeedManager(seed).derive('queue-common-rep', rep)
         nodes_path, edges_path, od_path = input_paths
         runner = Runner(
             nodes_csv=nodes_path,
@@ -387,6 +388,14 @@ def _nash_for_config(args):
     return loc_str, result, history
 
 
+def _assignment_signature(assignments_no, assignments_ch):
+    values = []
+    for vehicle_type, assignments in (("F1", assignments_no), ("F2", assignments_ch)):
+        for od in sorted(assignments):
+            values.append((vehicle_type, tuple(map(int, od)), tuple(map(int, assignments[od]))))
+    return tuple(values)
+
+
 def find_nash_assignments(config, experiment_dir, all_opt_results_path,
                           network_name='canonical', artifact_dir=None,
                           seed_manager=None):
@@ -427,7 +436,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
     input_paths = (nodes_path, edges_path, od_path)
     configs = list(data['configurations'].keys())
     seed = seed_manager.seed if seed_manager is not None else config.pipeline.get('random_seed', 0)
-    available_workers = max(1, os.cpu_count() or 1)
+    available_workers = available_cpus()
     pool_size = available_workers if workers is None else max(1, int(workers))
     pool_size = min(pool_size, available_workers)
 
@@ -475,6 +484,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             'status': 'ok',
             'failure_reason': None,
             'resumed_complete': False,
+            'seen_assignments': set(),
         }
 
         prior = resume_assignments.get(loc_str)
@@ -506,6 +516,21 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
         if not state.get('resumed_complete')
     }
     for iteration in range(int(max_ne_iterations)):
+        if not active:
+            break
+        for loc_str in list(active):
+            state = states[loc_str]
+            signature = _assignment_signature(
+                state['assignments_no'], state['assignments_ch']
+            )
+            if signature in state['seen_assignments']:
+                state['status'] = 'nonconverged'
+                state['failure_reason'] = (
+                    f'assignment cycle detected at iteration {iteration}'
+                )
+                active.remove(loc_str)
+            else:
+                state['seen_assignments'].add(signature)
         if not active:
             break
         iteration_started = time.perf_counter()

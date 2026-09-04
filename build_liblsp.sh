@@ -3,14 +3,17 @@
 # Run this ON THE LINUX MACHINE, from the project root. See README_LINUX.md.
 set -euo pipefail
 
-BRANCH=dataframe_2026     # NOT the default branch: only this one has creategraph()
 REPO=https://github.com/cb-cities/sp.git
+COMMIT=475298f4570109378a57b4e592f01b8a26fe0c90
 DEST="$(cd "$(dirname "$0")" && pwd)/dlls"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-echo ">> cloning $REPO ($BRANCH)"
-git clone -q --depth 1 --branch "$BRANCH" "$REPO" "$WORK/sp"
+echo ">> fetching $REPO at $COMMIT"
+git init -q "$WORK/sp"
+git -C "$WORK/sp" remote add origin "$REPO"
+git -C "$WORK/sp" fetch -q --depth 1 origin "$COMMIT"
+git -C "$WORK/sp" checkout -q --detach FETCH_HEAD
 
 echo ">> compiling"
 g++ -std=c++14 -O3 -shared -fPIC \

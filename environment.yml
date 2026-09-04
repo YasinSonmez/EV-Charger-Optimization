@@ -4,29 +4,32 @@ channels:
   - defaults
 dependencies:
   # Core Python
-  - python=3.10
+  - python=3.10.16
 
   # Scientific computing & Data
-  - numpy
-  - pandas
-  - scipy
-  - scikit-learn
+  - numpy=1.26.4
+  - pandas=2.2.3
+  - scipy=1.15.3
+  - scikit-learn=1.6.1
 
   # Plotting
-  - matplotlib
+  - matplotlib=3.10.0
 
   # Optimization
-  - cvxpy
+  - cvxpy=1.6.5
 
   # Geospatial
-  - osmnx
-  - geopandas 
-  - networkx
+  - osmnx=2.0.3
+  - geopandas=1.0.1
+  - networkx=3.4.2
+  - pyproj=3.6.1
+  - shapely=2.0.6
 
   # Pip for packages not well-supported on conda-forge or for specific versions
   - pip
   - pip:
-    - clarabel  # CVXPY recommends installing solvers via pip
+    - clarabel==0.10.0
+    - pytest==8.3.5
     # Optional solvers, can be uncommented if direct control over their availability is desired
     # - osqp
     # - scs

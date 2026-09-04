@@ -208,6 +208,12 @@ class TrafficModelFitter:
         fft = float(link_row.get('calibration_fft', np.nan))
         if not np.isfinite(capacity) or capacity <= 0 or not np.isfinite(fft) or fft <= 0:
             return link_id, np.nan, np.nan, np.nan, np.nan, np.nan
+        # A nearly horizontal simulated response is a valid free-flow curve,
+        # not a reason to invent congestion parameters or reject the link.
+        if np.ptp(y) <= 0.01 * max(abs(fft), np.finfo(float).eps):
+            prediction = np.full_like(y, fft)
+            r2 = float(r2_score(y, prediction)) if np.std(y) > 0 else 1.0
+            return link_id, 0.0, 1.0, capacity, fft, r2
 
         def fixed_model(flow, a, b):
             return model(flow, a, b, capacity, fft)
@@ -353,6 +359,12 @@ class TrafficModelFitter:
             is_constant = (np.isfinite(a_fit) and np.isfinite(b_fit)
                             and float(a_fit) == 0.0 and float(b_fit) == 0.0
                             and float(cap_fit) == 1.0)
+            is_validated_flat = (
+                self.fixed_references and np.isfinite(a_fit) and np.isfinite(b_fit)
+                and float(a_fit) == 0.0 and float(b_fit) == 1.0
+                and np.isfinite(cap_fit) and float(cap_fit) > 0
+                and np.isfinite(fft_fit) and float(fft_fit) > 0
+            )
             if self.bpr_mode == 'historical_artifact_compatible':
                 if source_status == 'proxy' or observation_source == 'proxy':
                     status = 'proxy'
@@ -371,7 +383,7 @@ class TrafficModelFitter:
                     status = 'failed'
                     reason = 'non_finite_fit_parameters'
             else:
-                status = (
+                status = 'validated_free_flow' if is_validated_flat else (
                     'full'
                     if np.isfinite(a_fit) and np.isfinite(b_fit) and np.isfinite(cap_fit)
                     and np.isfinite(fft_fit) and a_fit > 0 and b_fit > 0
@@ -621,17 +633,19 @@ def validate_bpr_fit_table(df, expected_link_ids=None, require_full_fit=False,
         | (numeric['cap_fit'] <= 0)
         | (numeric['fft_fit'] < 0)
     )
-    if validation_mode == 'full':
-        invalid_mask = invalid_mask | df.index.isin(df.index[
-            (numeric['a_fit'] <= 0) | (numeric['b_fit'] <= 0)
-        ])
-    invalid = df[invalid_mask]
     statuses = (
         df['fit_status']
         if 'fit_status' in df.columns
         else pd.Series('unknown', index=df.index, dtype=object)
     )
-    non_full = df[statuses != 'full']
+    validated_flat = statuses == 'validated_free_flow'
+    if validation_mode == 'full':
+        invalid_mask = invalid_mask | (
+            ((numeric['a_fit'] <= 0) | (numeric['b_fit'] <= 0)) & ~validated_flat
+        )
+    invalid = df[invalid_mask]
+    accepted_statuses = {'full', 'validated', 'validated_free_flow'}
+    non_full = df[~statuses.isin(accepted_statuses)]
     if not invalid.empty:
         errors.append(
             f'invalid fitted parameters for link_ids={invalid.link_id.astype(int).tolist()[:10]}'
@@ -644,9 +658,11 @@ def validate_bpr_fit_table(df, expected_link_ids=None, require_full_fit=False,
         raise ValueError(f'{label} BPR fit validation failed: ' + '; '.join(errors))
     return {
         'link_count': int(len(df)),
-        'full_fit_count': int((statuses == 'full').sum()),
+        'full_fit_count': int(statuses.isin(accepted_statuses).sum()),
+        'validated_fit_count': int((statuses == 'validated').sum()),
+        'validated_free_flow_count': int((statuses == 'validated_free_flow').sum()),
         'full_relaxed_count': int((statuses == 'full_relaxed').sum()),
-        'non_full_fit_count': int((statuses != 'full').sum()),
+        'non_full_fit_count': int((~statuses.isin(accepted_statuses)).sum()),
         'constant_fallback_count': int((statuses == 'constant_fallback').sum()),
         'proxy_count': int((statuses == 'proxy').sum()),
         'validation_mode': validation_mode,

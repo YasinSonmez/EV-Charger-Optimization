@@ -1009,7 +1009,15 @@ class Runner:
                             edge_index = list(path).index((start_nid, end_nid))
                             link_id = link_ids[edge_index]
                         link = link_by_id[int(link_id)]
-                        travel_time += float(link.fft if np.isfinite(link.fft) else link.ave_travel_time)
+                        # Wardrop/better-response cost under the current
+                        # network state.  A route need not carry an agent for
+                        # its cost to be assembled from its links; links with
+                        # no observations retain their initialized FFT.
+                        travel_time += float(
+                            link.ave_travel_time
+                            if np.isfinite(link.ave_travel_time) and link.ave_travel_time > 0
+                            else link.fft
+                        )
                     if group['vehicle_type'] == 'F2':
                         travel_time += float(group['entries'][route_index].get('station_cost', 0.0) or 0.0)
                 details.setdefault(key, []).append({

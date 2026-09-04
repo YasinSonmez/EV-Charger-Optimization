@@ -1,0 +1,8 @@
+{
+  "name": "secondary-plus-scaling",
+  "configs": [
+    "scale_0100.json",
+    "scale_0500.json",
+    "scale_1000.json"
+  ]
+}

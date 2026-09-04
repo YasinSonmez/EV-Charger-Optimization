@@ -30,9 +30,13 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.config import Config
+from src.config import Config, NetworkConfig
 from src.contracts import SeedManager, TimingRecorder, stable_json
 from src.network_artifact import load_network_artifact
+from src.run_state import (
+    atomic_write_json, available_cpus, config_digest,
+    directory_inventory, process_provenance, safe_name,
+)
 from src.sanity_checks import validate_experiment_outputs
 from src.model_fitter import TrafficModelFitter, convert_string_to_array, validate_bpr_fit_table
 from src.utils import outer_optimization
@@ -329,8 +333,10 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
             ),
             simulation_horizon=bpr_config.get(
                 'simulation_horizon',
-                config.queue_simulation.get('SIMULATION_HORIZON', 10801),
+                10801,
             ),
+            active_link_ids=bpr_config.get('active_link_ids'),
+            resume=bpr_config.get('resume', True),
         )
         import pandas as pd
         pandas_df = pd.read_csv(data_path)
@@ -421,7 +427,10 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
             'num_samples': int(bpr_config.get('num_samples', 25)),
             'max_flow': float(bpr_config.get('max_flow', 250)),
             'random_seed': int(seed_manager.seed if seed_manager is not None else 0),
-            'fitter_version': 'historical_v1' if bpr_mode == 'historical_artifact_compatible' else 'capacity_fraction_v1',
+            'fitter_version': (
+                'historical_v1' if bpr_mode == 'historical_artifact_compatible'
+                else 'capacity_fraction_v1'
+            ),
             'historical_reference_commit': bpr_config.get('historical_reference_commit') if bpr_mode == 'historical_artifact_compatible' else None,
             'route_semantics': 'measured_target_flow_with_straight_ahead_context' if bpr_mode == 'historical_artifact_compatible' else bpr_config.get('route_mode', 'link_probe'),
             'missing_context_policy': bpr_config.get('missing_context_policy', 'synthetic_boundary'),
@@ -434,7 +443,7 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
             'simulation_horizon': int(
                 bpr_config.get(
                     'simulation_horizon',
-                    config.queue_simulation.get('SIMULATION_HORIZON', 10801),
+                    10801,
                 )
             ),
             'fit_screening': bpr_config.get('fit_screening', 'none'),
@@ -1091,7 +1100,7 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
     return report_path
 
 
-def run_pipeline(config_path: str) -> str:
+def run_pipeline(config_path: str, results_root: str = "results", resume: bool = False) -> str:
     """Run the complete EV charger optimization pipeline end-to-end.
 
     Returns: path to experiment directory.
@@ -1101,10 +1110,21 @@ def run_pipeline(config_path: str) -> str:
     seed_manager = SeedManager(config.pipeline.get('random_seed', 0))
     timing_recorder = TimingRecorder()
 
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    experiment_dir = os.path.join("results", f"{timestamp}_n={len(config.possible_charger_positions)}_chargers={config.num_chargers}")
+    digest = config_digest(config.to_dict())
+    experiment_dir = os.path.join(results_root, f"{safe_name(config.name)}-{digest[:12]}")
+    if os.path.exists(experiment_dir) and not resume:
+        raise FileExistsError(
+            f"Run directory already exists: {experiment_dir}; use --resume or change the config"
+        )
     os.makedirs(experiment_dir, exist_ok=True)
+    with open(config_path) as handle:
+        original_config = json.load(handle)
+    atomic_write_json(os.path.join(experiment_dir, "original_config.json"), original_config)
     config.to_json(os.path.join(experiment_dir, "run_config.json"))
+    atomic_write_json(os.path.join(experiment_dir, "status.json"), {
+        "status": "running", "stage": "network", "config_digest": digest,
+        "resume": bool(resume), **process_provenance(),
+    })
 
     timing = {}
     cg_results = None
@@ -1135,20 +1155,43 @@ def run_pipeline(config_path: str) -> str:
     hw_types = rf.get('highway_types') if rf.get('enabled', True) else None
     from src.road_network import RoadNet
     shared_road_net = RoadNet('pipeline')
-    shared_road_net.get_map(
-        config.coordinates[0], config.coordinates[1],
-        config.coordinates[2], config.coordinates[3],
-        highway_types=hw_types,
-        merge_chains=rf.get('merge_chains', True),
-        contract_threshold=rf.get('contract_threshold', 30),
-        prune_dead_ends=rf.get('prune_dead_ends', False),
-        suppress_t_junctions=rf.get('suppress_t_junctions', False),
-        apply_cleaning=rf.get('enabled', True),
-    )
+    input_artifact_dir = config.pipeline.get('artifact_dir')
+    input_network_manifest = None
+    if input_artifact_dir:
+        input_network_manifest = shared_road_net.load_artifact(input_artifact_dir)
+    else:
+        shared_road_net.get_map(
+            config.coordinates[0], config.coordinates[1],
+            config.coordinates[2], config.coordinates[3],
+            highway_types=hw_types,
+            merge_chains=rf.get('merge_chains', True),
+            contract_threshold=rf.get('contract_threshold', 30),
+            prune_dead_ends=rf.get('prune_dead_ends', False),
+            suppress_t_junctions=rf.get('suppress_t_junctions', False),
+            apply_cleaning=rf.get('enabled', True),
+            intersection_tolerance=rf.get('intersection_tolerance', 0),
+            cache_policy=config.network.get('cache_policy', 'reuse'),
+        )
     network_stages = shared_road_net.stage_counts
     network_stage_maps = shared_road_net.stage_maps
     network_node_count = len(shared_road_net.nodes)
     network_edge_count = len(shared_road_net.edges)
+    expected_nodes = config.network.get('expected_nodes')
+    if expected_nodes is not None:
+        tolerance = float(config.network.get('node_tolerance_fraction', 0.10))
+        relative_error = abs(network_node_count - int(expected_nodes)) / int(expected_nodes)
+        if relative_error > tolerance:
+            atomic_write_json(os.path.join(experiment_dir, "status.json"), {
+                "status": "ineligible", "stage": "network",
+                "reason": "network_size_out_of_tolerance",
+                "expected_nodes": int(expected_nodes), "actual_nodes": network_node_count,
+                "relative_error": relative_error, "allowed_relative_error": tolerance,
+                "config_digest": digest, **process_provenance(),
+            })
+            raise ValueError(
+                f"Generated network has {network_node_count} nodes; expected "
+                f"{expected_nodes} within {tolerance:.1%}"
+            )
     print(f"Network: {network_node_count} nodes, {network_edge_count} links")
     timing['network_cleaning'] = time.time() - t0
     timing_recorder.add('network_cleaning', timing['network_cleaning'], nodes=network_node_count, edges=network_edge_count)
@@ -1157,16 +1200,40 @@ def run_pipeline(config_path: str) -> str:
     network_manifest = shared_road_net.export_artifact(
         network_artifact_dir,
         source={
+            'input_artifact': input_artifact_dir,
+            'input_network_hash': (
+                input_network_manifest.get('network_hash')
+                if input_network_manifest else None
+            ),
             'coordinates': config.coordinates,
             'highway_types': hw_types,
             'merge_chains': rf.get('merge_chains', True),
             'contract_threshold': rf.get('contract_threshold', 30),
+            'intersection_tolerance': rf.get('intersection_tolerance', 0),
             'prune_dead_ends': rf.get('prune_dead_ends', False),
             'random_seed': seed_manager.seed,
         },
     )
     with open(os.path.join(experiment_dir, 'network_manifest.json'), 'w') as handle:
         json.dump(network_manifest, handle, indent=2, default=str)
+
+    scenario_metadata = None
+    if config.scenario_generation.get("enabled", False):
+        from src.scenario_generation import generate_scenario, plot_scenario
+        generated = generate_scenario(shared_road_net, config.scenario_generation)
+        config.possible_charger_positions = generated.candidate_node_ids
+        config.num_chargers = int(config.scenario_generation["num_chargers"])
+        config.od_demand = generated.od_demand
+        scenario_metadata = generated.metadata
+        resolved = config.to_dict()
+        resolved["generated_scenario"] = scenario_metadata
+        resolved["network_hash"] = network_manifest["network_hash"]
+        atomic_write_json(os.path.join(experiment_dir, "resolved_config.json"), resolved)
+    else:
+        atomic_write_json(os.path.join(experiment_dir, "resolved_config.json"), {
+            **config.to_dict(), "network_hash": network_manifest["network_hash"],
+            "generated_scenario": None,
+        })
     known_nodes = set(int(value) for value in shared_road_net.nodes['node_id'])
     invalid_candidates = sorted(set(config.possible_charger_positions) - known_nodes)
     invalid_od = sorted({
@@ -1185,6 +1252,14 @@ def run_pipeline(config_path: str) -> str:
     _plot_pruning_phases(network_stages, os.path.join(plot_dir, 'pruning_phases.png'),
                          node_count=network_node_count, edge_count=network_edge_count,
                          stage_maps=network_stage_maps)
+    if scenario_metadata is not None:
+        plot_scenario(
+            shared_road_net, generated, os.path.join(plot_dir, "generated_scenario.png")
+        )
+    atomic_write_json(os.path.join(experiment_dir, "status.json"), {
+        "status": "running", "stage": "bpr", "config_digest": digest,
+        "network_hash": network_manifest["network_hash"], **process_provenance(),
+    })
 
     # Step 1: BPR fitting
     bpr_config = dict(config.pipeline.get("bpr_generation", {}))
@@ -1285,6 +1360,11 @@ def run_pipeline(config_path: str) -> str:
             road_net=shared_road_net,
             charger_self_link_length=config.charger_self_link_length,
             cg_fit_policy=config.pipeline.get('cg_fit_policy', 'allow_degraded'),
+            parallel_workers=(
+                config.pipeline.get('parallel_workers') or available_cpus()
+            ),
+            checkpoint_dir=os.path.join(experiment_dir, 'cg_checkpoints'),
+            resume=resume,
         )
         if not grids or not any(np.isfinite(float(grid.travel_time_obj)) for grid in grids):
             raise RuntimeError(
@@ -1299,7 +1379,11 @@ def run_pipeline(config_path: str) -> str:
             'best_objective': float(best_grid.travel_time_obj),
             'num_configs': len(grids),
             'all_configs': [
-                {'chargers': [int(x) for x in g.chargers], 'objective': float(g.travel_time_obj)}
+                {
+                    'chargers': [int(x) for x in g.chargers],
+                    'objective': float(g.travel_time_obj),
+                    'solver': getattr(g, 'solver_metadata', {}),
+                }
                 for g in grids
             ],
             'stage_counts': grids[0].net.stage_counts if hasattr(grids[0], 'net') else {},
@@ -1351,6 +1435,15 @@ def run_pipeline(config_path: str) -> str:
         timing['queue_ne'] = time.time() - t0
         timing_recorder.add('queue_ne', timing['queue_ne'])
 
+        queue_manifest_path = os.path.join(experiment_dir, 'queue', 'queue_manifest.json')
+        with open(queue_manifest_path) as handle:
+            queue_manifest = json.load(handle)
+        if queue_manifest.get('nonconverged_configurations'):
+            raise RuntimeError(
+                'Queue better-response search did not converge; comparison is '
+                f'not eligible: {queue_manifest["nonconverged_configurations"]}'
+            )
+
         if convergence_data:
             _save_convergence_csv(convergence_data, os.path.join(experiment_dir, 'queue', 'ne_convergence.csv'))
             print(f"Convergence data saved to {experiment_dir}/queue/ne_convergence.csv")
@@ -1372,10 +1465,12 @@ def run_pipeline(config_path: str) -> str:
         if cg_results and queue_results:
             _plot_objective_comparison(cg_results, queue_results,
                                        os.path.join(plot_dir, 'objective_comparison.png'))
-    elif not QUEUE_SIM_AVAILABLE:
-        print(f"\nSkipping queue simulation (requires macOS: {_QUEUE_SIM_ERROR})")
-        timing['queue_ne'] = 0
-        timing['queue_comparison'] = 0
+    elif (not config.pipeline.get("skip_queue_simulation", False)
+          and queue_enabled and not QUEUE_SIM_AVAILABLE):
+        raise RuntimeError(
+            "Queue simulation is required by this configuration but its "
+            f"native library is unavailable: {_QUEUE_SIM_ERROR}"
+        )
     else:
         print("\nSkipping queue simulation (config).")
         timing['queue_ne'] = 0
@@ -1399,7 +1494,7 @@ def run_pipeline(config_path: str) -> str:
     provenance = {
         'random_seed': seed_manager.seed,
         'parallel_workers_requested': config.pipeline.get('parallel_workers'),
-        'parallel_workers_available': os.cpu_count() or 1,
+        'parallel_workers_available': available_cpus(),
         'network_hash': network_hash,
         'network_artifact': os.path.relpath(network_artifact_dir, experiment_dir),
         'config_path': os.path.abspath(config_path),
@@ -1408,6 +1503,9 @@ def run_pipeline(config_path: str) -> str:
         'solver': solver_metadata,
         'cg_fit_policy': config.pipeline.get('cg_fit_policy', 'allow_degraded'),
         'cg_bpr_provenance': cg_results.get('bpr_provenance', {}) if cg_results else {},
+        'config_digest': digest,
+        'graph_cache': getattr(shared_road_net, 'cache_metadata', {}),
+        'generated_scenario': scenario_metadata,
     }
     with open(os.path.join(experiment_dir, 'run_manifest.json'), 'w') as handle:
         json.dump({
@@ -1455,6 +1553,53 @@ def run_pipeline(config_path: str) -> str:
         )
     print(f"Sanity checks passed: {os.path.join(experiment_dir, 'sanity_check.json')}")
 
+    inventory = directory_inventory(experiment_dir)
+    atomic_write_json(os.path.join(experiment_dir, "artifact_inventory.json"), inventory)
+    bpr_manifest_path = os.path.join(experiment_dir, 'bpr', 'bpr_manifest.json')
+    bpr_manifest = {}
+    if os.path.isfile(bpr_manifest_path):
+        with open(bpr_manifest_path) as handle:
+            bpr_manifest = json.load(handle)
+    summary_row = {
+        'run_id': os.path.basename(experiment_dir),
+        'status': 'complete',
+        'eligible': True,
+        'network_hash': network_hash,
+        'nodes': network_node_count,
+        'edges': network_edge_count,
+        'bpr_fit_status_counts': json.dumps(
+            bpr_manifest.get('fit_status_counts', {}), sort_keys=True
+        ),
+        'cg_configurations': len(grids) if not config.pipeline.get(
+            'skip_cg_optimization', False
+        ) else 0,
+        'queue_status': (
+            queue_results.get('status', 'complete') if queue_results else 'skipped'
+        ),
+        'network_seconds': timing.get('network_cleaning'),
+        'bpr_seconds': timing.get('bpr_fitting'),
+        'cg_seconds': timing.get('cg_optimization'),
+        'queue_ne_seconds': timing.get('queue_ne'),
+        'queue_comparison_seconds': timing.get('queue_comparison'),
+        'total_seconds': timing.get('total'),
+        'artifact_bytes': inventory['total_bytes'],
+        'available_cpus': available_cpus(),
+    }
+    pd.DataFrame([summary_row]).to_csv(
+        os.path.join(experiment_dir, 'summary.csv'), index=False
+    )
+    run_manifest_path = os.path.join(experiment_dir, 'run_manifest.json')
+    with open(run_manifest_path) as handle:
+        completed_manifest = json.load(handle)
+    completed_manifest['artifacts'] = inventory
+    atomic_write_json(run_manifest_path, completed_manifest)
+    atomic_write_json(os.path.join(experiment_dir, "status.json"), {
+        "status": "complete", "stage": "complete", "eligible": True,
+        "config_digest": digest, "network_hash": network_hash,
+        "timing": timing, "artifact_bytes": inventory["total_bytes"],
+        **process_provenance(),
+    })
+
     print(f"\n{'=' * 80}")
     print(f"Pipeline complete. Experiment directory: {experiment_dir}")
     print(f"Total time: {timing['total']:.1f}s")
@@ -1465,17 +1610,24 @@ def run_pipeline(config_path: str) -> str:
 
 def run_network_only(config_path: str) -> str:
     """Download + clean network only, generate pruning plot, exit. For rapid iteration."""
-    config = Config.from_json(config_path)
-    seed_manager = SeedManager(config.pipeline.get('random_seed', 0))
+    config = NetworkConfig.from_json(config_path)
+    seed_manager = SeedManager(config.road_filter.get('diagnostic_seed', 0))
     rf = config.road_filter
     coords = config.coordinates
-    highway_types = rf.get('highway_types') if rf.get('enabled', True) else None
+    from src.network_pruning import ROAD_PROFILES
+    highway_types = rf.get('highway_types')
+    if highway_types is None and rf.get('enabled', True):
+        highway_types = list(ROAD_PROFILES[rf.get('road_profile', 'secondary_plus')])
+    if not rf.get('enabled', True):
+        highway_types = None
     do_merge = rf.get('merge_chains', True)
 
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    exp_dir = os.path.join("results", f"{timestamp}_network_only")
+    root = config.output_dir or "results"
+    exp_dir = os.path.join(root, f"{timestamp}_{config.name}_network_only")
     os.makedirs(exp_dir, exist_ok=True)
-    config.to_json(os.path.join(exp_dir, "run_config.json"))
+    with open(os.path.join(exp_dir, "run_config.json"), "w") as handle:
+        json.dump(config.to_dict(), handle, indent=2, sort_keys=True)
     plot_dir = os.path.join(exp_dir, 'plots')
     os.makedirs(plot_dir, exist_ok=True)
 
@@ -1487,7 +1639,8 @@ def run_network_only(config_path: str) -> str:
                contract_threshold=rf.get('contract_threshold', 30),
                prune_dead_ends=rf.get('prune_dead_ends', False),
                suppress_t_junctions=rf.get('suppress_t_junctions', False),
-               apply_cleaning=rf.get('enabled', True))
+               apply_cleaning=rf.get('enabled', True),
+               intersection_tolerance=rf.get('intersection_tolerance', 0))
     elapsed = time.time() - t0
     artifact_dir = os.path.join(exp_dir, 'network')
     manifest = rn.export_artifact(
@@ -1497,6 +1650,7 @@ def run_network_only(config_path: str) -> str:
             'highway_types': highway_types,
             'merge_chains': do_merge,
             'contract_threshold': rf.get('contract_threshold', 30),
+            'intersection_tolerance': rf.get('intersection_tolerance', 0),
             'prune_dead_ends': rf.get('prune_dead_ends', False),
             'random_seed': seed_manager.seed,
         },
@@ -1533,10 +1687,24 @@ def run_network_only(config_path: str) -> str:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Run unified EV charger optimization pipeline')
     parser.add_argument('--config', type=str, default='config.json', help='Path to config JSON')
+    parser.add_argument('--results-root', default='results', help='Root directory for deterministic run outputs')
+    parser.add_argument('--resume', action='store_true', help='Resume/reuse checkpoints in the deterministic run directory')
+    parser.add_argument('--validate-config', action='store_true', help='Validate and print the normalized config, then exit')
     parser.add_argument('--network-only', action='store_true',
                         help='Download + clean network, generate pruning plot, exit')
+    parser.add_argument('--pruning-sweep', action='store_true',
+                        help='Compare road profiles and intersection radii; run no optimization')
     args = parser.parse_args()
-    if args.network_only:
+    if args.validate_config:
+        validated = Config.from_json(args.config)
+        print(json.dumps(validated.to_dict(), indent=2, sort_keys=True))
+        raise SystemExit(0)
+    if args.network_only and args.pruning_sweep:
+        parser.error('--network-only and --pruning-sweep are mutually exclusive')
+    if args.pruning_sweep:
+        from src.pruning_study import run_pruning_sweep
+        run_pruning_sweep(args.config)
+    elif args.network_only:
         run_network_only(args.config)
     else:
-        run_pipeline(args.config)
+        run_pipeline(args.config, results_root=args.results_root, resume=args.resume)

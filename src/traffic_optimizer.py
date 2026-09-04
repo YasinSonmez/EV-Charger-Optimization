@@ -10,6 +10,7 @@ from shapely.geometry import Point
 import geopandas as gpd
 from matplotlib.cm import ScalarMappable
 import matplotlib.colors as mcolors
+import time
 
 from src.road_network import RoadNet
 
@@ -878,6 +879,8 @@ class Network(RoadNet):
 
     def optimize_with_cvxpy(self, disp=True):
         print("Running structured CVXPY optimization with link-specific BPR delay...")
+        solve_wall_started = time.perf_counter()
+        solve_cpu_started = time.process_time()
 
         T = [1, 2]  # T=1: non-charging, T=2: charging
         od_pairs = list(self.od_demand.keys())
@@ -1041,19 +1044,8 @@ class Network(RoadNet):
                     break  # Exit the loop if solver succeeds with optimal solution
                 else:
                     print(f"Solver {solver} completed but returned status: {prob.status}")
-                    # Save the solution anyway if it's usable
-                    if (x_total.value is not None and 
-                        not np.any(np.isnan(x_total.value)) and 
-                        prob.value is not None and 
-                        np.isfinite(prob.value)):
-                        print(f"Solution appears usable with objective value: {prob.value}")
-                        solver_success = True
-                        self.solver_metadata.update({
-                            'selected': solver,
-                            'status': prob.status,
-                        })
-                        break
-                    # Continue to next solver since this one didn't get an optimal solution
+                    # A finite incumbent with an unacceptable solver status is
+                    # not sufficient evidence for a production result.
             except Exception as e:
                 last_exception = e
                 self.solver_metadata['attempts'].append({
@@ -1086,16 +1078,6 @@ class Network(RoadNet):
                         })
                     else:
                         print(f"CVXPY default solver completed but returned status: {prob.status}")
-                        if (x_total.value is not None and 
-                            not np.any(np.isnan(x_total.value)) and 
-                            prob.value is not None and 
-                            np.isfinite(prob.value)):
-                            print(f"Solution from default solver appears usable with objective value: {prob.value}")
-                            solver_success = True
-                            self.solver_metadata.update({
-                                'selected': 'cvxpy_default',
-                                'status': prob.status,
-                            })
                 except Exception as e:
                     print(f"CVXPY default solver failed: {e}")
                     last_exception = e # Update last_exception to reflect default solver failure
@@ -1118,6 +1100,53 @@ class Network(RoadNet):
         print(f"Solver status: {prob.status}")
         print(f"Solve time: {prob.solver_stats.solve_time} seconds")
         print(f"Iterations: {prob.solver_stats.num_iters}")
+
+        demand_scale = max(1.0, float(total_network_demand))
+        residual_tolerance = 1e-6 * demand_scale
+        violations = []
+        for constraint in constraints:
+            try:
+                violation = np.asarray(constraint.violation(), dtype=float)
+                if violation.size:
+                    violations.append(float(np.nanmax(np.abs(violation))))
+            except (ValueError, TypeError):
+                violations.append(float('inf'))
+        maximum_constraint_residual = max(violations, default=0.0)
+        minimum_flow = float(np.nanmin(x_total.value)) if x_total.value is not None else float('-inf')
+        recomputed_objective = (
+            float(self._compute_objective(x_total.value, x_hat.value))
+            if x_total.value is not None and x_hat.value is not None else float('inf')
+        )
+        reported_objective = float(prob.value) if prob.value is not None else float('inf')
+        objective_error = abs(recomputed_objective - reported_objective)
+        objective_tolerance = 1e-6 * max(1.0, abs(reported_objective))
+        checks_passed = bool(
+            np.isfinite(reported_objective)
+            and np.isfinite(recomputed_objective)
+            and np.isfinite(maximum_constraint_residual)
+            and maximum_constraint_residual <= residual_tolerance
+            and minimum_flow >= -residual_tolerance
+            and objective_error <= objective_tolerance
+        )
+        self.solver_metadata.update({
+            'iterations': int(prob.solver_stats.num_iters or 0),
+            'solve_time_seconds': float(prob.solver_stats.solve_time or 0.0),
+            'wall_time_seconds': time.perf_counter() - solve_wall_started,
+            'cpu_time_seconds': time.process_time() - solve_cpu_started,
+            'constraint_residual': maximum_constraint_residual,
+            'constraint_tolerance': residual_tolerance,
+            'minimum_link_flow': minimum_flow,
+            'reported_objective': reported_objective,
+            'recomputed_objective': recomputed_objective,
+            'objective_recompute_error': objective_error,
+            'objective_recompute_tolerance': objective_tolerance,
+            'validation_passed': checks_passed,
+        })
+        if not checks_passed:
+            self.best_objective_value = float('inf')
+            self.travel_time_obj = float('inf')
+            self.solver_metadata['status'] = 'validation_failed'
+            return None
 
         # If prob.value is None or NaN, compute it manually using our method
         if prob.value is None or np.isnan(prob.value):

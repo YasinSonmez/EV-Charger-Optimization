@@ -7,7 +7,7 @@ import os
 import time
 import traceback
 import warnings
-from multiprocessing import Pool, TimeoutError as PoolTimeout
+from multiprocessing import Pool
 
 import numpy as np
 import pandas as pd
@@ -18,6 +18,7 @@ from queue_sim import Runner, QUEUE_SIM_AVAILABLE
 from src.contracts import SeedManager
 from src.network_artifact import load_network_artifact
 from src.road_network import RoadNet
+from src.run_state import atomic_write_json, available_cpus
 
 
 DEFAULT_FLOW_FRACTIONS = [0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
@@ -385,6 +386,13 @@ def _bpr_link_worker(job):
         'errors': [],
     }
     try:
+        checkpoint_path = os.path.join(link_dir, "result.json")
+        if isinstance(flow_spec, dict) and flow_spec.get("resume", False) and os.path.exists(checkpoint_path):
+            with open(checkpoint_path) as handle:
+                cached = json.load(handle)
+            if cached.get("complete") and int(cached.get("link_id", -1)) == link_id:
+                cached["resumed"] = True
+                return cached
         historical_mode = (
             isinstance(flow_spec, dict)
             and flow_spec.get('mode') == 'historical_artifact_compatible'
@@ -398,9 +406,10 @@ def _bpr_link_worker(job):
             result['flow_plan'] = flow_plan
             result['bpr_mode'] = 'historical_artifact_compatible'
         elif isinstance(flow_spec, dict):
+            fractions = list(flow_spec['flow_fractions'])
             capacity_rate, flow_plan = _capacity_fraction_flow_plan(
                 link_record,
-                flow_spec['flow_fractions'],
+                fractions,
                 capacity_source=flow_spec.get('capacity_source', 'simulator'),
                 capacity_per_lane=flow_spec.get('capacity_per_lane', DEFAULT_SIMULATOR_CAPACITY_PER_LANE),
                 calibration_window_hours=flow_spec.get('calibration_window_hours', 0.1),
@@ -510,14 +519,13 @@ def _bpr_link_worker(job):
         else:
             link_orig = int(link_record['start_node_id'])
             link_dest = int(link_record['end_node_id'])
-        # Reuse the Runner and immutable network tables for the complete
-        # link sweep.  Only the per-flow demand table is replaced.
+        # Reuse the Runner and immutable network tables for the complete link
+        # sweep. Each configured flow level is simulated exactly once.
         for flow_index, flow_item in enumerate(flow_plan):
             flow_rate = float(flow_item['flow_rate'])
             demand_count = int(flow_item['demand_count'])
             flow_dir = os.path.join(link_dir, f'flow_{flow_index}')
             os.makedirs(flow_dir, exist_ok=True)
-            od_csv = os.path.join(flow_dir, 'od.csv')
             if demand_count == 0:
                 # A zero-demand queue run creates no target-link observation.
                 # The BPR baseline is exactly the canonical link free-flow
@@ -532,26 +540,34 @@ def _bpr_link_worker(job):
                     'entries': 0,
                     'completions': 0,
                     'travel_time': _free_flow_time(link_record),
+                    'travel_time_mean': _free_flow_time(link_record),
+                    'travel_time_std': 0.0,
+                    'travel_time_ci_half_width': 0.0,
+                    'realized_flow_mean': 0.0,
+                    'replications': 1,
+                    'split': flow_item.get('split', 'training'),
                     'status': 'free_flow_anchor',
                 })
                 continue
-            if historical_mode:
-                # This is the historical experiment's all-at-time-zero OD
-                # demand.  The measured x-value is still read back from the
-                # simulator below, not replaced by the requested count.
-                departure_times = [0] * demand_count
-            else:
-                departure_times = _departure_schedule(
+            rep = 0
+            rep_dir = flow_dir
+            od_csv = os.path.join(rep_dir, 'od.csv')
+            departure_times = (
+                [0] * demand_count if historical_mode else
+                _departure_schedule(
                     demand_count,
                     flow_spec.get('calibration_window_hours', 0.1)
                     if isinstance(flow_spec, dict) else 0.1,
                 )
+            )
             _write_single_od(
                 od_csv, link_orig, link_dest, demand_count,
                 departure_times=departure_times,
             )
             finder.od_df = pd.read_csv(od_csv)
-            flow_seed = SeedManager(seed).derive('bpr-flow', link_id, flow_index, demand_count)
+            flow_seed = SeedManager(seed).derive(
+                'bpr-flow', link_id, flow_index, demand_count, rep
+            )
             finder.seed = flow_seed
             SeedManager(flow_seed)
             finder.add_charging_info(0, 0)
@@ -561,12 +577,10 @@ def _bpr_link_worker(job):
                 pd.Series(link_record), route_sa_il, route_sa_ol,
             )
             finder.spatial_queue_simulation(
-                f'bpr_link_{link_id}_flow_{flow_index}',
-                output_dir=flow_dir,
-                t_end=(
-                    int(flow_spec.get('simulation_horizon', 10801))
-                    if isinstance(flow_spec, dict) else 10801
-                ),
+                f'bpr_link_{link_id}_flow_{flow_index}_rep_{rep}',
+                output_dir=rep_dir,
+                t_end=int(flow_spec.get('simulation_horizon', 10801))
+                if isinstance(flow_spec, dict) else 10801,
             )
             target_link = finder.sim.all_links.get(link_id)
             if target_link is None or not target_link.completed_travel_time_list:
@@ -578,7 +592,6 @@ def _bpr_link_worker(job):
                     f'target flow accounting mismatch: requested_agents={demand_count}, '
                     f'entries={entries}, completions={completions}'
                 )
-            travel_time = float(target_link.ave_travel_time)
             if historical_mode:
                 traffic_df = finder.return_traffic_data(
                     demand_count, link_orig, link_dest, density=0
@@ -590,8 +603,6 @@ def _bpr_link_worker(job):
                     raise RuntimeError(
                         f'link {link_id} did not produce a finite measured target flow'
                     )
-                # Historical x semantics are the simulator's measured target
-                # link flow, rather than the requested OD count.
                 realized_flow = float(target_rows.iloc[0]['flow'])
             else:
                 calibration_window = float(
@@ -602,16 +613,25 @@ def _bpr_link_worker(job):
                     entries / calibration_window
                     if isinstance(flow_spec, dict) else flow_rate
                 )
+            travel_time = float(target_link.ave_travel_time)
+            realized_flow = float(realized_flow)
             result['x_vector'].append(realized_flow)
             result['y_vector'].append(travel_time)
             result['observations'].append({
                 'fraction': flow_item.get('fraction'),
+                'split': flow_item.get('split', 'training'),
                 'requested_flow': flow_rate,
                 'realized_flow': realized_flow,
+                'realized_flow_mean': realized_flow,
                 'demand_count': demand_count,
                 'entries': entries,
                 'completions': completions,
                 'travel_time': travel_time,
+                'travel_time_mean': travel_time,
+                'travel_time_std': 0.0,
+                'travel_time_ci_half_width': 0.0,
+                'relative_ci_half_width': 0.0,
+                'replications': 1,
                 'target_queue_max': int(max(
                     [0] + [len(target_link.queue_veh), len(target_link.run_veh)]
                 )),
@@ -623,6 +643,9 @@ def _bpr_link_worker(job):
         result['errors'].append(str(exc))
         result['traceback'] = traceback.format_exc()
     result['elapsed_seconds'] = time.perf_counter() - started
+    result['complete'] = not result['errors']
+    if result['complete']:
+        atomic_write_json(checkpoint_path, result)
     return result
 
 
@@ -659,7 +682,8 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
                       missing_context_policy='synthetic_boundary',
                       synthetic_context_capacity_multiplier=10.0,
                       synthetic_context_length_m=1.0,
-                      simulation_horizon=10801):
+                      simulation_horizon=10801, active_link_ids=None,
+                      resume=True):
     """Generate BPR observations from one canonical artifact.
 
     Work is parallelized by link.  Each worker owns the complete flow sweep
@@ -719,21 +743,33 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
         flow_fractions = list(DEFAULT_FLOW_FRACTIONS)
         flow_fractions = [float(value) for value in flow_fractions]
         flow_spec = {
+            'mode': mode,
             'flow_fractions': flow_fractions,
             'capacity_source': capacity_source,
             'capacity_per_lane': float(capacity_per_lane),
             'calibration_window_hours': float(calibration_window_hours),
             'route_mode': route_mode,
+            'missing_context_policy': missing_context_policy,
+            'synthetic_context_capacity_multiplier': float(synthetic_context_capacity_multiplier),
+            'synthetic_context_length_m': float(synthetic_context_length_m),
+            'simulation_horizon': int(simulation_horizon),
+            'resume': bool(resume),
         }
         legacy_flow_levels = None
     elif flow_fractions is not None:
         flow_fractions = [float(value) for value in flow_fractions]
         flow_spec = {
+            'mode': mode,
             'flow_fractions': flow_fractions,
             'capacity_source': capacity_source,
             'capacity_per_lane': float(capacity_per_lane),
             'calibration_window_hours': float(calibration_window_hours),
             'route_mode': route_mode,
+            'missing_context_policy': missing_context_policy,
+            'synthetic_context_capacity_multiplier': float(synthetic_context_capacity_multiplier),
+            'synthetic_context_length_m': float(synthetic_context_length_m),
+            'simulation_horizon': int(simulation_horizon),
+            'resume': bool(resume),
         }
         legacy_flow_levels = None
     sweep_name = (
@@ -743,57 +779,40 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
     )
     output_root = os.path.join(work_dir, sweep_name)
     os.makedirs(output_root, exist_ok=True)
-    link_records = edges.sort_values('link_id').to_dict(orient='records')
+    link_records = edges.sort_values(
+        ['lanes', 'link_id'], ascending=[False, True], kind='mergesort'
+    ).to_dict(orient='records')
+    active_ids = None if active_link_ids is None else {int(value) for value in active_link_ids}
     jobs = [] if not QUEUE_SIM_AVAILABLE else [
         (record, nodes_csv, edges_csv, flow_spec, output_root,
          SeedManager(seed).derive('bpr-job', int(record['link_id'])))
         for record in link_records
         if int(record['start_node_id']) != int(record['end_node_id'])
+        and (active_ids is None or int(record['link_id']) in active_ids)
     ]
     results = []
     pool_size = 0
     if jobs:
-        pool_size = workers if workers is not None else min(len(jobs), os.cpu_count() or 1)
-        pool = Pool(max(1, pool_size))
-        async_results = [pool.apply_async(_bpr_link_worker, (job,)) for job in jobs]
-        try:
-            for index, (job, async_result) in enumerate(zip(jobs, async_results)):
-                try:
-                    results.append(async_result.get(timeout=timeout))
-                except PoolTimeout:
-                    link_id = int(job[0]['link_id'])
-                    results.append({
-                        'link_id': link_id,
-                        'x_vector': [],
-                        'y_vector': [],
-                        'errors': [f'worker timeout after {timeout}s'],
-                    })
-                    for pending_job in jobs[index + 1:]:
-                        results.append({
-                            'link_id': int(pending_job[0]['link_id']),
-                            'x_vector': [],
-                            'y_vector': [],
-                            'errors': ['cancelled after another worker timeout'],
-                        })
-                    pool.terminate()
-                    break
-            else:
-                pool.close()
-        finally:
-            pool.join()
+        pool_size = workers if workers is not None else min(len(jobs), available_cpus())
+        with Pool(max(1, int(pool_size))) as pool:
+            # Unordered consumption prevents a slow early link from blocking
+            # completed checkpoints and progress from all other workers.
+            results.extend(pool.imap_unordered(_bpr_link_worker, jobs, chunksize=1))
 
     by_id = {int(result['link_id']): result for result in results}
     rows = []
     failures = []
     for record in link_records:
         link_id = int(record['link_id'])
+        if active_ids is not None and link_id not in active_ids:
+            continue
         result = by_id.get(link_id)
         if mode == 'historical_artifact_compatible':
             expected_samples = len(flow_spec['flow_levels'])
         else:
             expected_samples = len(flow_spec) if not isinstance(flow_spec, dict) else len(flow_spec['flow_fractions'])
         if result and len(result['x_vector']) == expected_samples:
-            rows.append({
+            row = {
                 'link_id': link_id,
                 'x_vector': result['x_vector'],
                 'y_vector': result['y_vector'],
@@ -809,7 +828,9 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
                 'sample_count': expected_samples,
                 'fallback_reason': '',
                 'network_hash': manifest['network_hash'],
-            })
+                'observations_json': json.dumps(result.get('observations', [])),
+            }
+            rows.append(row)
         else:
             result = by_id.get(link_id, {})
             failures.append({
@@ -842,22 +863,30 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
                                            reason='; '.join(result.get('errors', ['simulation unavailable'])),
                                            network_hash=manifest['network_hash']))
 
-    if failures and (
+    fatal_failures = bool(failures) and (
         any(item.get('fatal_context', False) for item in failures)
         or (failure_policy == 'fail_fast' and not allow_proxy)
-    ):
-        raise RuntimeError(
-            f'BPR generation failed for {len(failures)} links; first failure: {failures[0]}'
-        )
+    )
     df = pd.DataFrame(rows).sort_values('link_id').reset_index(drop=True)
-    with open(os.path.join(work_dir, 'bpr_manifest.json'), 'w') as handle:
-        json.dump({
+    observation_rows = []
+    for result in results:
+        for observation in result.get('observations', []):
+            observation_rows.append({'link_id': int(result['link_id']), **observation})
+    if observation_rows:
+        pd.DataFrame(observation_rows).to_csv(
+            os.path.join(work_dir, 'bpr_observations.csv.gz'), index=False,
+            compression='gzip',
+        )
+    atomic_write_json(os.path.join(work_dir, 'bpr_manifest.json'), {
             'network_hash': manifest['network_hash'],
             'bpr_mode': mode,
             'num_samples': int(num_samples),
             'max_flow': float(max_flow),
             'random_seed': int(seed if seed is not None else 0),
-            'fitter_version': 'historical_v1' if mode == 'historical_artifact_compatible' else 'capacity_fraction_v1',
+            'fitter_version': (
+                'historical_v1' if mode == 'historical_artifact_compatible'
+                else 'capacity_fraction_v1'
+            ),
             'historical_reference_commit': '37eab33' if mode == 'historical_artifact_compatible' else None,
             'route_semantics': 'measured_target_flow_with_straight_ahead_context' if mode == 'historical_artifact_compatible' else route_mode,
             'link_count': len(link_records),
@@ -888,9 +917,13 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
                 if row.get('observation_source') == 'simulated_synthetic_context'
             ],
             'workers': pool_size,
+            'workers_available': available_cpus(),
             'timeout': timeout,
             'flow_levels': legacy_flow_levels,
             'flow_fractions': flow_fractions,
+            'fit_status_counts': (
+                df.get('fit_status', pd.Series(dtype=str)).value_counts().to_dict()
+            ),
             'capacity_source': capacity_source if flow_fractions is not None else None,
             'capacity_per_lane': float(capacity_per_lane) if flow_fractions is not None else None,
             'calibration_window_hours': float(calibration_window_hours) if flow_fractions is not None else None,
@@ -920,8 +953,12 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
                 }
                 for result in sorted(results, key=lambda value: int(value['link_id']))
             ],
-        }, handle, indent=2)
-    return df, len(link_records)
+        })
+    if fatal_failures:
+        raise RuntimeError(
+            f'BPR generation failed for {len(failures)} links; first failure: {failures[0]}'
+        )
+    return df, len(link_records if active_ids is None else active_ids)
 
 
 def generate_and_save_bpr_data(coordinates, output_path, **kwargs):

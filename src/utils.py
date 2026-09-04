@@ -10,8 +10,45 @@ from itertools import combinations
 from math import comb
 import shutil # For copying the file
 import json # Added for loading config file
+from multiprocessing import Pool
+import resource
 
 from src.traffic_optimizer import Network
+from src.run_state import available_cpus
+
+
+def _cg_placement_worker(job):
+    """Solve one independent charger placement in a worker process."""
+    chargers, settings = job
+    started = time.perf_counter()
+    grid = Network(
+        settings['coordinates'], chargers=chargers,
+        parameter_fit_results=settings['parameter_fit_results'],
+        od_demand=settings['od_demand'], road_net=settings['road_net'],
+        charger_self_link_length=settings['charger_self_link_length'],
+        cg_fit_policy=settings['cg_fit_policy'],
+    )
+    if not grid.optimize(
+        use_cvxpy=settings['use_cvxpy'],
+        use_derivatives=settings['use_derivatives'],
+        max_iter=settings['max_iter'],
+    ):
+        raise RuntimeError(
+            f"Congestion-game solver failed for chargers {chargers}: "
+            f"{getattr(grid, 'solver_metadata', {})}"
+        )
+    grid.solver_metadata['worker_elapsed_seconds'] = time.perf_counter() - started
+    grid.solver_metadata['worker_peak_rss_raw'] = resource.getrusage(
+        resource.RUSAGE_SELF
+    ).ru_maxrss
+    return tuple(chargers), grid, time.perf_counter() - started
+
+
+def _atomic_pickle(path, value):
+    temporary = f"{path}.tmp-{os.getpid()}"
+    with open(temporary, 'wb') as handle:
+        pickle.dump(value, handle)
+    os.replace(temporary, path)
 
 def save_flow_heatmap(grid, output_path, title, use_cvxpy=True, flows=None, flow_threshold=1.0):
     """Save a flow heatmap for a single configuration without displaying it"""
@@ -540,7 +577,8 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
                        max_iter=1000, parameter_fit_results=None, single_swap=False, use_cvxpy=False, od_demand=None,
                        config_filepath=None, output_dir=None,
                        road_net=None, charger_self_link_length=100.0,
-                       cg_fit_policy='allow_degraded'):
+                       cg_fit_policy='allow_degraded', parallel_workers=1,
+                       checkpoint_dir=None, resume=False):
     """
     Outer optimization to find the best charger locations.
     Includes configurable route analysis with top-k routes and parameter sweep.
@@ -557,10 +595,68 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
     possible_charger_positions_j = possible_charger_positions.copy()
     t0 = time.time()
 
+    worker_count = max(1, int(parallel_workers or available_cpus()))
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    placement_settings = {
+        'coordinates': coordinates,
+        'parameter_fit_results': parameter_fit_results,
+        'od_demand': od_demand,
+        'road_net': road_net,
+        'charger_self_link_length': charger_self_link_length,
+        'cg_fit_policy': cg_fit_policy,
+        'use_cvxpy': use_cvxpy,
+        'use_derivatives': use_derivatives,
+        'max_iter': max_iter,
+    }
+
+    def evaluate_placements(placements):
+        nonlocal iteration_count
+        ordered = [tuple(sorted(item)) for item in placements]
+        resolved = {}
+        jobs = []
+        for placement in ordered:
+            checkpoint = None
+            if checkpoint_dir:
+                label = '-'.join(str(value) for value in placement)
+                checkpoint = os.path.join(checkpoint_dir, f'placement_{label}.pkl')
+            if resume and checkpoint and os.path.isfile(checkpoint):
+                with open(checkpoint, 'rb') as handle:
+                    resolved[placement] = pickle.load(handle)
+            else:
+                jobs.append((placement, placement_settings))
+        if jobs:
+            if worker_count > 1 and len(jobs) > 1:
+                with Pool(min(worker_count, len(jobs))) as pool:
+                    completed = pool.imap_unordered(_cg_placement_worker, jobs, chunksize=1)
+                    new_results = list(completed)
+            else:
+                new_results = [_cg_placement_worker(job) for job in jobs]
+            for placement, grid, elapsed in new_results:
+                resolved[placement] = (grid, elapsed)
+                if checkpoint_dir:
+                    label = '-'.join(str(value) for value in placement)
+                    _atomic_pickle(
+                        os.path.join(checkpoint_dir, f'placement_{label}.pkl'),
+                        (grid, elapsed),
+                    )
+        output = []
+        for placement in ordered:
+            grid, elapsed = resolved[placement]
+            iteration_count += 1
+            time_history.append(time.time() - t0)
+            if plot_info:
+                grid.plot_info()
+            grids.append(grid)
+            output.append(grid)
+        return output
+
     # Step 1: Perform grid search to find the initial best placement
     for num_chargers_j in range(1, num_chargers + 1):
         best_charger_position_j = None
         best_charger_position_travel_time = 1e100
+        round_placements = []
+        round_candidates = []
         for charger_ji in possible_charger_positions_j:
             if best_charger is None:
                 chargers_i = (charger_ji,)
@@ -568,23 +664,13 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
                 chargers_i = (best_charger) + (charger_ji,)
                 chargers_i = tuple(sorted(chargers_i))
             chargers_set.add(chargers_i)
-            grid_i = Network(coordinates, chargers=chargers_i, parameter_fit_results=parameter_fit_results, od_demand=od_demand, road_net=road_net, charger_self_link_length=charger_self_link_length, cg_fit_policy=cg_fit_policy)
-            iteration_count += 1
-            print("*" * 80)
-            print('Iteration: ', iteration_count)
-            if not grid_i.optimize(use_cvxpy=use_cvxpy, use_derivatives=use_derivatives, max_iter=max_iter):
-                raise RuntimeError(
-                    f"Congestion-game solver failed for chargers {chargers_i}: "
-                    f"{getattr(grid_i, 'solver_metadata', {})}"
-                )
-            time_history.append(time.time() - t0)
-            if plot_info:
-                grid_i.plot_info()
-            grids.append(grid_i)
-
+            round_placements.append(chargers_i)
+            round_candidates.append(charger_ji)
+        for charger_ji, grid_i in zip(
+                round_candidates, evaluate_placements(round_placements)):
             if grid_i.travel_time_obj < best_charger_position_travel_time:
                 best_charger_position_travel_time = grid_i.travel_time_obj
-                best_charger_tmp = chargers_i
+                best_charger_tmp = tuple(grid_i.chargers)
                 best_charger_position_j = charger_ji
                 best_grid = grid_i
         best_charger = best_charger_tmp
@@ -604,19 +690,8 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
                         all_possible_swaps.append(swapped_chargers)
                         chargers_set.add(swapped_chargers)
 
-        # Evaluate each swap
-        for swapped_chargers in all_possible_swaps:
-            grid_i = Network(coordinates, chargers=swapped_chargers, parameter_fit_results=parameter_fit_results, od_demand=od_demand, road_net=road_net, charger_self_link_length=charger_self_link_length, cg_fit_policy=cg_fit_policy)
-            if not grid_i.optimize(use_cvxpy=use_cvxpy, use_derivatives=use_derivatives, max_iter=max_iter):
-                raise RuntimeError(
-                    f"Congestion-game solver failed for chargers {swapped_chargers}: "
-                    f"{getattr(grid_i, 'solver_metadata', {})}"
-                )
-            time_history.append(time.time() - t0)
-            if plot_info:
-                grid_i.plot_info()
-            grids.append(grid_i)
-
+        # Evaluate independent swaps concurrently.
+        for grid_i in evaluate_placements(all_possible_swaps):
             if grid_i.travel_time_obj < best_travel_time:
                 best_travel_time = grid_i.travel_time_obj
                 best_charger = swapped_chargers
@@ -624,24 +699,14 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
 
     # Step 3: Full Search on All Possible Charger Combinations (if enabled)
     if calculate_on_all_possible_positions:
+        exhaustive = []
         for chargers_i in list(combinations(possible_charger_positions, num_chargers)):
             chargers_i = tuple(sorted(chargers_i))
             if chargers_i in chargers_set:
                 continue
             chargers_set.add(chargers_i)
-            grid_i = Network(coordinates, chargers=chargers_i, parameter_fit_results=parameter_fit_results, od_demand=od_demand, road_net=road_net, charger_self_link_length=charger_self_link_length, cg_fit_policy=cg_fit_policy)
-            iteration_count += 1
-            print('Iteration: ', iteration_count)
-            if not grid_i.optimize(use_cvxpy=use_cvxpy, use_derivatives=use_derivatives, max_iter=max_iter):
-                raise RuntimeError(
-                    f"Congestion-game solver failed for chargers {chargers_i}: "
-                    f"{getattr(grid_i, 'solver_metadata', {})}"
-                )
-            time_history.append(time.time() - t0)
-            if plot_info:
-                grid_i.plot_info()
-            grids.append(grid_i)
-
+            exhaustive.append(chargers_i)
+        for grid_i in evaluate_placements(exhaustive):
             if grid_i.travel_time_obj < best_travel_time:
                 best_travel_time = grid_i.travel_time_obj
                 best_charger = chargers_i

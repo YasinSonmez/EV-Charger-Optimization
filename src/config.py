@@ -24,6 +24,25 @@ QUEUE_DEFAULTS = {
     "failure_policy": "fail_fast",
 }
 
+NETWORK_DEFAULTS = {
+    "expected_nodes": None,
+    "node_tolerance_fraction": 0.10,
+    "cache_policy": "reuse",
+}
+
+SCENARIO_DEFAULTS = {
+    "enabled": False,
+    "candidate_count": 5,
+    "num_chargers": 2,
+    "candidate_strategy": "interchanges_then_farthest_point",
+    "interchange_merge_diameter_m": 250.0,
+    "od_pair_count": 1,
+    "od_strategy": "boundary_max_separation",
+    "boundary_pool_size": 64,
+    "demand": {"F1": 60, "F2": 120},
+    "seed": 42,
+}
+
 PIPELINE_DEFAULTS = {
     "random_seed": 42,
     # None means use os.cpu_count() for stages whose local worker count is
@@ -72,6 +91,8 @@ PIPELINE_DEFAULTS = {
         "accept_low_r2": True,
         "force_regenerate": False,
         "min_samples": 2,
+        "active_link_ids": None,
+        "resume": True,
     },
     "artifact_dir": None,
 }
@@ -87,7 +108,73 @@ ROAD_FILTER_DEFAULTS = {
     "suppress_t_junctions": False,
     "contract_threshold": 30,
     "cross_threshold": 200,
+    "road_profile": "secondary_plus",
+    "intersection_tolerance": 0.0,
+    "sweep_profiles": ["primary_plus", "secondary_plus", "tertiary_plus"],
+    "sweep_radii_m": [0, 5, 10, 15, 20, 30],
+    "connector_threshold": 0.90,
+    "diagnostic_seed": 42,
+    "diagnostic_profile": None,
+    "diagnostic_radius_m": None,
+    "diagnostic_connector_recovery": False,
 }
+
+
+@dataclass
+class NetworkConfig:
+    """Minimal configuration accepted by network-only and pruning-sweep runs."""
+
+    coordinates: list
+    name: str = "network"
+    road_filter: dict = field(default_factory=lambda: dict(ROAD_FILTER_DEFAULTS))
+    output_dir: Optional[str] = None
+
+    @classmethod
+    def from_json(cls, path: str) -> "NetworkConfig":
+        with open(path, "r") as handle:
+            raw = json.load(handle)
+        road_filter = {**ROAD_FILTER_DEFAULTS, **raw.get("road_filter", {})}
+        result = cls(
+            coordinates=raw["coordinates"],
+            name=str(raw.get("name", "network")),
+            road_filter=road_filter,
+            output_dir=raw.get("output_dir"),
+        )
+        result._validate()
+        return result
+
+    def _validate(self):
+        if len(self.coordinates) != 4:
+            raise ValueError("coordinates must be [north, south, east, west]")
+        north, south, east, west = map(float, self.coordinates)
+        if north <= south or east <= west:
+            raise ValueError("coordinates must satisfy north > south and east > west")
+        profiles = self.road_filter.get("sweep_profiles", [])
+        valid_profiles = {"primary_plus", "secondary_plus", "tertiary_plus"}
+        if not profiles or any(profile not in valid_profiles for profile in profiles):
+            raise ValueError("road_filter.sweep_profiles contains an unknown road profile")
+        radii = [float(value) for value in self.road_filter.get("sweep_radii_m", [])]
+        if not radii or any(value < 0 for value in radii):
+            raise ValueError("road_filter.sweep_radii_m must contain non-negative values")
+        if len(set(radii)) != len(radii):
+            raise ValueError("road_filter.sweep_radii_m values must be unique")
+        threshold = float(self.road_filter.get("connector_threshold", 0.90))
+        if not 0 < threshold <= 1:
+            raise ValueError("road_filter.connector_threshold must be in (0, 1]")
+        diagnostic_profile = self.road_filter.get("diagnostic_profile")
+        if diagnostic_profile is not None and diagnostic_profile not in profiles:
+            raise ValueError("road_filter.diagnostic_profile must be included in sweep_profiles")
+        diagnostic_radius = self.road_filter.get("diagnostic_radius_m")
+        if diagnostic_radius is not None and float(diagnostic_radius) not in radii:
+            raise ValueError("road_filter.diagnostic_radius_m must be included in sweep_radii_m")
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "coordinates": self.coordinates,
+            "road_filter": self.road_filter,
+            "output_dir": self.output_dir,
+        }
 
 
 @dataclass
@@ -96,6 +183,7 @@ class Config:
     num_chargers: int
     possible_charger_positions: list
     od_demand: dict
+    name: str = "experiment"
     max_iter: int = 1000
     use_derivatives: bool = False
     single_swap: bool = True
@@ -107,6 +195,8 @@ class Config:
     queue_simulation: dict = field(default_factory=lambda: dict(QUEUE_DEFAULTS))
     pipeline: dict = field(default_factory=lambda: dict(PIPELINE_DEFAULTS))
     road_filter: dict = field(default_factory=lambda: dict(ROAD_FILTER_DEFAULTS))
+    network: dict = field(default_factory=lambda: dict(NETWORK_DEFAULTS))
+    scenario_generation: dict = field(default_factory=lambda: dict(SCENARIO_DEFAULTS))
 
     @classmethod
     def from_json(cls, path: str) -> "Config":
@@ -147,11 +237,22 @@ class Config:
             **raw_bpr,
         }
         road_filter = {**ROAD_FILTER_DEFAULTS, **raw.get("road_filter", {})}
+        raw_scenario = raw.get("scenario_generation", {})
+        scenario = {**SCENARIO_DEFAULTS, **raw_scenario}
+        scenario["demand"] = {
+            **SCENARIO_DEFAULTS["demand"], **raw_scenario.get("demand", {})
+        }
+        network = {**NETWORK_DEFAULTS, **raw.get("network", {})}
+        generated = bool(raw_scenario.get("enabled", bool(raw_scenario)))
+        scenario["enabled"] = generated
         cfg = cls(
             coordinates=raw["coordinates"],
-            num_chargers=raw["num_chargers"],
-            possible_charger_positions=[int(value) for value in raw["possible_charger_positions"]],
-            od_demand=raw["od_demand"],
+            num_chargers=int(raw.get("num_chargers", scenario["num_chargers"])),
+            possible_charger_positions=[
+                int(value) for value in raw.get("possible_charger_positions", [])
+            ],
+            od_demand=raw.get("od_demand", {}),
+            name=str(raw.get("name", "experiment")),
             max_iter=raw.get("max_iter", 1000),
             use_derivatives=raw.get("use_derivatives", False),
             single_swap=raw.get("single_swap", True),
@@ -163,6 +264,8 @@ class Config:
             queue_simulation=queue,
             pipeline=pipeline,
             road_filter=road_filter,
+            network=network,
+            scenario_generation=scenario,
         )
         cfg._explicit_queue_config = "queue_simulation" in raw
         cfg._validate()
@@ -171,18 +274,25 @@ class Config:
     def _validate(self):
         if len(self.coordinates) != 4:
             raise ValueError("coordinates must be [north, south, east, west]")
+        north, south, east, west = map(float, self.coordinates)
+        if north <= south or east <= west:
+            raise ValueError("coordinates must satisfy north > south and east > west")
         if self.num_chargers < 1:
             raise ValueError("num_chargers must be >= 1")
-        if not self.possible_charger_positions:
+        generated = bool(self.scenario_generation.get("enabled", False))
+        if not generated and not self.possible_charger_positions:
             raise ValueError("possible_charger_positions must not be empty")
-        if self.num_chargers > len(self.possible_charger_positions):
+        if (not generated
+                and self.num_chargers > len(self.possible_charger_positions)):
             raise ValueError("num_chargers cannot exceed len(possible_charger_positions)")
         if self.charger_self_link_length < 0:
             raise ValueError("charger_self_link_length must be non-negative")
-        records = normalize_od_demand(self.od_demand)
-        valid_nodes = set(self.possible_charger_positions)
-        if any(record.demand < 0 for record in records):
-            raise ValueError("OD demand must be non-negative")
+        if not generated:
+            records = normalize_od_demand(self.od_demand)
+            if any(record.demand < 0 for record in records):
+                raise ValueError("OD demand must be non-negative")
+        self._validate_generated_scenario()
+        self._validate_network()
         q = self.queue_simulation
         if q["K"] < 1:
             raise ValueError("queue_simulation.K must be >= 1")
@@ -326,6 +436,7 @@ class Config:
 
     def to_dict(self) -> dict:
         return {
+            "name": self.name,
             "coordinates": self.coordinates,
             "num_chargers": self.num_chargers,
             "possible_charger_positions": self.possible_charger_positions,
@@ -341,7 +452,40 @@ class Config:
             "queue_simulation": self.queue_simulation,
             "pipeline": self.pipeline,
             "road_filter": self.road_filter,
+            "network": self.network,
+            "scenario_generation": self.scenario_generation,
         }
+
+    def _validate_network(self) -> None:
+        expected = self.network.get("expected_nodes")
+        if expected is not None and int(expected) < 2:
+            raise ValueError("network.expected_nodes must be >= 2")
+        tolerance = float(self.network.get("node_tolerance_fraction", 0.10))
+        if not 0 <= tolerance < 1:
+            raise ValueError("network.node_tolerance_fraction must be in [0, 1)")
+        if self.network.get("cache_policy", "reuse") not in {"reuse", "refresh", "require"}:
+            raise ValueError("network.cache_policy must be reuse, refresh, or require")
+
+    def _validate_generated_scenario(self) -> None:
+        scenario = self.scenario_generation
+        if not scenario.get("enabled", False):
+            return
+        if scenario.get("candidate_strategy") != "interchanges_then_farthest_point":
+            raise ValueError("unsupported scenario_generation.candidate_strategy")
+        if scenario.get("od_strategy") != "boundary_max_separation":
+            raise ValueError("unsupported scenario_generation.od_strategy")
+        candidate_count = int(scenario.get("candidate_count", 0))
+        if candidate_count < self.num_chargers:
+            raise ValueError("scenario_generation.candidate_count must be >= num_chargers")
+        if int(scenario.get("od_pair_count", 0)) < 1:
+            raise ValueError("scenario_generation.od_pair_count must be >= 1")
+        if int(scenario.get("boundary_pool_size", 0)) < 2:
+            raise ValueError("scenario_generation.boundary_pool_size must be >= 2")
+        demand = scenario.get("demand", {})
+        for vehicle_type in ("F1", "F2"):
+            value = demand.get(vehicle_type)
+            if isinstance(value, bool) or int(value) != float(value) or int(value) < 0:
+                raise ValueError(f"scenario_generation.demand.{vehicle_type} must be a non-negative integer")
 
     def get_od_demand_tuples(self) -> dict:
         result = {}
