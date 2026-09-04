@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -8,7 +9,17 @@ import osmnx as ox
 import networkx as nx
 import matplotlib.pyplot as plt
 from src.graph_cache import get_graph
-from src.network_artifact import write_network_artifact
+from src.network_artifact import load_network_artifact, write_network_artifact
+from src.network_pruning import (
+    consolidate_intersections,
+    filter_highways,
+    largest_component,
+    parse_lanes,
+    parse_speed_kph,
+    prepare_source_graph,
+    project_graph,
+    topology_simplify,
+)
 
 
 MAJOR_ROAD_TYPES = [
@@ -29,6 +40,60 @@ class RoadNet:
         self.nid_to_osmid_dict = {}
         self.stage_counts = {}  # {stage_name: {'nodes': n, 'edges': e}}
         self.stage_maps = {}    # {stage_name: {'nodes_xy': [...], 'edges_pairs': [...]}}
+        self.cache_metadata = {}
+
+    def load_artifact(self, artifact_dir):
+        """Load a canonical network artifact without downloading or pruning."""
+        nodes, edges, manifest = load_network_artifact(artifact_dir)
+        graph = nx.MultiDiGraph(crs="EPSG:4326")
+        node_osmids = {}
+        for row in nodes.itertuples():
+            node_id = int(row.node_id)
+            osmid = getattr(row, "node_osmid", node_id)
+            node_osmids[node_id] = osmid
+            graph.add_node(osmid, osmid=osmid, x=float(row.lon), y=float(row.lat))
+        for row in edges.itertuples():
+            source_ids = getattr(row, "source_edge_ids", "[]")
+            if isinstance(source_ids, str):
+                try:
+                    source_ids = tuple(json.loads(source_ids))
+                except (TypeError, ValueError):
+                    source_ids = (source_ids,)
+            geometry = getattr(row, "geometry", None)
+            if isinstance(geometry, str):
+                geometry = wkt.loads(geometry)
+            maxmph = float(getattr(row, "maxmph", 25.0))
+            highway = str(getattr(row, "type", "primary")).split("|")
+            graph.add_edge(
+                node_osmids[int(row.start_node_id)],
+                node_osmids[int(row.end_node_id)],
+                key=getattr(row, "edge_key", 0),
+                link_id=int(row.link_id),
+                geometry=geometry,
+                length=float(row.length),
+                travel_time=float(getattr(
+                    row, "travel_time",
+                    float(row.length) / (maxmph * 1609.344 / 3600.0),
+                )),
+                speed_kph=maxmph * 1.609344,
+                maxspeed=f"{maxmph} mph",
+                highway=highway[0] if len(highway) == 1 else tuple(highway),
+                lanes_numeric=float(getattr(row, "lanes", 1)),
+                lanes=str(getattr(row, "lanes", 1)),
+                source_edge_ids=tuple(source_ids),
+            )
+        self.graph = graph
+        self.nodes = nodes.sort_values("node_id").reset_index(drop=True)
+        self.edges = edges.sort_values("link_id").reset_index(drop=True)
+        self.osmid_to_nid_dict = {
+            osmid: node_id for node_id, osmid in node_osmids.items()
+        }
+        self.nid_to_osmid_dict = dict(node_osmids)
+        self.stage_counts = dict(manifest.get("stage_counts") or {
+            "loaded_artifact": {"nodes": len(nodes), "edges": len(edges)},
+        })
+        self.stage_maps = {"loaded_artifact": self._snapshot_map()}
+        return manifest
 
     def _snapshot_map(self):
         """Capture node coords, edge pairs, and edge geometry polylines."""
@@ -71,57 +136,96 @@ class RoadNet:
     def get_map(self, no_lat, so_lat, east_long, west_long,
                 highway_types=None, merge_chains=True, contract_threshold=30,
                 prune_dead_ends=False, suppress_t_junctions=False,
-                apply_cleaning=True):
-        """Download OSM graph and apply simplified cleaning pipeline.
+                apply_cleaning=True, intersection_tolerance=0,
+                cache_policy="reuse"):
+        """Download OSM graph and apply topology-preserving cleaning.
 
         Stages:
-          01_all         -- raw OSM download (all drivable roads)
-          02_filtered    -- filtered to *highway_types* (if provided)
-          03_contract    -- close-node clusters merged into centroids
-          04_merged      -- degree-2 pass-through chains merged
-          05_final_scc   -- optional dead-end pruning and largest SCC
+          01_downloaded_unsimplified -- raw, unsimplified OSM graph
+          02_highway_filtered        -- requested highway classes
+          03_topology_simplified     -- true nondecision nodes removed
+          04_intersections_consolidated -- optional metric consolidation
+          05_largest_wcc             -- diagnostic weak component
+          06_final_scc               -- model-ready directed component
 
         Args:
             highway_types: OSM highway filter, e.g. ['motorway','trunk',...]
-            merge_chains: Enable pass‑through chain merging.
-            contract_threshold: Max internal edge length (m) for centroid merge.
+            merge_chains: Enable topology-aware pass-through simplification.
+            contract_threshold: Deprecated and ignored. It previously selected
+                unsafe connected-component contraction.
             prune_dead_ends: Iteratively remove directed source/sink dead ends
                 before the final SCC extraction.
             suppress_t_junctions: Reserved compatibility option. T-junction
                 suppression is not applied implicitly; callers must use an
                 explicit contraction threshold instead.
-            apply_cleaning: If false, retain the filtered raw graph and record
-                the skipped cleaning stages explicitly.
+            apply_cleaning: If false, retain the filtered graph before the
+                final component extraction.
+            intersection_tolerance: OSMnx node-buffer radius in metres. Zero
+                disables proximity consolidation.
         """
         if suppress_t_junctions:
             raise ValueError(
                 'suppress_t_junctions is not implemented; use contract_threshold '
                 'and merge_chains explicitly'
             )
-        self.graph = get_graph((west_long, so_lat, east_long, no_lat))
-        self.stage_counts['01_all'] = {'nodes': len(self.graph.nodes), 'edges': len(self.graph.edges)}
-        self.stage_maps['01_all'] = self._snapshot_map()
+        coords = (west_long, so_lat, east_long, no_lat)
+        if cache_policy not in {"reuse", "refresh", "require"}:
+            raise ValueError("cache_policy must be reuse, refresh, or require")
+        downloaded, self.cache_metadata = get_graph(
+            coords,
+            highway_types=highway_types,
+            simplify=False,
+            retain_all=True,
+            force_refresh=cache_policy == "refresh",
+            require_cached=cache_policy == "require",
+            return_metadata=True,
+        )
+        downloaded = prepare_source_graph(downloaded)
+        self.graph = downloaded
+        self.stage_counts['01_downloaded_unsimplified'] = {
+            'nodes': len(self.graph), 'edges': self.graph.number_of_edges(),
+        }
+        self.stage_maps['01_downloaded_unsimplified'] = self._snapshot_map()
 
         if highway_types:
-            self._filter_by_highway(highway_types)
-            self.stage_counts['02_filtered'] = {'nodes': len(self.graph.nodes), 'edges': len(self.graph.edges)}
-            self.stage_maps['02_filtered'] = self._snapshot_map()
-
-        if apply_cleaning:
-            self._merge_junctions(threshold=contract_threshold)
-        self.stage_counts['03_contract'] = {'nodes': len(self.graph.nodes), 'edges': len(self.graph.edges)}
-        self.stage_maps['03_contract'] = self._snapshot_map()
+            self.graph = filter_highways(self.graph, highway_types)
+        self.stage_counts['02_highway_filtered'] = {
+            'nodes': len(self.graph), 'edges': self.graph.number_of_edges(),
+        }
+        self.stage_maps['02_highway_filtered'] = self._snapshot_map()
 
         if apply_cleaning and merge_chains:
-            self._merge_degree2_chains()
-        self.stage_counts['04_merged'] = {'nodes': len(self.graph.nodes), 'edges': len(self.graph.edges)}
-        self.stage_maps['04_merged'] = self._snapshot_map()
+            self.graph = topology_simplify(self.graph)
+        self.stage_counts['03_topology_simplified'] = {
+            'nodes': len(self.graph), 'edges': self.graph.number_of_edges(),
+        }
+        self.stage_maps['03_topology_simplified'] = self._snapshot_map()
+
+        if apply_cleaning and float(intersection_tolerance) > 0:
+            projected = project_graph(self.graph)
+            projected, _, _ = consolidate_intersections(
+                projected, float(intersection_tolerance)
+            )
+            self.graph = project_graph(projected, to_crs='EPSG:4326')
+        self.stage_counts['04_intersections_consolidated'] = {
+            'nodes': len(self.graph), 'edges': self.graph.number_of_edges(),
+        }
+        self.stage_maps['04_intersections_consolidated'] = self._snapshot_map()
 
         if prune_dead_ends:
             self._prune_dead_ends()
-        self._keep_largest_scc()
-        self.stage_counts['05_final_scc'] = {'nodes': len(self.graph.nodes), 'edges': len(self.graph.edges)}
-        self.stage_maps['05_final_scc'] = self._snapshot_map()
+        wcc = largest_component(self.graph, strong=False)
+        self.stage_counts['05_largest_wcc'] = {
+            'nodes': len(wcc), 'edges': wcc.number_of_edges(),
+        }
+        original_graph = self.graph
+        self.graph = wcc
+        self.stage_maps['05_largest_wcc'] = self._snapshot_map()
+        self.graph = largest_component(original_graph, strong=True)
+        self.stage_counts['06_final_scc'] = {
+            'nodes': len(self.graph), 'edges': self.graph.number_of_edges(),
+        }
+        self.stage_maps['06_final_scc'] = self._snapshot_map()
         self.rearrange_data()
 
     def _prune_dead_ends(self):
@@ -147,21 +251,8 @@ class RoadNet:
 
     def _filter_by_highway(self, highway_types):
         """Remove edges whose highway tag is not in the given list."""
-        if not highway_types:
-            return
-        to_remove = []
-        for u, v, k, d in self.graph.edges(keys=True, data=True):
-            hw = d.get('highway')
-            if isinstance(hw, list):
-                hw = hw[0]
-            if hw not in highway_types:
-                to_remove.append((u, v, k))
-        self.graph.remove_edges_from(to_remove)
-        # Remove orphaned nodes
-        orphans = [n for n, deg in self.graph.degree() if deg == 0]
-        self.graph.remove_nodes_from(orphans)
-        if to_remove:
-            print(f"  Filtered {len(to_remove)} edges to highway types: {highway_types}")
+        if highway_types:
+            self.graph = filter_highways(self.graph, highway_types)
 
     def _merge_degree2_chains(self):
         """Merge all pass-through nodes (undirected-degree = 2).
@@ -361,7 +452,7 @@ class RoadNet:
     def rearrange_data(self):
         nodesOX, edgesOX = ox.graph_to_gdfs(self.graph)
 
-        raw_nodes = nodesOX.copy()
+        raw_nodes = pd.DataFrame(nodesOX.copy())
         if 'osmid' not in raw_nodes.columns:
             raw_nodes['osmid'] = raw_nodes.index
         raw_nodes = raw_nodes.reset_index(drop=True)
@@ -375,7 +466,7 @@ class RoadNet:
         self.osmid_to_nid_dict = {r.osmid: r.node_id for r in raw_nodes.itertuples()}
         self.nid_to_osmid_dict = {r.node_id: r.osmid for r in raw_nodes.itertuples()}
 
-        raw_edges = edgesOX.copy().reset_index()
+        raw_edges = pd.DataFrame(edgesOX.copy().reset_index())
         for col in ('u', 'v', 'key'):
             if col not in raw_edges.columns:
                 raw_edges[col] = ''
@@ -389,26 +480,39 @@ class RoadNet:
         raw_edges['start_osmid'] = raw_edges['u'].astype(object)
         raw_edges['end_osmid'] = raw_edges['v'].astype(object)
         raw_edges['edge_key'] = raw_edges['key'].astype(object)
-        raw_edges['type'] = raw_edges['highway']
-        raw_edges['length'] = raw_edges['length'].astype(float)
-        raw_edges['lanes'] = raw_edges['lanes'].fillna('1')
-        raw_edges['lanes'] = raw_edges['lanes'].apply(
-            lambda x: str(x[0]) if isinstance(x, list) else str(x)
+        raw_edges['type'] = raw_edges['highway'].apply(
+            lambda value: '|'.join(map(str, value))
+            if isinstance(value, (list, tuple, set)) else str(value)
         )
-        raw_edges['maxmph'] = raw_edges['maxspeed'].fillna('25 mph')
-        raw_edges['maxmph'] = [
-            float(list(filter(lambda x: x.isdigit(), s.split()))[0])
-            for s in raw_edges['maxmph'].apply(
-                lambda x: str(x[0]) if isinstance(x, list) else str(x)
-            ).tolist()
-        ]
+        raw_edges['length'] = raw_edges['length'].astype(float)
+        lane_source = 'lanes_numeric' if 'lanes_numeric' in raw_edges else 'lanes'
+        raw_edges['lanes'] = raw_edges[lane_source].apply(parse_lanes).round().astype(int)
+        if 'speed_kph' in raw_edges:
+            raw_edges['maxmph'] = raw_edges['speed_kph'].astype(float) / 1.609344
+        else:
+            raw_edges['maxmph'] = raw_edges.apply(
+                lambda row: parse_speed_kph(row.get('maxspeed'), row.get('highway')) / 1.609344,
+                axis=1,
+            )
+        if 'travel_time' not in raw_edges:
+            raw_edges['travel_time'] = raw_edges['length'] / (
+                raw_edges['maxmph'] * 1609.344 / 3600.0
+            )
         raw_edges['geometry'] = raw_edges['geometry'].apply(wkt.dumps)
-        raw_edges['capacity'] = raw_edges['lanes'].astype(int) * 1000
+        raw_edges['capacity'] = raw_edges['lanes'] * 1000
+        if 'source_edge_ids' not in raw_edges:
+            raw_edges['source_edge_ids'] = raw_edges.apply(
+                lambda row: (f"{row['u']}|{row['v']}|{row['key']}",), axis=1
+            )
+        raw_edges['source_edge_ids'] = raw_edges['source_edge_ids'].apply(
+            lambda value: json.dumps(list(value) if isinstance(value, (list, tuple, set)) else [value])
+        )
 
         drop_node_columns = [c for c in ['x', 'y', 'street_count', 'geometry', 'highway', 'osmid', '_stable_node_key'] if c in raw_nodes]
         self.nodes = raw_nodes.drop(drop_node_columns, axis=1)
         self.edges = raw_edges[['link_id', 'start_node_id', 'end_node_id', 'type',
                                 'length', 'maxmph', 'lanes', 'capacity',
+                                'travel_time', 'source_edge_ids',
                                 'start_osmid', 'end_osmid', 'edge_key', 'geometry']]
         self.nodes = self.nodes.sort_values('node_id').reset_index(drop=True)
         self.edges = self.edges.sort_values('link_id').reset_index(drop=True)
