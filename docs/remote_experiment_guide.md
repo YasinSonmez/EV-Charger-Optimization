@@ -50,6 +50,29 @@ Because OSM changes, retain the raw cache and use `"cache_policy": "require"`
 for exact reruns after the first download. Run all three configs network-only
 before BPR fitting and visually inspect their pruning/scenario maps.
 
+## Local end-to-end sanity check
+
+`configs/rebuttal/sanity_small.json` uses the same secondary+ network method,
+17-level strict BPR fitting, 20 queue replications, 1% Nash criterion, and
+300-iteration safety cap as the scaling configs. It deliberately uses a
+49-node window, one candidate/charger, and only one F1 plus one F2 vehicle so
+that it tests every pipeline stage quickly; it is an execution check, not a
+scientific placement experiment.
+
+```bash
+MPLCONFIGDIR=/tmp/evopt-mpl XDG_CACHE_HOME=/tmp/evopt-cache \
+conda run -n evopt python pipeline.py \
+  --config configs/rebuttal/sanity_small.json \
+  --results-root results/sanity-runs
+```
+
+The verified local run completed in 171.7 seconds on eight CPUs, validated all
+100 BPR links, converged its single queue configuration in one iteration, and
+passed output sanity checks. Larger-demand diagnostic attempts on the same
+network entered exact cycles at iterations 5--6; this is why production runs
+retain cycle detection and must not infer a production iteration count from
+the two-vehicle sanity result.
+
 ## Container and cluster launch
 
 ```bash

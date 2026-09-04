@@ -1,0 +1,107 @@
+{
+  "name": "secondary-plus-sanity-small",
+  "coordinates": [
+    38.910578,
+    38.903422,
+    -77.032620,
+    -77.041379
+  ],
+  "network": {
+    "expected_nodes": 49,
+    "node_tolerance_fraction": 0.1,
+    "cache_policy": "reuse"
+  },
+  "road_filter": {
+    "enabled": true,
+    "road_profile": "secondary_plus",
+    "highway_types": [
+      "motorway",
+      "trunk",
+      "primary",
+      "secondary",
+      "motorway_link",
+      "trunk_link",
+      "primary_link",
+      "secondary_link"
+    ],
+    "merge_chains": true,
+    "prune_dead_ends": false,
+    "intersection_tolerance": 5
+  },
+  "scenario_generation": {
+    "enabled": true,
+    "candidate_count": 1,
+    "num_chargers": 1,
+    "candidate_strategy": "interchanges_then_farthest_point",
+    "interchange_merge_diameter_m": 250,
+    "od_pair_count": 1,
+    "od_strategy": "boundary_max_separation",
+    "boundary_pool_size": 32,
+    "demand": {
+      "F1": 1,
+      "F2": 1
+    },
+    "seed": 42
+  },
+  "max_iter": 1000,
+  "use_derivatives": false,
+  "single_swap": false,
+  "use_cvxpy": true,
+  "plot_info": false,
+  "calculate_on_all_possible_positions": true,
+  "charger_self_link_length": 100,
+  "route_analysis": {
+    "analyze_top_k_routes": true,
+    "k_values": [
+      16
+    ],
+    "run_parameter_sweep": false
+  },
+  "queue_simulation": {
+    "enabled": true,
+    "K": 16,
+    "ALPHA": 0.01,
+    "NUM_ITERS": 20,
+    "MAX_NE_ITERATIONS": 300,
+    "N": 20,
+    "WORKERS": null,
+    "single_swap": false,
+    "SIMULATION_HORIZON": 10801,
+    "ENT_CAPACITY": 250,
+    "CHARGING_CAPACITY": 250,
+    "EXIT_CAPACITY": 250,
+    "COST": 0,
+    "failure_policy": "fail_fast"
+  },
+  "pipeline": {
+    "random_seed": 42,
+    "parallel_workers": null,
+    "skip_bpr_fitting": false,
+    "skip_cg_optimization": false,
+    "skip_queue_simulation": false,
+    "cg_fit_policy": "validated_only",
+    "bpr_generation": {
+      "mode": "capacity_fraction_strict",
+      "num_samples": 17,
+      "flow_fractions": [
+        0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1,
+        1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875, 2
+      ],
+      "capacity_source": "simulator",
+      "capacity_per_lane": 1900,
+      "calibration_window_hours": 0.1,
+      "route_mode": "link_probe",
+      "missing_context_policy": "fail_fast",
+      "simulation_horizon": 10801,
+      "failure_policy": "fail_fast",
+      "allow_proxy": false,
+      "require_full_fit": true,
+      "fit_validation": "full",
+      "fallback_policy": "none",
+      "fixed_references": true,
+      "save_fit_plots": false,
+      "force_regenerate": false,
+      "resume": true
+    }
+  }
+}
