@@ -133,17 +133,10 @@ def _ensure_bpr_link_length(pandas_df, artifact_dir):
     return output
 
 
-def _bpr_manifest_is_compatible(manifest_path, network_hash, bpr_config, seed):
-    """Return whether a cached BPR artifact matches the current request."""
-    if not os.path.exists(manifest_path):
-        return False
-    try:
-        with open(manifest_path) as handle:
-            manifest = json.load(handle)
-    except (OSError, ValueError):
-        return False
+def _bpr_request_manifest_fields(network_hash, bpr_config, seed):
+    """Return the request identity shared by BPR data and fit checkpoints."""
     requested_mode = bpr_config.get('mode', 'historical_artifact_compatible')
-    checks = {
+    return {
         'network_hash': network_hash,
         'bpr_mode': requested_mode,
         'num_samples': int(bpr_config.get('num_samples', 25)),
@@ -172,6 +165,18 @@ def _bpr_manifest_is_compatible(manifest_path, network_hash, bpr_config, seed):
         ),
         'simulation_horizon': int(bpr_config.get('simulation_horizon', 10801)),
     }
+
+
+def _bpr_manifest_is_compatible(manifest_path, network_hash, bpr_config, seed):
+    """Return whether a cached BPR artifact matches the current request."""
+    if not os.path.exists(manifest_path):
+        return False
+    try:
+        with open(manifest_path) as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    checks = _bpr_request_manifest_fields(network_hash, bpr_config, seed)
     for key, expected in checks.items():
         actual = manifest.get(key)
         if key in {
@@ -214,6 +219,12 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
         road_filter_config: Dict with 'highway_types' and 'prune_dead_ends' keys.
     """
     bpr_config = dict(bpr_config or {})
+    # ``cache_path`` may point at a historical repository artifact selected as
+    # a read-only compatibility input. Any new or enriched checkpoint belongs
+    # in this run's writable BPR directory.
+    output_cache_path = (
+        os.path.join(work_dir, 'cached_results.pkl') if work_dir else cache_path
+    )
     bpr_mode = bpr_config.get('mode', 'historical_artifact_compatible')
     validation_mode = bpr_config.get(
         'fit_validation',
@@ -291,7 +302,7 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
                 pandas_df, n_links,
             allow_missing=bpr_config.get('allow_missing_links', False),
             )
-        with open(cache_path, "wb") as f:
+        with open(output_cache_path, "wb") as f:
             pickle.dump((pandas_df, model_fitter), f)
         print("Cached BPR fit results.")
     elif allow_generate and coordinates is not None and (
@@ -337,6 +348,23 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
             active_link_ids=bpr_config.get('active_link_ids'),
             resume=bpr_config.get('resume', True),
         )
+        # The per-link simulations are complete now. Record the full request
+        # identity before fitting, so an interrupted fit can resume directly
+        # from traffic_data.csv without rescheduling simulation work.
+        generation_manifest_path = os.path.join(
+            work_dir or os.path.dirname(output_cache_path) or '.',
+            'bpr_manifest.json',
+        )
+        generation_manifest = {}
+        if os.path.exists(generation_manifest_path):
+            with open(generation_manifest_path) as handle:
+                generation_manifest = json.load(handle)
+        generation_manifest.update(_bpr_request_manifest_fields(
+            network_hash,
+            bpr_config,
+            seed_manager.seed if seed_manager is not None else 0,
+        ))
+        atomic_write_json(generation_manifest_path, generation_manifest)
         pandas_df = pd.read_csv(data_path)
         convert_string_to_array(pandas_df, 'x_vector')
         convert_string_to_array(pandas_df, 'y_vector')
@@ -375,7 +403,7 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
                 pandas_df, n_links_generated,
             allow_missing=bpr_config.get('allow_missing_links', False),
             )
-        with open(cache_path, "wb") as f:
+        with open(output_cache_path, "wb") as f:
             pickle.dump((pandas_df, model_fitter), f)
         print("Generated BPR data and cached fit results.")
     else:
@@ -409,7 +437,7 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
         model_fitter.save_results_to_csv(
             os.path.join(work_dir or os.path.dirname(cache_path) or '.', 'fitter_results.csv')
         )
-        with open(cache_path, "wb") as f:
+        with open(output_cache_path, "wb") as f:
             pickle.dump((pandas_df, model_fitter), f)
         bpr_manifest = {}
         if os.path.exists(bpr_manifest_path):
@@ -1321,18 +1349,23 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
         timing['bpr_fitting'] = time.time() - t0
         timing_recorder.add('bpr_fitting', timing['bpr_fitting'], skipped=True)
 
+    bpr_fit_plot = os.path.join(plot_dir, 'bpr_fit_samples.png')
     try:
-        _plot_bpr_fit_samples(
-            pandas_df, os.path.join(plot_dir, 'bpr_fit_samples.png'),
-            seed=seed_manager.seed,
-        )
+        _plot_bpr_fit_samples(pandas_df, bpr_fit_plot, seed=seed_manager.seed)
+        if not os.path.exists(bpr_fit_plot):
+            raise RuntimeError('plot function did not create an output file')
+        print(f"BPR fit diagnostics saved to {bpr_fit_plot}")
+    except Exception as exc:
+        raise RuntimeError(f'Failed to create required BPR fit diagnostics: {exc}') from exc
+
+    try:
         _plot_historical_bpr_comparison(
             pandas_df,
             os.path.join(plot_dir, 'bpr_historical_comparison.png'),
             reference_commit=bpr_config.get('historical_reference_commit', '37eab33'),
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"Optional historical BPR comparison plot skipped: {exc}")
 
     # Step 2: Congestion-game equilibrium
     if not config.pipeline.get("skip_cg_optimization", False):

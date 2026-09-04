@@ -98,3 +98,70 @@ def test_bpr_checkpoint_resume_uses_module_pandas(tmp_path):
     )
     assert resumed["fit_status"].tolist() == ["full"]
     assert resumed["link_length"].tolist() == [100.0]
+
+
+def test_read_only_compatibility_cache_is_not_used_as_output(tmp_path):
+    artifact = tmp_path / "network"
+    manifest = write_network_artifact(
+        pd.DataFrame({"node_id": [0, 1], "lon": [0.0, 1.0], "lat": [0.0, 0.0]}),
+        pd.DataFrame({
+            "link_id": [0], "start_node_id": [0], "end_node_id": [1],
+            "edge_key": [0], "length": [100.0],
+        }),
+        artifact,
+    )
+    frame = pd.DataFrame({
+        "link_id": [0], "x_vector": [np.array([0.0, 1.0])],
+        "y_vector": [np.array([10.0, 11.0])], "a_fit": [0.15],
+        "b_fit": [4.0], "cap_fit": [1000.0], "fft_fit": [10.0],
+        "R^2": [1.0], "fit_status": ["full"],
+        "network_hash": [manifest["network_hash"]],
+    })
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    legacy_cache = legacy_dir / "cached_results.pkl"
+    with legacy_cache.open("wb") as handle:
+        pickle.dump((frame, _CachedFitter(frame)), handle)
+    original_bytes = legacy_cache.read_bytes()
+
+    work_dir = tmp_path / "run" / "bpr"
+    work_dir.mkdir(parents=True)
+    (work_dir / "bpr_manifest.json").write_text(json.dumps({
+        "network_hash": manifest["network_hash"],
+        "bpr_mode": "historical_artifact_compatible", "num_samples": 25,
+        "max_flow": 250.0, "random_seed": 0, "fitter_version": "historical_v1",
+        "route_semantics": "measured_target_flow_with_straight_ahead_context",
+        "fit_screening": "none", "correlation_threshold": 0.0,
+        "variation_ratio_threshold": 0.0, "accept_low_r2": True,
+        "missing_context_policy": "synthetic_boundary",
+        "synthetic_context_capacity_multiplier": 10.0,
+        "synthetic_context_length_m": 1.0, "simulation_horizon": 10801,
+    }))
+
+    pipeline.load_or_fit_model(
+        data_path=str(work_dir / "missing.csv"),
+        cache_path=str(legacy_cache), work_dir=str(work_dir),
+        artifact_dir=str(artifact), n_links=1,
+        seed_manager=SeedManager(0),
+    )
+
+    assert (work_dir / "cached_results.pkl").is_file()
+    assert legacy_cache.read_bytes() == original_bytes
+
+
+def test_bpr_fit_diagnostic_plot_is_created(tmp_path):
+    frame = pd.DataFrame({
+        "link_id": [0, 1],
+        "x_vector": [np.array([0.0, 1.0, 2.0])] * 2,
+        "y_vector": [np.array([10.0, 10.2, 13.0]), np.array([8.0, 8.1, 9.0])],
+        "a_fit": [0.15, 0.10], "b_fit": [4.0, 3.0],
+        "cap_fit": [2.0, 2.0], "fft_fit": [10.0, 8.0],
+        "R^2": [0.99, 0.95], "fit_status": ["full", "full"],
+        "observation_source": ["simulated_contextual"] * 2,
+    })
+    output = tmp_path / "bpr_fit_samples.png"
+
+    pipeline._plot_bpr_fit_samples(frame, str(output), seed=42)
+
+    assert output.is_file()
+    assert output.stat().st_size > 0

@@ -7,7 +7,7 @@ import pytest
 from shapely.geometry import LineString
 
 from src.config import NetworkConfig
-from src.graph_cache import _cache_key
+from src.graph_cache import _cache_key, get_graph
 from src.network_coarsening import (
     contract_freeflow_shortcut_skeleton,
     select_charger_candidate_layer,
@@ -49,6 +49,28 @@ def _add_edge(graph, u, v, *, length=10.0, highway="primary", key=None):
         lanes="2",
         geometry=geometry,
     )
+
+
+def test_graph_download_uses_configured_root_for_osmnx_cache(tmp_path, monkeypatch):
+    observed = {}
+
+    def fake_graph_from_bbox(*args, **kwargs):
+        observed["cache_folder"] = Path(ox.settings.cache_folder)
+        return nx.MultiDiGraph()
+
+    import osmnx as ox
+
+    monkeypatch.setenv("EVOPT_GRAPH_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(ox, "graph_from_bbox", fake_graph_from_bbox)
+
+    get_graph(
+        (38.91, 38.90, -77.03, -77.04),
+        force_refresh=True,
+        simplify=False,
+    )
+
+    assert observed["cache_folder"] == tmp_path / "osmnx"
+    assert observed["cache_folder"].is_dir()
 
 
 def test_mixed_highway_tag_keeps_any_allowed_member():

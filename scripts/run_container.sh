@@ -182,7 +182,6 @@ common_env=(
     "MKL_NUM_THREADS=1"
     "NUMEXPR_NUM_THREADS=1"
     "MPLCONFIGDIR=/tmp/evopt-matplotlib"
-    "HOME=/tmp/evopt-home"
 )
 if [[ "$mode" == "workspace" ]]; then
     common_env+=("EVOPT_CODE_COMMIT=$code_commit")
@@ -198,6 +197,7 @@ if [[ "$engine" == "docker" ]]; then
     runtime=(docker run --rm --init --user "$(id -u):$(id -g)" --workdir "$container_workdir" --entrypoint conda)
     [[ -n "$cpus" ]] && runtime+=(--cpus "$cpus")
     for value in "${common_env[@]}"; do runtime+=(-e "$value"); done
+    runtime+=(-e "HOME=/tmp/evopt-home")
     runtime+=(-v "$results:/results" -v "$cache:/cache")
     for value in "${mounts[@]}"; do runtime+=(-v "$value"); done
     runtime+=("$docker_image" run --no-capture-output -n evopt python "${command_args[@]}")

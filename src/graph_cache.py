@@ -4,6 +4,7 @@ import pickle
 import hashlib
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 import osmnx as ox
 
 
@@ -61,6 +62,12 @@ def get_graph(coords, highway_types=None, force_refresh=False, *,
     """
     cache_dir = graph_cache_dir()
     os.makedirs(cache_dir, exist_ok=True)
+    # OSMnx maintains its own HTTP response cache in addition to our processed
+    # graph cache. Point it beneath the same configurable, mounted cache root so
+    # container runs never attempt to write into a read-only source checkout.
+    osmnx_cache_dir = Path(cache_dir) / "osmnx"
+    osmnx_cache_dir.mkdir(parents=True, exist_ok=True)
+    ox.settings.cache_folder = osmnx_cache_dir
     if custom_filter is None and highway_types:
         custom_filter = _drivable_highway_filter(highway_types)
     key = _cache_key(
