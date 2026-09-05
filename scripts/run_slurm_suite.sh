@@ -48,4 +48,10 @@ trap checkpoint_and_exit USR1 TERM
     --index "$SLURM_ARRAY_TASK_ID" \
     --resume &
 child=$!
+set +e
 wait "$child"
+child_status=$?
+set -e
+child=""
+echo "EVOPT container process exited with status $child_status"
+exit "$child_status"

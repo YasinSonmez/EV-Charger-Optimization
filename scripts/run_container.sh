@@ -194,19 +194,19 @@ if [[ -n "$cpus" ]]; then
 fi
 
 if [[ "$engine" == "docker" ]]; then
-    runtime=(docker run --rm --init --user "$(id -u):$(id -g)" --workdir "$container_workdir" --entrypoint conda)
+    runtime=(docker run --rm --init --user "$(id -u):$(id -g)" --workdir "$container_workdir" --entrypoint /opt/conda/envs/evopt/bin/python)
     [[ -n "$cpus" ]] && runtime+=(--cpus "$cpus")
     for value in "${common_env[@]}"; do runtime+=(-e "$value"); done
     runtime+=(-e "HOME=/tmp/evopt-home")
     runtime+=(-v "$results:/results" -v "$cache:/cache")
     for value in "${mounts[@]}"; do runtime+=(-v "$value"); done
-    runtime+=("$docker_image" run --no-capture-output -n evopt python "${command_args[@]}")
+    runtime+=("$docker_image" "${command_args[@]}")
 else
     runtime=(apptainer exec --cleanenv --pwd "$container_workdir")
     for value in "${common_env[@]}"; do runtime+=(--env "$value"); done
     runtime+=(--bind "$results:/results" --bind "$cache:/cache")
     for value in "${mounts[@]}"; do runtime+=(--bind "$value"); done
-    runtime+=("$image" conda run --no-capture-output -n evopt python "${command_args[@]}")
+    runtime+=("$image" /opt/conda/envs/evopt/bin/python "${command_args[@]}")
 fi
 
 echo "Results are available on the host at: $results"

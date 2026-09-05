@@ -14,6 +14,7 @@ Usage:
 import argparse
 import io
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -48,6 +49,30 @@ try:
 except (ImportError, ModuleNotFoundError):
     QUEUE_SIM_AVAILABLE = False
     _QUEUE_SIM_ERROR = "queue_sim package or platform-native library not found"
+
+
+def _cleanup_multiprocessing_children(timeout_seconds=5.0):
+    """Terminate unexpected workers before Python/container shutdown."""
+    children = multiprocessing.active_children()
+    if not children:
+        print("Process shutdown check: no active multiprocessing children")
+        return []
+    descriptions = [f"pid={child.pid} name={child.name}" for child in children]
+    print(
+        "WARNING: terminating active multiprocessing children at shutdown: "
+        + ", ".join(descriptions)
+    )
+    for child in children:
+        if child.is_alive():
+            child.terminate()
+    deadline = time.monotonic() + float(timeout_seconds)
+    for child in children:
+        child.join(max(0.0, deadline - time.monotonic()))
+    for child in children:
+        if child.is_alive():
+            child.kill()
+            child.join(1.0)
+    return descriptions
 
 
 def _fill_missing_links_to_count(pandas_df, target_count, allow_missing=False):
@@ -1874,16 +1899,18 @@ if __name__ == "__main__":
     parser.add_argument('--pruning-sweep', action='store_true',
                         help='Compare road profiles and intersection radii; run no optimization')
     args = parser.parse_args()
-    if args.validate_config:
-        validated = Config.from_json(args.config)
-        print(json.dumps(validated.to_dict(), indent=2, sort_keys=True))
-        raise SystemExit(0)
-    if args.network_only and args.pruning_sweep:
-        parser.error('--network-only and --pruning-sweep are mutually exclusive')
-    if args.pruning_sweep:
-        from src.pruning_study import run_pruning_sweep
-        run_pruning_sweep(args.config)
-    elif args.network_only:
-        run_network_only(args.config)
-    else:
-        run_pipeline(args.config, results_root=args.results_root, resume=args.resume)
+    try:
+        if args.validate_config:
+            validated = Config.from_json(args.config)
+            print(json.dumps(validated.to_dict(), indent=2, sort_keys=True))
+        elif args.network_only and args.pruning_sweep:
+            parser.error('--network-only and --pruning-sweep are mutually exclusive')
+        elif args.pruning_sweep:
+            from src.pruning_study import run_pruning_sweep
+            run_pruning_sweep(args.config)
+        elif args.network_only:
+            run_network_only(args.config)
+        else:
+            run_pipeline(args.config, results_root=args.results_root, resume=args.resume)
+    finally:
+        _cleanup_multiprocessing_children()

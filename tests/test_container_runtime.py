@@ -58,6 +58,53 @@ def test_container_provenance_is_recorded(monkeypatch):
     assert provenance["code_commit"] == "abc123"
 
 
+def test_pipeline_shutdown_terminates_unexpected_children(monkeypatch):
+    class _Child:
+        pid = 123
+        name = "leaked-worker"
+
+        def __init__(self):
+            self.alive = True
+            self.terminated = False
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+
+        def join(self, _timeout):
+            return None
+
+        def kill(self):
+            self.alive = False
+
+    child = _Child()
+    monkeypatch.setattr(
+        pipeline.multiprocessing, "active_children", lambda: [child]
+    )
+
+    descriptions = pipeline._cleanup_multiprocessing_children(0.01)
+
+    assert child.terminated is True
+    assert descriptions == ["pid=123 name=leaked-worker"]
+
+
+def test_container_launcher_bypasses_conda_run_wrapper():
+    launcher = (
+        pipeline.os.path.join(
+            pipeline.os.path.dirname(pipeline.__file__),
+            "scripts",
+            "run_container.sh",
+        )
+    )
+    with open(launcher, encoding="utf-8") as handle:
+        text = handle.read()
+    assert "/opt/conda/envs/evopt/bin/python" in text
+    assert "run --no-capture-output -n evopt python" not in text
+
+
 def test_bpr_checkpoint_resume_uses_module_pandas(tmp_path):
     artifact = tmp_path / "network"
     manifest = write_network_artifact(
