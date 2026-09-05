@@ -141,10 +141,19 @@ class Runner:
             dot, det = (in_vec[0] * out_vec[0] + in_vec[1] * out_vec[1]), (in_vec[0] * out_vec[1] - in_vec[1] * out_vec[0])
             ang.append(np.arctan2(det, dot) * 180 / np.pi)
 
-        sub_link = sub_links.iloc[ang.index(min(ang))]
-
-        # Find the angle of the station's entrance/exit link with respect to node_id
-        station_ang = min(ang)/2
+        # With multiple incoming roads, preserve the historical angular
+        # placement.  A valid directed-network node can have exactly one
+        # incoming road (and still belong to the SCC).  In that case there is
+        # no second angle to bisect, so place the symbolic station link
+        # perpendicular to the sole incoming road instead of calling
+        # ``min`` on an empty sequence.  This geometry is only a visual and
+        # topological offset for the virtual station links; it does not alter
+        # road travel times or capacities.
+        if ang:
+            station_ang = min(ang) / 2
+        else:
+            incoming_angle = np.degrees(np.arctan2(in_vec[1], in_vec[0]))
+            station_ang = incoming_angle + 90.0
 
         # Build two links: One is from the station entrance to the station, the other from the station to the station's exit
         # These links are symbolic (virtual), but we still add them to the dataframes for simulation purposes

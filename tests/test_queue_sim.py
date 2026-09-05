@@ -1,6 +1,7 @@
 """Unit tests for queue simulation availability and basic imports."""
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 
@@ -58,3 +59,41 @@ def test_unused_route_uses_current_link_cost_not_free_flow():
     }]
     details = runner._check_route_details()
     assert details[((0, 2), 'F1')][0]['travel_time'] == pytest.approx(30.0)
+
+
+def test_station_at_node_accepts_single_incoming_link():
+    """A valid one-incoming-road candidate must support a virtual station."""
+    from queue_sim import QUEUE_SIM_AVAILABLE
+    if not QUEUE_SIM_AVAILABLE:
+        pytest.skip("queue simulator unavailable")
+    from queue_sim.runner_EV import Runner
+
+    runner = Runner.__new__(Runner)
+    runner.nodes_df = pd.DataFrame([
+        {'node_id': 0, 'lon': 0.0, 'lat': 0.0, 'node_osmid': 0, 'type': 'real'},
+        {'node_id': 1, 'lon': 1.0, 'lat': 0.0, 'node_osmid': 1, 'type': 'real'},
+    ])
+    runner.links_df = pd.DataFrame([{
+        'link_id': 0, 'start_node_id': 0, 'end_node_id': 1,
+        'type': 'secondary', 'length': 100.0, 'maxmph': 25.0,
+        'lanes': 1, 'capacity': 1900.0,
+        'start_osmid': 0, 'end_osmid': 1,
+        'geometry': 'LINESTRING (0 0, 1 0)',
+    }])
+    runner.charging_stations_df = pd.DataFrame()
+
+    runner.create_EV_charging_station_at_node(
+        station_node_id=1,
+        ent_capacity=250,
+        charging_capacity=250,
+        exit_capacity=250,
+        cost=0,
+    )
+
+    assert len(runner.charging_stations_df) == 1
+    assert set(runner.links_df['type']) == {
+        'secondary', 'In_Station', 'Out_Station',
+    }
+    station_node = runner.nodes_df.loc[runner.nodes_df['type'] == 'Station'].iloc[0]
+    assert station_node['lon'] == pytest.approx(1.0)
+    assert station_node['lat'] != pytest.approx(0.0)
