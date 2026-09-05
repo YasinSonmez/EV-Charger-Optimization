@@ -1748,7 +1748,29 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
         )
     print(f"Sanity checks passed: {os.path.join(experiment_dir, 'sanity_check.json')}")
 
-    inventory = directory_inventory(experiment_dir)
+    # A full recursive inventory can issue hundreds of thousands of metadata
+    # operations for raw queue/BPR timestep files. On shared Slurm storage it
+    # can outlast the experiment while consuming almost no CPU. Keep it
+    # opt-in and write a small, explicit marker by default.
+    full_inventory = bool(config.pipeline.get('full_artifact_inventory', False))
+    if full_inventory:
+        inventory = directory_inventory(experiment_dir)
+        inventory.update({
+            'full_scan': True,
+            'scan_status': 'complete',
+        })
+    else:
+        inventory = {
+            'full_scan': False,
+            'scan_status': 'skipped',
+            'reason': (
+                'Recursive artifact inventory disabled to avoid expensive '
+                'shared-filesystem metadata traversal'
+            ),
+            'file_count': None,
+            'total_bytes': None,
+            'files': [],
+        }
     atomic_write_json(os.path.join(experiment_dir, "artifact_inventory.json"), inventory)
     bpr_manifest_path = os.path.join(experiment_dir, 'bpr', 'bpr_manifest.json')
     bpr_manifest = {}

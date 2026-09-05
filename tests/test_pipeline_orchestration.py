@@ -182,3 +182,9 @@ def test_pipeline_orchestrator_produces_valid_two_od_outputs(tmp_path, monkeypat
     assert (experiment_dir / "queue" / "comparison_results.json").exists()
     sanity = json.loads((experiment_dir / "sanity_check.json").read_text())
     assert sanity["valid"] is True
+    inventory = json.loads((experiment_dir / "artifact_inventory.json").read_text())
+    assert inventory["full_scan"] is False
+    assert inventory["scan_status"] == "skipped"
+    assert inventory["total_bytes"] is None
+    status = json.loads((experiment_dir / "status.json").read_text())
+    assert status["artifact_bytes"] is None
