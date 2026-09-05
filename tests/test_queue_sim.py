@@ -1,4 +1,6 @@
 """Unit tests for queue simulation availability and basic imports."""
+import json
+import pickle
 from types import SimpleNamespace
 
 import pandas as pd
@@ -33,6 +35,76 @@ def test_queue_sim_helpers():
     s3 = _placement_seed(1, [14, 20])
     assert s1 == s2
     assert s1 != s3
+
+
+def test_cycle_assignment_is_explicitly_approximate_and_comparison_usable():
+    from queue_sim.comparison import _assignment_is_usable
+    from queue_sim.find_nash import _promote_cycle_result
+
+    result = {
+        'status': 'nonconverged',
+        'converged': False,
+        'failure_reason': 'assignment cycle detected at iteration 4',
+        'assignments': {'F1': {(0, 1): [1]}, 'F2': {(0, 1): [1]}},
+    }
+    _promote_cycle_result(result, gap_verified=False)
+
+    assert result['status'] == 'approximate_cycle_state'
+    assert result['approximate_equilibrium'] is True
+    assert result['converged'] is False
+    assert result['exact_ne_eligible'] is False
+    assert result['retained_state_gap_verified'] is False
+    assert result['failure_reason'] is None
+    assert _assignment_is_usable(result)
+
+
+def test_unlabeled_nonconverged_assignment_remains_unusable():
+    from queue_sim.comparison import _assignment_is_usable
+
+    assert not _assignment_is_usable({
+        'status': 'nonconverged',
+        'converged': False,
+    })
+
+
+def test_resume_promotes_legacy_cycle_artifact_without_resimulation(tmp_path):
+    from queue_sim.find_nash import _reuse_saved_cycle_assignments
+
+    work_dir = tmp_path / 'queue'
+    work_dir.mkdir()
+    legacy = {
+        '75': {
+            'status': 'nonconverged',
+            'converged': False,
+            'failure_reason': 'assignment cycle detected at iteration 4',
+            'final_gap': 0.2,
+            'network_hash': 'network-1',
+            'assignments': {'F1': {(0, 1): [1]}, 'F2': {(0, 1): [1]}},
+        }
+    }
+    with (work_dir / 'NE_path_assignments.pkl').open('wb') as handle:
+        pickle.dump(legacy, handle)
+    (work_dir / 'queue_manifest.json').write_text(json.dumps({
+        'network_hash': 'network-1',
+        'configuration_count': 1,
+        'failed_configurations': {},
+        'nonconverged_configurations': {
+            '75': 'assignment cycle detected at iteration 4'
+        },
+    }))
+
+    reused = _reuse_saved_cycle_assignments(work_dir, 'network-1', 1)
+
+    assert reused is not None
+    _, assignments = reused
+    assert assignments['75']['status'] == 'approximate_cycle_state'
+    assert assignments['75']['retained_state_gap_verified'] is False
+    manifest = json.loads((work_dir / 'queue_manifest.json').read_text())
+    assert manifest['nonconverged_configurations'] == {}
+    assert manifest['approximate_configurations'] == {
+        '75': 'assignment cycle detected at iteration 4'
+    }
+    assert manifest['exact_ne_eligible'] is False
 
 
 def test_unused_route_uses_current_link_cost_not_free_flow():

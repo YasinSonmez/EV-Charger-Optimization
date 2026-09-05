@@ -20,6 +20,102 @@ from src.network_artifact import load_network_artifact
 from src.run_state import available_cpus
 
 
+CYCLE_APPROXIMATION_STATUS = 'approximate_cycle_state'
+
+
+def _is_cycle_termination(result):
+    """Return whether a saved result terminated by repeating an assignment."""
+    if not isinstance(result, dict):
+        return False
+    if result.get('status') == CYCLE_APPROXIMATION_STATUS:
+        return True
+    reason = result.get('termination_reason') or result.get('failure_reason') or ''
+    return str(reason).startswith('assignment cycle detected at iteration ')
+
+
+def _promote_cycle_result(result, *, gap_verified=False):
+    """Label a retained cycle state as an approximation, never an exact NE."""
+    reason = (
+        result.get('termination_reason')
+        or result.get('failure_reason')
+        or 'assignment cycle detected'
+    )
+    result['status'] = CYCLE_APPROXIMATION_STATUS
+    result['converged'] = False
+    result['approximate_equilibrium'] = True
+    result['approximation_method'] = 'current_assignment_at_cycle_detection'
+    result['exact_ne_eligible'] = False
+    result['termination_reason'] = reason
+    result['failure_reason'] = None
+    result['retained_state_gap_verified'] = bool(gap_verified)
+    return result
+
+
+def _write_queue_manifest(path, manifest, assignments):
+    """Update manifest quality fields from the assignment result contract."""
+    approximate = {
+        key: value.get('termination_reason')
+        for key, value in assignments.items()
+        if value.get('status') == CYCLE_APPROXIMATION_STATUS
+    }
+    nonconverged = {
+        key: value.get('failure_reason') or value.get('termination_reason')
+        for key, value in assignments.items()
+        if value.get('status') == 'nonconverged'
+    }
+    manifest.update({
+        'approximate_configurations': approximate,
+        'nonconverged_configurations': nonconverged,
+        'exact_converged_configurations': sum(
+            bool(value.get('converged', False))
+            for value in assignments.values()
+        ),
+        'uses_approximate_cycle_states': bool(approximate),
+        'exact_ne_eligible': (
+            not approximate
+            and not nonconverged
+            and not manifest.get('failed_configurations')
+        ),
+    })
+    with open(path, 'w') as handle:
+        json.dump(manifest, handle, indent=2)
+
+
+def _reuse_saved_cycle_assignments(work_dir, network_hash, expected_count):
+    """Reuse terminal queue artifacts, promoting legacy cycle failures safely."""
+    ne_path = os.path.join(work_dir, 'NE_path_assignments.pkl')
+    manifest_path = os.path.join(work_dir, 'queue_manifest.json')
+    if not (os.path.isfile(ne_path) and os.path.isfile(manifest_path)):
+        return None
+    with open(ne_path, 'rb') as handle:
+        assignments = pickle.load(handle)
+    with open(manifest_path) as handle:
+        manifest = json.load(handle)
+    if not isinstance(assignments, dict) or len(assignments) != int(expected_count):
+        return None
+    if manifest.get('network_hash') != network_hash:
+        return None
+    for value in assignments.values():
+        if not isinstance(value, dict) or value.get('status') == 'failed':
+            return None
+        if value.get('network_hash') not in (None, network_hash):
+            return None
+        if not value.get('converged', False) and not _is_cycle_termination(value):
+            return None
+    for value in assignments.values():
+        if _is_cycle_termination(value):
+            # Legacy artifacts contain the retained assignment but not the
+            # assignment-indexed metric snapshot introduced with this policy.
+            already_verified = bool(value.get('retained_state_gap_verified', False))
+            _promote_cycle_result(value, gap_verified=already_verified)
+    with open(ne_path, 'wb') as handle:
+        pickle.dump(assignments, handle)
+    manifest['failed_configurations'] = {}
+    manifest['successful_configurations'] = len(assignments)
+    _write_queue_manifest(manifest_path, manifest, assignments)
+    return ne_path, assignments
+
+
 def _collapse_repeats(lst):
     if not lst:
         return []
@@ -398,7 +494,7 @@ def _assignment_signature(assignments_no, assignments_ch):
 
 def find_nash_assignments(config, experiment_dir, all_opt_results_path,
                           network_name='canonical', artifact_dir=None,
-                          seed_manager=None):
+                          seed_manager=None, resume=False):
     """Find a shared-network Nash assignment for every charger configuration.
 
     The simulator calls are the parallel work unit.  Nash iterations are
@@ -435,6 +531,21 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
 
     input_paths = (nodes_path, edges_path, od_path)
     configs = list(data['configurations'].keys())
+    if resume:
+        reused = _reuse_saved_cycle_assignments(
+            work_dir, manifest['network_hash'], len(configs)
+        )
+        if reused is not None:
+            ne_path, reused_assignments = reused
+            print(
+                f'\nReusing saved queue assignments from {ne_path}; '
+                'cycle states are explicitly labeled approximate.'
+            )
+            return ne_path, {
+                key: [float(value.get('final_gap', float('inf')))]
+                for key, value in reused_assignments.items()
+                if value.get('final_gap') is not None
+            }
     seed = seed_manager.seed if seed_manager is not None else config.pipeline.get('random_seed', 0)
     available_workers = available_cpus()
     pool_size = available_workers if workers is None else max(1, int(workers))
@@ -484,7 +595,12 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             'status': 'ok',
             'failure_reason': None,
             'resumed_complete': False,
-            'seen_assignments': set(),
+            'seen_assignments': {},
+            'evaluated_assignments': {},
+            'final_gap_override': None,
+            'cycle_start_iteration': None,
+            'cycle_length': None,
+            'retained_state_gap_verified': False,
         }
 
         prior = resume_assignments.get(loc_str)
@@ -524,13 +640,22 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
                 state['assignments_no'], state['assignments_ch']
             )
             if signature in state['seen_assignments']:
-                state['status'] = 'nonconverged'
-                state['failure_reason'] = (
+                first_seen = state['seen_assignments'][signature]
+                state['status'] = CYCLE_APPROXIMATION_STATUS
+                state['termination_reason'] = (
                     f'assignment cycle detected at iteration {iteration}'
                 )
+                state['failure_reason'] = None
+                state['cycle_start_iteration'] = int(first_seen)
+                state['cycle_length'] = int(iteration - first_seen)
+                prior_evaluation = state['evaluated_assignments'].get(signature)
+                if prior_evaluation is not None:
+                    state['final_details'] = prior_evaluation['route_metrics']
+                    state['final_gap_override'] = prior_evaluation['gap']
+                    state['retained_state_gap_verified'] = True
                 active.remove(loc_str)
             else:
-                state['seen_assignments'].add(signature)
+                state['seen_assignments'][signature] = int(iteration)
         if not active:
             break
         iteration_started = time.perf_counter()
@@ -599,6 +724,13 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             state['final_details'] = final_details
             gap, selected = _relative_gap(final_details)
             state['history'].append(gap)
+            signature = _assignment_signature(
+                state['assignments_no'], state['assignments_ch']
+            )
+            state['evaluated_assignments'][signature] = {
+                'gap': float(gap),
+                'route_metrics': final_details,
+            }
             if gap <= float(alpha) or selected is None:
                 state['converged'] = gap <= float(alpha)
                 active.remove(loc_str)
@@ -641,6 +773,9 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
                 f'relative Nash gap {state["history"][-1] if state["history"] else float("inf"):.6g} '
                 f'exceeded alpha={float(alpha):.6g} after {iterations_completed} iterations'
             )
+        final_gap = state.get('final_gap_override')
+        if final_gap is None:
+            final_gap = state['history'][-1] if state['history'] else float('inf')
         result = {
             'assignments': {
                 'F1': state['assignments_no'],
@@ -648,12 +783,18 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             },
             'converged': state['converged'],
             'iterations': iterations_completed,
-            'final_gap': state['history'][-1] if state['history'] else float('inf'),
+            'final_gap': final_gap,
             'route_metrics': state['final_details'],
             'flow_data': state['flow_data'],
             'iteration_timings': state['iteration_timings'],
             'status': state['status'],
             'failure_reason': state['failure_reason'],
+            'termination_reason': state.get('termination_reason'),
+            'cycle_start_iteration': state.get('cycle_start_iteration'),
+            'cycle_length': state.get('cycle_length'),
+            'retained_state_gap_verified': bool(
+                state.get('retained_state_gap_verified', False)
+            ),
             'resumed_complete': bool(state.get('resumed_complete', False)),
             'route_assignments': [
                 {
@@ -675,6 +816,11 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             ],
             'network_hash': manifest['network_hash'],
         }
+        if state['status'] == CYCLE_APPROXIMATION_STATUS:
+            _promote_cycle_result(
+                result,
+                gap_verified=state.get('retained_state_gap_verified', False),
+            )
         assignments[loc_str] = result
         convergence_data[loc_str] = state['history']
 
@@ -692,11 +838,6 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             for key, value in assignments.items()
             if value.get('status') == 'failed'
         },
-        'nonconverged_configurations': {
-            key: value.get('failure_reason')
-            for key, value in assignments.items()
-            if value.get('status') == 'nonconverged'
-        },
         'iteration_timings': {
             key: value.get('iteration_timings', [])
             for key, value in assignments.items()
@@ -713,8 +854,9 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             if state.get('resumed_complete')
         ),
     }
-    with open(os.path.join(work_dir, 'queue_manifest.json'), 'w') as handle:
-        json.dump(manifest, handle, indent=2)
+    _write_queue_manifest(
+        os.path.join(work_dir, 'queue_manifest.json'), manifest, assignments
+    )
     if manifest['failed_configurations']:
         first_config, reason = next(iter(manifest['failed_configurations'].items()))
         raise RuntimeError(

@@ -956,6 +956,14 @@ def _generate_run_summary(experiment_dir, config, timing, cg_results, queue_resu
     lines.append("-" * 40)
     if queue_results:
         qc = queue_results.get('config', {})
+        lines.append(
+            f"  Assignment quality: {queue_results.get('assignment_quality', 'unknown')}"
+        )
+        if queue_results.get('uses_approximate_ne'):
+            lines.append(
+                "  WARNING: cycle states were retained as approximate assignments; "
+                "they are not verified Nash equilibria."
+            )
         lines.append(f"  K-routes:   {qc.get('K', 'N/A')}")
         lines.append(f"  MC reps:    {qc.get('N', 'N/A')}")
         lines.append(f"  Single-swap: {qc.get('single_swap', 'N/A')}")
@@ -1141,6 +1149,18 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
             "",
             "## Queue-Based Simulation Results",
             "",
+            f"**Assignment quality:** `{queue_results.get('assignment_quality', 'unknown')}`",
+            "",
+        ])
+        if queue_results.get('uses_approximate_ne'):
+            lines.extend([
+                "**Important limitation:** Better-response dynamics cycled. The "
+                "comparison below uses the current assignment retained at cycle "
+                "detection. These assignments are approximations and have not "
+                "been verified as Nash equilibria.",
+                "",
+            ])
+        lines.extend([
             "### Greedy",
             "",
             f"| Placement | Avg travel time |",
@@ -1218,7 +1238,7 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
     ])
     if queue_results:
         lines.extend([
-            f"| `queue/NE_path_assignments.pkl` | Queue NE route counts per config |",
+            f"| `queue/NE_path_assignments.pkl` | Queue route counts with exact/approximate status per config |",
             f"| `queue/comparison_results.json` | Greedy vs exhaustive results |",
             f"| `queue/ne_convergence.csv` | Per-config, per-iteration NE diff |",
             f"| `queue/traffic_inputs_*.csv` | Network CSVs for simulator |",
@@ -1572,6 +1592,7 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
             config, experiment_dir, all_opt_path,
             artifact_dir=network_artifact_dir,
             seed_manager=seed_manager,
+            resume=resume,
         )
         timing['queue_ne'] = time.time() - t0
         timing_recorder.add('queue_ne', timing['queue_ne'])
@@ -1583,6 +1604,13 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
             raise RuntimeError(
                 'Queue better-response search did not converge; comparison is '
                 f'not eligible: {queue_manifest["nonconverged_configurations"]}'
+            )
+        if queue_manifest.get('approximate_configurations'):
+            print(
+                'WARNING: cycle detection retained the current assignment as '
+                'an approximate equilibrium for '
+                f'{len(queue_manifest["approximate_configurations"])} '
+                'configurations. Downstream results will be labeled approximate.'
             )
 
         if convergence_data:
@@ -1702,10 +1730,17 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
     if os.path.isfile(bpr_manifest_path):
         with open(bpr_manifest_path) as handle:
             bpr_manifest = json.load(handle)
+    uses_approximate_ne = bool(
+        queue_results and queue_results.get('uses_approximate_ne', False)
+    )
+    completion_status = (
+        'complete_with_approximate_ne' if uses_approximate_ne else 'complete'
+    )
+    strict_eligible = not uses_approximate_ne
     summary_row = {
         'run_id': os.path.basename(experiment_dir),
-        'status': 'complete',
-        'eligible': True,
+        'status': completion_status,
+        'eligible': strict_eligible,
         'network_hash': network_hash,
         'nodes': network_node_count,
         'edges': network_edge_count,
@@ -1736,7 +1771,9 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
     completed_manifest['artifacts'] = inventory
     atomic_write_json(run_manifest_path, completed_manifest)
     atomic_write_json(os.path.join(experiment_dir, "status.json"), {
-        "status": "complete", "stage": "complete", "eligible": True,
+        "status": completion_status, "stage": "complete",
+        "eligible": strict_eligible,
+        "uses_approximate_ne": uses_approximate_ne,
         "config_digest": digest, "network_hash": network_hash,
         "timing": timing, "artifact_bytes": inventory["total_bytes"],
         **process_provenance(),

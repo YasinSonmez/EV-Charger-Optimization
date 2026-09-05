@@ -17,7 +17,7 @@ import pandas as pd
 warnings.filterwarnings('ignore')
 
 from queue_sim import Runner, QUEUE_SIM_AVAILABLE
-from queue_sim.find_nash import _prune_flow_data
+from queue_sim.find_nash import CYCLE_APPROXIMATION_STATUS, _prune_flow_data
 from src.contracts import normalize_od_demand, SeedManager
 from src.network_artifact import load_network_artifact
 from src.run_state import available_cpus
@@ -25,6 +25,16 @@ from src.run_state import available_cpus
 
 def _placement_seed(rep, positions):
     return rep * 100000 + sum(sorted(set(positions)))
+
+
+def _assignment_is_usable(value):
+    """Accept exact NE or explicitly labeled retained cycle approximations."""
+    if not isinstance(value, dict) or value.get('status') == 'failed':
+        return False
+    return bool(value.get('converged', False)) or (
+        value.get('status') == CYCLE_APPROXIMATION_STATUS
+        and bool(value.get('approximate_equilibrium', False))
+    )
 
 
 def _run_sim(positions, data, ne, k, demand_classes, input_paths, output_root,
@@ -184,11 +194,22 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
     invalid = {
         key: value.get('status', 'invalid')
         for key, value in ne.items()
-        if not isinstance(value, dict) or not value.get('converged', False)
+        if not _assignment_is_usable(value)
     }
     if invalid:
         raise RuntimeError(
-            f'Queue comparison requires converged Nash assignments: {invalid}'
+            'Queue comparison requires exact equilibria or explicitly labeled '
+            f'cycle-state approximations: {invalid}'
+        )
+    approximate = sorted(
+        key for key, value in ne.items()
+        if value.get('status') == CYCLE_APPROXIMATION_STATUS
+    )
+    if approximate:
+        print(
+            'WARNING: queue comparison is using current assignments retained '
+            f'at cycle detection for {len(approximate)} configurations. '
+            'These are approximations, not verified Nash equilibria.'
         )
     demand_classes = normalize_od_demand(data['run_configuration']['od_demand'])
     seed = seed_manager.seed if seed_manager is not None else config.pipeline.get('random_seed', 0)
@@ -244,6 +265,17 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
         if best_e_time > 0 else 0.0
     )
     results = {
+        'status': (
+            'complete_with_approximate_cycle_states'
+            if approximate else 'complete'
+        ),
+        'uses_approximate_ne': bool(approximate),
+        'exact_ne_eligible': not approximate,
+        'approximate_configurations': approximate,
+        'assignment_quality': (
+            'current_state_at_cycle_detection'
+            if approximate else 'converged_nash'
+        ),
         'best_greedy': best_greedy,
         'best_exhaustive': best_exhaustive,
         'suboptimality_pct': float(suboptimality),

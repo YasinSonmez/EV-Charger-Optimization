@@ -319,6 +319,7 @@ def _validate_queue_outputs(
         errors.append(f"queue validation: invalid run_configuration demand ({exc})")
 
     nonconverged: list[str] = []
+    approximate: list[str] = []
     if isinstance(ne, Mapping):
         if manifest and manifest.get("configuration_count") != len(ne):
             errors.append("queue_manifest.json: configuration_count does not match NE pickle")
@@ -330,7 +331,9 @@ def _validate_queue_outputs(
                 errors.append(f"NE placement {placement!r}: network_hash mismatch")
             if result.get("status") == "failed":
                 errors.append(f"NE placement {placement!r}: status=failed")
-            if not bool(result.get("converged", False)):
+            if result.get("status") == "approximate_cycle_state":
+                approximate.append(str(placement))
+            elif not bool(result.get("converged", False)):
                 nonconverged.append(str(placement))
             assignments = result.get("assignments", {})
             if not isinstance(assignments, Mapping):
@@ -371,6 +374,8 @@ def _validate_queue_outputs(
         "configuration_count": len(ne) if isinstance(ne, Mapping) else 0,
         "comparison_present": comparison is not None,
         "nonconverged_configurations": nonconverged,
+        "approximate_configurations": approximate,
+        "exact_ne_eligible": not approximate and not nonconverged,
     }
 
 

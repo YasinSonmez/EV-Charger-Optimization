@@ -128,6 +128,29 @@ def test_two_od_full_artifact_contract_passes(tmp_path):
     assert result["queue"]["configuration_count"] == 1
 
 
+def test_cycle_approximation_is_valid_but_not_exact_ne_eligible(tmp_path):
+    _write_fixture(tmp_path)
+    ne_path = tmp_path / "queue" / "NE_path_assignments.pkl"
+    with ne_path.open("rb") as handle:
+        assignments = pickle.load(handle)
+    assignments["2"].update({
+        "status": "approximate_cycle_state",
+        "converged": False,
+        "approximate_equilibrium": True,
+        "exact_ne_eligible": False,
+        "termination_reason": "assignment cycle detected at iteration 4",
+    })
+    with ne_path.open("wb") as handle:
+        pickle.dump(assignments, handle)
+
+    result = validate_experiment_outputs(tmp_path, require_queue=True)
+
+    assert result["valid"], result["errors"]
+    assert result["queue"]["approximate_configurations"] == ["2"]
+    assert result["queue"]["nonconverged_configurations"] == []
+    assert result["queue"]["exact_ne_eligible"] is False
+
+
 def test_output_validator_detects_network_hash_drift(tmp_path):
     _write_fixture(tmp_path)
     all_opt_path = tmp_path / "all_optimization_results.pkl"
