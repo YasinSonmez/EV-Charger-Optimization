@@ -19,6 +19,7 @@ import numpy as np
 
 
 VEHICLE_TYPES = ("F1", "F2")
+BPR_CALIBRATION_VERSION = "offered_cohort_entry_wait_v2"
 
 
 @dataclass(frozen=True)

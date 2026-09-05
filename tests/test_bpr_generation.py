@@ -9,8 +9,11 @@ import pytest
 
 from queue_sim import QUEUE_SIM_AVAILABLE
 from queue_sim.bpr_data_generator import (
+    BPR_CALIBRATION_VERSION,
     _bpr_link_worker,
     _capacity_fraction_flow_plan,
+    _configure_probe_capacity,
+    _entry_wait_inclusive_target_times,
     _free_flow_time,
     _proxy_row,
     _synthetic_boundary_overlay,
@@ -142,6 +145,78 @@ def test_capacity_fraction_plan_rejects_duplicate_agent_counts():
             capacity_per_lane=1.0,
             calibration_window_hours=1.0,
         )
+
+
+def test_probe_continuation_is_strictly_nonbinding():
+    runner = SimpleNamespace(links_df=pd.DataFrame({
+        'link_id': [1, 2], 'lanes': [1.0, 3.0],
+    }))
+    _configure_probe_capacity(
+        runner, {'lanes': 2.0}, [{'link_id': 1}, {'link_id': 2}],
+        capacity_multiplier=10.0,
+    )
+    assert runner.links_df['lanes'].tolist() == [20.0, 20.0]
+
+
+def test_entry_wait_inclusive_cost_subtracts_only_continuation_time():
+    runner = SimpleNamespace(sim=SimpleNamespace(
+        all_links={
+            7: SimpleNamespace(completed_travel_time_list=[[0, 10.0], [1, 12.0]]),
+            8: SimpleNamespace(completed_travel_time_list=[[0, 3.0], [1, 4.0]]),
+        },
+        all_agents={
+            0: SimpleNamespace(arrival_time=15.0, dept_time=0.0),
+            1: SimpleNamespace(arrival_time=20.0, dept_time=2.0),
+        },
+    ))
+    values = _entry_wait_inclusive_target_times(runner, 7, [8])
+    assert values.tolist() == [12.0, 14.0]
+
+
+@pytest.mark.skipif(not QUEUE_SIM_AVAILABLE, reason="queue simulator unavailable")
+def test_strict_worker_uses_cohort_units_and_simulates_zero_probe(tmp_path):
+    nodes = pd.DataFrame({
+        'node_id': [0, 1, 2], 'node_osmid': [0, 1, 2],
+        'lon': [0.0, 1.0, 2.0], 'lat': [0.0, 0.0, 0.0],
+        'type': ['real', 'real', 'real'],
+    })
+    edges = pd.DataFrame({
+        'link_id': [0, 1], 'start_node_id': [0, 1],
+        'end_node_id': [1, 2], 'type': ['road', 'road'],
+        'length': [100.0, 100.0], 'maxmph': [25.0, 25.0],
+        'lanes': [1, 1], 'capacity': [1900.0, 1900.0],
+        'start_osmid': [0, 1], 'end_osmid': [1, 2],
+        'edge_key': ['target', 'continuation'],
+        'geometry': ['LINESTRING (0 0, 1 0)', 'LINESTRING (1 0, 2 0)'],
+    })
+    artifact = tmp_path / 'network'
+    write_network_artifact(nodes, edges, artifact)
+    flow_spec = {
+        'mode': 'capacity_fraction_strict',
+        'flow_fractions': [0.0, 0.5, 2.0],
+        'capacity_source': 'simulator', 'capacity_per_lane': 1900.0,
+        'calibration_window_hours': 0.01, 'route_mode': 'link_probe',
+        'simulation_horizon': 1000, 'resume': False,
+        'calibration_version': BPR_CALIBRATION_VERSION,
+        'probe_continuation_capacity_multiplier': 10.0,
+    }
+    result = _bpr_link_worker((
+        edges.iloc[0].to_dict(), str(artifact / 'nodes.csv'),
+        str(artifact / 'edges.csv'), flow_spec, str(tmp_path / 'sweeps'), 42,
+    ))
+    assert result['errors'] == []
+    assert result['calibration_version'] == BPR_CALIBRATION_VERSION
+    assert result['capacity_rate'] == 1900.0
+    assert result['capacity_count'] == 19.0
+    assert result['x_vector'] == [0.0, 10.0, 38.0]
+    assert result['observations'][0]['simulated_demand_count'] == 1
+    assert result['observations'][0]['status'] == 'simulated_zero_flow_probe'
+    assert result['observations'][1]['requested_flow_vph'] == 950.0
+    assert all(
+        item['measurement'] == 'offered_demand_entry_wait_inclusive'
+        for item in result['observations']
+    )
+    assert result['y_vector'][-1] > result['y_vector'][0]
 
 
 def test_cg_provenance_policy_reports_or_rejects_active_degraded_links():

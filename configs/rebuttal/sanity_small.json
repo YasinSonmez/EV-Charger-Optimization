@@ -82,10 +82,9 @@
     "cg_fit_policy": "validated_only",
     "bpr_generation": {
       "mode": "capacity_fraction_strict",
-      "num_samples": 17,
+      "num_samples": 9,
       "flow_fractions": [
-        0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1,
-        1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875, 2
+        0, 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2
       ],
       "capacity_source": "simulator",
       "capacity_per_lane": 1900,
@@ -99,6 +98,9 @@
       "fit_validation": "full",
       "fallback_policy": "none",
       "fixed_references": true,
+      "min_r2": 0.95,
+      "fit_screening": "none",
+      "accept_low_r2": false,
       "save_fit_plots": false,
       "force_regenerate": false,
       "resume": true

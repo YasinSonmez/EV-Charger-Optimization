@@ -31,7 +31,9 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.config import Config, NetworkConfig
-from src.contracts import SeedManager, TimingRecorder, stable_json
+from src.contracts import (
+    BPR_CALIBRATION_VERSION, SeedManager, TimingRecorder, stable_json,
+)
 from src.network_artifact import load_network_artifact
 from src.run_state import (
     atomic_write_json, available_cpus, config_digest,
@@ -84,7 +86,9 @@ def _fill_missing_links_to_count(pandas_df, target_count, allow_missing=False):
     return df
 
 
-def _ensure_bpr_reference_metadata(pandas_df, artifact_dir, capacity_source='simulator', capacity_per_lane=1900.0):
+def _ensure_bpr_reference_metadata(
+        pandas_df, artifact_dir, capacity_source='simulator',
+        capacity_per_lane=1900.0, calibration_window_hours=0.1):
     """Attach canonical FFT/capacity references when fitting old observation files."""
     if artifact_dir is None:
         return pandas_df
@@ -100,10 +104,12 @@ def _ensure_bpr_reference_metadata(pandas_df, artifact_dir, capacity_source='sim
         if capacity_source == 'artifact':
             output['calibration_capacity'] = output['link_id'].map(
                 lambda link_id: float(by_id.loc[int(link_id), 'capacity'])
+                * float(calibration_window_hours)
             )
         else:
             output['calibration_capacity'] = output['link_id'].map(
-                lambda link_id: float(by_id.loc[int(link_id), 'lanes']) * float(capacity_per_lane)
+                lambda link_id: float(by_id.loc[int(link_id), 'lanes'])
+                * float(capacity_per_lane) * float(calibration_window_hours)
             )
     return output
 
@@ -145,12 +151,28 @@ def _bpr_request_manifest_fields(network_hash, bpr_config, seed):
         'fitter_version': (
             'historical_v1'
             if requested_mode == 'historical_artifact_compatible'
-            else 'capacity_fraction_v1'
+            else BPR_CALIBRATION_VERSION
         ),
         'route_semantics': (
             'measured_target_flow_with_straight_ahead_context'
             if requested_mode == 'historical_artifact_compatible'
-            else bpr_config.get('route_mode', 'link_probe')
+            else 'offered_cohort_entry_wait_inclusive_nonbinding_continuation'
+        ),
+        'flow_fractions': (
+            [float(value) for value in (bpr_config.get('flow_fractions') or [])]
+            if requested_mode == 'capacity_fraction_strict' else None
+        ),
+        'capacity_source': (
+            bpr_config.get('capacity_source', 'simulator')
+            if requested_mode == 'capacity_fraction_strict' else None
+        ),
+        'capacity_per_lane': (
+            float(bpr_config.get('capacity_per_lane', 1900.0))
+            if requested_mode == 'capacity_fraction_strict' else None
+        ),
+        'calibration_window_hours': (
+            float(bpr_config.get('calibration_window_hours', 0.1))
+            if requested_mode == 'capacity_fraction_strict' else None
         ),
         'fit_screening': bpr_config.get('fit_screening', 'none'),
         'correlation_threshold': float(bpr_config.get('correlation_threshold', 0.0)),
@@ -163,6 +185,9 @@ def _bpr_request_manifest_fields(network_hash, bpr_config, seed):
         'synthetic_context_length_m': float(
             bpr_config.get('synthetic_context_length_m', 1.0)
         ),
+        'probe_continuation_capacity_multiplier': float(
+            bpr_config.get('probe_continuation_capacity_multiplier', 10.0)
+        ) if requested_mode == 'capacity_fraction_strict' else None,
         'simulation_horizon': int(bpr_config.get('simulation_horizon', 10801)),
     }
 
@@ -182,6 +207,8 @@ def _bpr_manifest_is_compatible(manifest_path, network_hash, bpr_config, seed):
         if key in {
             'max_flow', 'correlation_threshold', 'variation_ratio_threshold',
             'synthetic_context_capacity_multiplier', 'synthetic_context_length_m',
+            'capacity_per_lane', 'calibration_window_hours',
+            'probe_continuation_capacity_multiplier',
         } and actual is not None:
             if not np.isclose(float(actual), expected):
                 return False
@@ -278,6 +305,7 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
                 pandas_df, artifact_dir,
                 capacity_source=bpr_config.get('capacity_source', 'simulator'),
                 capacity_per_lane=bpr_config.get('capacity_per_lane', 1900.0),
+                calibration_window_hours=bpr_config.get('calibration_window_hours', 0.1),
             )
         model_fitter = TrafficModelFitter(pandas_df=pandas_df)
         model_fitter.parallel_fit_and_evaluate(
@@ -341,6 +369,9 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
             synthetic_context_length_m=bpr_config.get(
                 'synthetic_context_length_m', 1.0
             ),
+            probe_continuation_capacity_multiplier=bpr_config.get(
+                'probe_continuation_capacity_multiplier', 10.0
+            ),
             simulation_horizon=bpr_config.get(
                 'simulation_horizon',
                 10801,
@@ -374,6 +405,7 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
                 pandas_df, artifact_dir,
                 capacity_source=bpr_config.get('capacity_source', 'simulator'),
                 capacity_per_lane=bpr_config.get('capacity_per_lane', 1900.0),
+                calibration_window_hours=bpr_config.get('calibration_window_hours', 0.1),
             )
         model_fitter = TrafficModelFitter(pandas_df=pandas_df)
         model_fitter.parallel_fit_and_evaluate(
@@ -455,16 +487,39 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
             'random_seed': int(seed_manager.seed if seed_manager is not None else 0),
             'fitter_version': (
                 'historical_v1' if bpr_mode == 'historical_artifact_compatible'
-                else 'capacity_fraction_v1'
+                else BPR_CALIBRATION_VERSION
             ),
             'historical_reference_commit': bpr_config.get('historical_reference_commit') if bpr_mode == 'historical_artifact_compatible' else None,
-            'route_semantics': 'measured_target_flow_with_straight_ahead_context' if bpr_mode == 'historical_artifact_compatible' else bpr_config.get('route_mode', 'link_probe'),
+            'route_semantics': (
+                'measured_target_flow_with_straight_ahead_context'
+                if bpr_mode == 'historical_artifact_compatible'
+                else 'offered_cohort_entry_wait_inclusive_nonbinding_continuation'
+            ),
             'missing_context_policy': bpr_config.get('missing_context_policy', 'synthetic_boundary'),
             'synthetic_context_capacity_multiplier': float(
                 bpr_config.get('synthetic_context_capacity_multiplier', 10.0)
             ),
             'synthetic_context_length_m': float(
                 bpr_config.get('synthetic_context_length_m', 1.0)
+            ),
+            'probe_continuation_capacity_multiplier': float(
+                bpr_config.get('probe_continuation_capacity_multiplier', 10.0)
+            ) if bpr_mode == 'capacity_fraction_strict' else None,
+            'flow_fractions': (
+                [float(value) for value in (bpr_config.get('flow_fractions') or [])]
+                if bpr_mode == 'capacity_fraction_strict' else None
+            ),
+            'capacity_source': (
+                bpr_config.get('capacity_source', 'simulator')
+                if bpr_mode == 'capacity_fraction_strict' else None
+            ),
+            'capacity_per_lane': (
+                float(bpr_config.get('capacity_per_lane', 1900.0))
+                if bpr_mode == 'capacity_fraction_strict' else None
+            ),
+            'calibration_window_hours': (
+                float(bpr_config.get('calibration_window_hours', 0.1))
+                if bpr_mode == 'capacity_fraction_strict' else None
             ),
             'simulation_horizon': int(
                 bpr_config.get(
@@ -699,14 +754,22 @@ def _plot_bpr_fit_samples(pandas_df, output_path, n_random=20, n_worst=10, seed=
                     xv = row['x_vector'] if hasattr(row['x_vector'], '__len__') else []
                     yv = row['y_vector'] if hasattr(row['y_vector'], '__len__') else []
                     if len(xv) > 0:
-                        ax.scatter(xv, yv, s=5, alpha=0.7)
+                        capacity = float(row.get('cap_fit', 1.0))
+                        normalized_x = np.asarray(xv, dtype=float) / capacity
+                        ax.scatter(normalized_x, yv, s=7, alpha=0.75)
+                        zero = np.isclose(normalized_x, 0.0)
+                        if zero.any():
+                            ax.scatter(
+                                normalized_x[zero], np.asarray(yv)[zero], s=18,
+                                color='darkorange', marker='D', zorder=3,
+                            )
                         a_fit = row.get('a_fit', np.nan)
                         fft_fit = row.get('fft_fit', np.nan)
                         if np.isfinite(a_fit) and np.isfinite(fft_fit):
                             if float(a_fit) > 0:
-                                xs = np.linspace(min(xv), max(xv), 100)
-                                a, b, c, f = a_fit, row['b_fit'], row['cap_fit'], fft_fit
-                                ys = f * (1 + a * (xs/c)**b)
+                                xs = np.linspace(min(normalized_x), max(normalized_x), 100)
+                                a, b, f = a_fit, row['b_fit'], fft_fit
+                                ys = f * (1 + a * xs**b)
                                 ax.plot(xs, ys, 'r-', linewidth=1, label='Full BPR fit')
                             else:
                                 ax.axhline(
@@ -718,15 +781,20 @@ def _plot_bpr_fit_samples(pandas_df, output_path, n_random=20, n_worst=10, seed=
                     pass
             r2 = row.get('R^2', np.nan)
             status = row.get('fit_status', 'unknown')
-            source = row.get('observation_source', 'unknown')
             ax.set_title(
-                f'Link {int(row["link_id"])} {status}/{source} R²={r2:.3f}',
+                f'Link {int(row["link_id"])} {status} R²={r2:.3f}',
                 fontsize=6,
             )
-        ax.set_xticks([]); ax.set_yticks([])
+            ax.axvline(1.0, color='0.6', linestyle=':', linewidth=0.6)
+            ax.set_xticks([0, 1, 2])
+            ax.tick_params(axis='both', labelsize=5)
+        else:
+            ax.set_xticks([]); ax.set_yticks([])
     for i in range(n, rows*cols):
         axes[i].set_visible(False)
     fig.suptitle('BPR Fit Diagnostics — Random + Worst-R² Links', fontsize=12, fontweight='bold')
+    fig.supxlabel('Offered cohort / capacity (orange diamond = zero-flow probe)', fontsize=9)
+    fig.supylabel('Entry-wait-inclusive travel time (s)', fontsize=9)
     fig.tight_layout()
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -955,6 +1023,48 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
         f"| Queue N (MC reps) | {config.get_queue_param('N')} |",
         f"| Queue single-swap | {config.get_queue_param('single_swap')} |",
     ]
+
+    bpr_manifest_path = os.path.join(experiment_dir, 'bpr', 'bpr_manifest.json')
+    bpr_results_path = os.path.join(experiment_dir, 'bpr', 'fitter_results.csv')
+    if os.path.isfile(bpr_manifest_path):
+        with open(bpr_manifest_path) as handle:
+            bpr_manifest = json.load(handle)
+        lines.extend([
+            "",
+            "## BPR Calibration",
+            "",
+            f"- Method version: `{bpr_manifest.get('fitter_version', 'unknown')}`",
+            f"- Route measurement: `{bpr_manifest.get('route_semantics', 'unknown')}`",
+            f"- Flow unit: `{bpr_manifest.get('flow_unit', 'unknown')}`",
+            f"- Calibration window: {bpr_manifest.get('calibration_window_hours', 'N/A')} hours",
+            f"- Flow fractions: {bpr_manifest.get('flow_fractions', 'N/A')}",
+            f"- Fit statuses: {bpr_manifest.get('fit_status_counts', {})}",
+        ])
+        if os.path.isfile(bpr_results_path):
+            bpr_results = pd.read_csv(bpr_results_path)
+            r2 = pd.to_numeric(
+                bpr_results.get('R^2', pd.Series(dtype=float)), errors='coerce'
+            ).dropna()
+            rmse = pd.to_numeric(
+                bpr_results.get('fit_rmse_seconds', pd.Series(dtype=float)),
+                errors='coerce'
+            ).dropna()
+            median_relative = pd.to_numeric(
+                bpr_results.get(
+                    'fit_median_relative_error', pd.Series(dtype=float)
+                ), errors='coerce'
+            ).dropna()
+            if not r2.empty:
+                lines.append(
+                    f"- R² min / median: {r2.min():.3f} / {r2.median():.3f}"
+                )
+            if not rmse.empty:
+                lines.append(f"- Median link RMSE: {rmse.median():.2f} seconds")
+            if not median_relative.empty:
+                lines.append(
+                    "- Median of per-link median relative errors: "
+                    f"{100 * median_relative.median():.1f}%"
+                )
 
     if network_stages:
         lines.extend([

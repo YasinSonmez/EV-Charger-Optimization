@@ -506,9 +506,13 @@ class Network(RoadNet):
                 })
             )
             if policy == 'validated_only':
+                validated_sources = {
+                    'simulated_contextual', 'simulated_link_probe',
+                    'simulated_synthetic_context',
+                }
                 rejected = rejected | (
                     (~derived_mask)
-                    & ((statuses != 'full') | (sources != 'simulated_contextual'))
+                    & ((statuses != 'full') | ~sources.isin(validated_sources))
                 )
             if rejected.any():
                 errors.append(

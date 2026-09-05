@@ -339,6 +339,15 @@ class TrafficModelFitter:
         # Update DataFrame with fitted parameters and R^2 values
         if 'honest_R2' not in self.df.columns:
             self.df['honest_R2'] = np.nan
+        for column in (
+            'fit_rmse_seconds', 'fit_nrmse_mean', 'fit_median_relative_error',
+            'fit_p95_relative_error', 'fit_max_relative_error',
+            'observation_max_relative_drop',
+        ):
+            if column not in self.df.columns:
+                self.df[column] = np.nan
+        if 'observation_decrease_count' not in self.df.columns:
+            self.df['observation_decrease_count'] = 0
         if 'fallback_reason' not in self.df.columns:
             self.df['fallback_reason'] = ''
         else:
@@ -395,16 +404,51 @@ class TrafficModelFitter:
             self.df.loc[row_mask, 'fallback_reason'] = reason
             try:
                 values = np.asarray(self.df.loc[row_mask, 'y_vector'].iloc[0], dtype=float)
+                prediction = np.full_like(values, np.nan, dtype=float)
                 if is_constant:
                     prediction = np.full_like(values, float(fft_fit))
                     honest = float(r2_score(values, prediction)) if np.std(values) > 0 else 1.0
                 elif np.isfinite(a_fit) and np.isfinite(b_fit) and np.isfinite(cap_fit) and np.isfinite(fft_fit):
-                    honest = float(r2_score(values, model(
+                    prediction = model(
                         np.asarray(self.df.loc[row_mask, 'x_vector'].iloc[0], dtype=float),
-                        a_fit, b_fit, cap_fit, fft_fit)))
+                        a_fit, b_fit, cap_fit, fft_fit)
+                    honest = float(r2_score(values, prediction))
                 else:
                     honest = np.nan
                 self.df.loc[row_mask, 'honest_R2'] = honest
+                observed = np.asarray(values, dtype=float)
+                if not np.all(np.isfinite(prediction)):
+                    continue
+                residual = prediction - observed
+                relative = np.abs(residual) / np.maximum(
+                    np.abs(observed), np.finfo(float).eps
+                )
+                drops = np.maximum(0.0, -np.diff(observed))
+                relative_drops = drops / np.maximum(
+                    np.abs(observed[:-1]), np.finfo(float).eps
+                )
+                self.df.loc[row_mask, 'fit_rmse_seconds'] = float(
+                    np.sqrt(np.mean(np.square(residual)))
+                )
+                self.df.loc[row_mask, 'fit_nrmse_mean'] = float(
+                    np.sqrt(np.mean(np.square(residual)))
+                    / max(float(np.mean(np.abs(observed))), np.finfo(float).eps)
+                )
+                self.df.loc[row_mask, 'fit_median_relative_error'] = float(
+                    np.median(relative)
+                )
+                self.df.loc[row_mask, 'fit_p95_relative_error'] = float(
+                    np.quantile(relative, 0.95)
+                )
+                self.df.loc[row_mask, 'fit_max_relative_error'] = float(
+                    np.max(relative)
+                )
+                self.df.loc[row_mask, 'observation_decrease_count'] = int(
+                    np.sum(np.diff(observed) < 0)
+                )
+                self.df.loc[row_mask, 'observation_max_relative_drop'] = float(
+                    np.max(relative_drops) if relative_drops.size else 0.0
+                )
             except (ValueError, TypeError, FloatingPointError):
                 self.df.loc[row_mask, 'honest_R2'] = np.nan
         target_dir = output_dir or '.'

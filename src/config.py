@@ -79,6 +79,7 @@ PIPELINE_DEFAULTS = {
         "missing_context_policy": "synthetic_boundary",
         "synthetic_context_capacity_multiplier": 10.0,
         "synthetic_context_length_m": 1.0,
+        "probe_continuation_capacity_multiplier": 10.0,
         "simulation_horizon": 10801,
         "require_full_fit": False,
         "min_r2": 0.0,
@@ -222,7 +223,8 @@ class Config:
         if raw_bpr.get("mode", inferred_bpr_mode) == "capacity_fraction_strict":
             strict_bpr_defaults = {
                 "mode": "capacity_fraction_strict",
-                "flow_fractions": [0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0, 10.0],
+                "num_samples": 9,
+                "flow_fractions": [0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
                 "fit_validation": "full",
                 "fallback_policy": "none",
                 "route_mode": "link_probe",
@@ -230,6 +232,9 @@ class Config:
                 "failure_policy": "fail_fast",
                 "allow_proxy": False,
                 "require_full_fit": True,
+                "min_r2": 0.95,
+                "fit_screening": "none",
+                "accept_low_r2": False,
             }
         pipeline["bpr_generation"] = {
             **PIPELINE_DEFAULTS["bpr_generation"],
@@ -357,6 +362,11 @@ class Config:
             raise ValueError(
                 "pipeline.bpr_generation.synthetic_context_length_m must be positive"
             )
+        if float(bpr.get("probe_continuation_capacity_multiplier", 10.0)) <= 1:
+            raise ValueError(
+                "pipeline.bpr_generation.probe_continuation_capacity_multiplier "
+                "must exceed 1"
+            )
         if int(bpr.get("simulation_horizon", 10801)) < 1:
             raise ValueError("pipeline.bpr_generation.simulation_horizon must be >= 1")
         if int(bpr.get("min_samples", 2)) < 2:
@@ -369,6 +379,20 @@ class Config:
             if not fractions or any(value < 0 for value in fractions) or len(set(fractions)) != len(fractions):
                 raise ValueError(
                     "pipeline.bpr_generation.flow_fractions must be unique non-negative values"
+                )
+            if bpr.get("mode") == "capacity_fraction_strict" and (
+                fractions[0] != 0.0
+                or any(right <= left for left, right in zip(fractions, fractions[1:]))
+            ):
+                raise ValueError(
+                    "strict BPR flow_fractions must start at 0 and be strictly increasing"
+                )
+            if (
+                bpr.get("mode") == "capacity_fraction_strict"
+                and int(bpr.get("num_samples", len(fractions))) != len(fractions)
+            ):
+                raise ValueError(
+                    "strict BPR num_samples must equal len(flow_fractions)"
                 )
             if bpr.get("capacity_source", "simulator") not in {"simulator", "artifact"}:
                 raise ValueError(

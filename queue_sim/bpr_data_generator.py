@@ -15,7 +15,7 @@ import pandas as pd
 warnings.filterwarnings('ignore')
 
 from queue_sim import Runner, QUEUE_SIM_AVAILABLE
-from src.contracts import SeedManager
+from src.contracts import BPR_CALIBRATION_VERSION, SeedManager
 from src.network_artifact import load_network_artifact
 from src.road_network import RoadNet
 from src.run_state import atomic_write_json, available_cpus
@@ -198,9 +198,13 @@ def _probe_continuation(runner, link_record):
     return continuation
 
 
-def _configure_probe_capacity(runner, target_record, continuation_links):
+def _configure_probe_capacity(runner, target_record, continuation_links,
+                              capacity_multiplier=10.0):
     """Prevent the calibration-only continuation from becoming a bottleneck."""
     target_lanes = float(target_record.get('lanes', 1.0) or 1.0)
+    multiplier = float(capacity_multiplier)
+    if not np.isfinite(multiplier) or multiplier <= 1.0:
+        raise ValueError('probe continuation capacity multiplier must exceed 1')
     continuation_ids = {
         int(item['link_id']) for item in continuation_links
     }
@@ -208,8 +212,54 @@ def _configure_probe_capacity(runner, target_record, continuation_links):
         return
     mask = runner.links_df.link_id.astype(int).isin(continuation_ids)
     runner.links_df.loc[mask, 'lanes'] = runner.links_df.loc[mask, 'lanes'].astype(float).clip(
-        lower=target_lanes
+        lower=target_lanes * multiplier
     )
+
+
+def _entry_wait_inclusive_target_times(runner, target_link_id,
+                                       continuation_link_ids):
+    """Return per-agent target costs including the queue before link entry.
+
+    A probe trip starts at the target's upstream node and finishes after its
+    calibration-only continuation links. Total trip time therefore contains
+    the upstream admission wait, target traversal, and continuation travel.
+    Subtracting completed continuation durations leaves the first two terms:
+    the generalized link cost faced by offered demand.
+    """
+    continuation_durations = {}
+    for link_id in continuation_link_ids:
+        link = runner.sim.all_links.get(int(link_id))
+        if link is None:
+            raise RuntimeError(f'missing continuation link {link_id}')
+        for agent_id, duration in link.completed_travel_time_list:
+            continuation_durations.setdefault(int(agent_id), 0.0)
+            continuation_durations[int(agent_id)] += float(duration)
+
+    target = runner.sim.all_links.get(int(target_link_id))
+    if target is None:
+        raise RuntimeError(f'missing target link {target_link_id}')
+    target_agents = {int(agent_id) for agent_id, _ in target.completed_travel_time_list}
+    values = []
+    for agent_id in sorted(target_agents):
+        agent = runner.sim.all_agents[int(agent_id)]
+        if not np.isfinite(agent.arrival_time):
+            raise RuntimeError(f'agent {agent_id} did not finish its probe route')
+        if agent_id not in continuation_durations:
+            raise RuntimeError(
+                f'agent {agent_id} has no completed continuation-link duration'
+            )
+        value = (
+            float(agent.arrival_time) - float(agent.dept_time)
+            - continuation_durations[agent_id]
+        )
+        if not np.isfinite(value) or value <= 0:
+            raise RuntimeError(
+                f'agent {agent_id} produced invalid target cost {value}'
+            )
+        values.append(value)
+    if not values:
+        raise RuntimeError('target link did not produce an entry-wait-inclusive cost')
+    return np.asarray(values, dtype=float)
 
 
 def _synthetic_boundary_overlay(nodes_csv, edges_csv, link_record,
@@ -390,7 +440,11 @@ def _bpr_link_worker(job):
         if isinstance(flow_spec, dict) and flow_spec.get("resume", False) and os.path.exists(checkpoint_path):
             with open(checkpoint_path) as handle:
                 cached = json.load(handle)
-            if cached.get("complete") and int(cached.get("link_id", -1)) == link_id:
+            if (
+                cached.get("complete")
+                and int(cached.get("link_id", -1)) == link_id
+                and cached.get('calibration_version') == flow_spec.get('calibration_version')
+            ):
                 cached["resumed"] = True
                 return cached
         historical_mode = (
@@ -415,7 +469,14 @@ def _bpr_link_worker(job):
                 calibration_window_hours=flow_spec.get('calibration_window_hours', 0.1),
             )
             result['capacity_rate'] = capacity_rate
+            result['capacity_count'] = (
+                capacity_rate
+                * float(flow_spec.get('calibration_window_hours', 0.1))
+            )
             result['flow_plan'] = flow_plan
+            result['calibration_version'] = flow_spec.get(
+                'calibration_version', BPR_CALIBRATION_VERSION
+            )
         else:
             # Backward-compatible worker contract for small tests and legacy
             # callers that already provide absolute simulator counts.
@@ -501,7 +562,10 @@ def _bpr_link_worker(job):
                 'context_mode': 'contextual' if route_mode == 'contextual' else route_mode,
                 'synthetic_link_ids': [],
                 'missing_context': [],
-                'observation_source': 'simulated_contextual',
+                'observation_source': (
+                    'simulated_link_probe'
+                    if route_mode == 'link_probe' else 'simulated_contextual'
+                ),
             })
         if route_mode == 'link_probe':
             sa_ol = _probe_continuation(finder, link_record)
@@ -509,7 +573,13 @@ def _bpr_link_worker(job):
                 raise RuntimeError(
                     f"link {link_id} has no outgoing continuation for link-level BPR probe"
                 )
-            _configure_probe_capacity(finder, link_record, sa_ol)
+            _configure_probe_capacity(
+                finder, link_record, sa_ol,
+                capacity_multiplier=(
+                    flow_spec.get('probe_continuation_capacity_multiplier', 10.0)
+                    if isinstance(flow_spec, dict) else 10.0
+                ),
+            )
         if route_mode == 'contextual' and sa_il is not None and sa_ol is not None:
             link_orig = int(sa_il['start_node_id'])
             link_dest = int(sa_ol['end_node_id'])
@@ -524,49 +594,27 @@ def _bpr_link_worker(job):
         for flow_index, flow_item in enumerate(flow_plan):
             flow_rate = float(flow_item['flow_rate'])
             demand_count = int(flow_item['demand_count'])
+            simulated_demand_count = max(1, demand_count)
             flow_dir = os.path.join(link_dir, f'flow_{flow_index}')
             os.makedirs(flow_dir, exist_ok=True)
-            if demand_count == 0:
-                # A zero-demand queue run creates no target-link observation.
-                # The BPR baseline is exactly the canonical link free-flow
-                # time, so record it directly as the 0.0C observation.
-                result['x_vector'].append(flow_rate)
-                result['y_vector'].append(_free_flow_time(link_record))
-                result['observations'].append({
-                    'fraction': flow_item.get('fraction'),
-                    'requested_flow': flow_rate,
-                    'realized_flow': 0.0,
-                    'demand_count': 0,
-                    'entries': 0,
-                    'completions': 0,
-                    'travel_time': _free_flow_time(link_record),
-                    'travel_time_mean': _free_flow_time(link_record),
-                    'travel_time_std': 0.0,
-                    'travel_time_ci_half_width': 0.0,
-                    'realized_flow_mean': 0.0,
-                    'replications': 1,
-                    'split': flow_item.get('split', 'training'),
-                    'status': 'free_flow_anchor',
-                })
-                continue
             rep = 0
             rep_dir = flow_dir
             od_csv = os.path.join(rep_dir, 'od.csv')
             departure_times = (
-                [0] * demand_count if historical_mode else
+                [0] * simulated_demand_count if historical_mode else
                 _departure_schedule(
-                    demand_count,
+                    simulated_demand_count,
                     flow_spec.get('calibration_window_hours', 0.1)
                     if isinstance(flow_spec, dict) else 0.1,
                 )
             )
             _write_single_od(
-                od_csv, link_orig, link_dest, demand_count,
+                od_csv, link_orig, link_dest, simulated_demand_count,
                 departure_times=departure_times,
             )
             finder.od_df = pd.read_csv(od_csv)
             flow_seed = SeedManager(seed).derive(
-                'bpr-flow', link_id, flow_index, demand_count, rep
+                'bpr-flow', link_id, flow_index, simulated_demand_count, rep
             )
             finder.seed = flow_seed
             SeedManager(flow_seed)
@@ -587,9 +635,9 @@ def _bpr_link_worker(job):
                 raise RuntimeError('target link did not produce a travel time')
             entries = int(target_link.tot_entering_vehs)
             completions = int(len(target_link.completed_travel_time_list))
-            if entries != demand_count or completions != demand_count:
+            if entries != simulated_demand_count or completions != simulated_demand_count:
                 raise RuntimeError(
-                    f'target flow accounting mismatch: requested_agents={demand_count}, '
+                    f'target flow accounting mismatch: requested_agents={simulated_demand_count}, '
                     f'entries={entries}, completions={completions}'
                 )
             if historical_mode:
@@ -605,15 +653,27 @@ def _bpr_link_worker(job):
                     )
                 realized_flow = float(target_rows.iloc[0]['flow'])
             else:
-                calibration_window = float(
-                    flow_spec.get('calibration_window_hours', 0.1)
-                    if isinstance(flow_spec, dict) else 0.1
+                # The independent variable is offered demand. Eventually
+                # admitting every member of a finite cohort does not make
+                # offered demand the stationary target-link throughput.
+                # The optimizer's decision variables are cohort vehicle
+                # counts, not hourly rates. Calibrate in vehicles per stated
+                # demand window so x and capacity have the same units as CG.
+                realized_flow = float(demand_count)
+            if not historical_mode and route_mode == 'link_probe':
+                per_agent_times = _entry_wait_inclusive_target_times(
+                    finder,
+                    link_id,
+                    [int(item['link_id']) for item in sa_ol],
                 )
-                realized_flow = (
-                    entries / calibration_window
-                    if isinstance(flow_spec, dict) else flow_rate
-                )
-            travel_time = float(target_link.ave_travel_time)
+                travel_time = float(np.mean(per_agent_times))
+                travel_time_std = float(np.std(per_agent_times, ddof=1)) \
+                    if per_agent_times.size > 1 else 0.0
+                measurement = 'offered_demand_entry_wait_inclusive'
+            else:
+                travel_time = float(target_link.ave_travel_time)
+                travel_time_std = 0.0
+                measurement = 'target_link_traversal_only'
             realized_flow = float(realized_flow)
             result['x_vector'].append(realized_flow)
             result['y_vector'].append(travel_time)
@@ -621,21 +681,28 @@ def _bpr_link_worker(job):
                 'fraction': flow_item.get('fraction'),
                 'split': flow_item.get('split', 'training'),
                 'requested_flow': flow_rate,
+                'requested_flow_vph': flow_rate,
+                'offered_demand_count': demand_count,
                 'realized_flow': realized_flow,
                 'realized_flow_mean': realized_flow,
                 'demand_count': demand_count,
+                'simulated_demand_count': simulated_demand_count,
                 'entries': entries,
                 'completions': completions,
                 'travel_time': travel_time,
                 'travel_time_mean': travel_time,
-                'travel_time_std': 0.0,
+                'travel_time_std': travel_time_std,
                 'travel_time_ci_half_width': 0.0,
                 'relative_ci_half_width': 0.0,
                 'replications': 1,
-                'target_queue_max': int(max(
-                    [0] + [len(target_link.queue_veh), len(target_link.run_veh)]
-                )),
-                'status': 'simulated_measured_flow' if historical_mode else 'simulated',
+                'active_period_throughput_vph': float(
+                    getattr(target_link, 'ave_flow', np.nan) * 3600.0
+                ),
+                'measurement': measurement,
+                'status': (
+                    'simulated_measured_flow' if historical_mode else
+                    ('simulated_zero_flow_probe' if demand_count == 0 else 'simulated')
+                ),
                 'continuation_link_ids': [int(item['link_id']) for item in sa_ol]
                 if route_mode == 'link_probe' else [],
             })
@@ -682,6 +749,7 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
                       missing_context_policy='synthetic_boundary',
                       synthetic_context_capacity_multiplier=10.0,
                       synthetic_context_length_m=1.0,
+                      probe_continuation_capacity_multiplier=10.0,
                       simulation_horizon=10801, active_link_ids=None,
                       resume=True):
     """Generate BPR observations from one canonical artifact.
@@ -704,6 +772,8 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
         raise ValueError('synthetic_context_capacity_multiplier must be positive')
     if float(synthetic_context_length_m) <= 0:
         raise ValueError('synthetic_context_length_m must be positive')
+    if float(probe_continuation_capacity_multiplier) <= 1:
+        raise ValueError('probe_continuation_capacity_multiplier must exceed 1')
     if int(simulation_horizon) < 1:
         raise ValueError('simulation_horizon must be >= 1')
     if mode not in {'historical_artifact_compatible', 'capacity_fraction_strict'}:
@@ -754,6 +824,10 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
             'synthetic_context_length_m': float(synthetic_context_length_m),
             'simulation_horizon': int(simulation_horizon),
             'resume': bool(resume),
+            'calibration_version': BPR_CALIBRATION_VERSION,
+            'probe_continuation_capacity_multiplier': float(
+                probe_continuation_capacity_multiplier
+            ),
         }
         legacy_flow_levels = None
     elif flow_fractions is not None:
@@ -770,12 +844,16 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
             'synthetic_context_length_m': float(synthetic_context_length_m),
             'simulation_horizon': int(simulation_horizon),
             'resume': bool(resume),
+            'calibration_version': BPR_CALIBRATION_VERSION,
+            'probe_continuation_capacity_multiplier': float(
+                probe_continuation_capacity_multiplier
+            ),
         }
         legacy_flow_levels = None
     sweep_name = (
         'link_sweeps_historical'
         if mode == 'historical_artifact_compatible'
-        else ('link_sweeps_capacity_fraction' if flow_fractions is not None else 'link_sweeps')
+        else ('link_sweeps_capacity_fraction_v2' if flow_fractions is not None else 'link_sweeps')
     )
     output_root = os.path.join(work_dir, sweep_name)
     os.makedirs(output_root, exist_ok=True)
@@ -816,8 +894,18 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
                 'link_id': link_id,
                 'x_vector': result['x_vector'],
                 'y_vector': result['y_vector'],
-                'calibration_capacity': result.get('capacity_rate'),
-                'calibration_fft': _free_flow_time(record),
+                'calibration_capacity': (
+                    result.get('capacity_count')
+                    if mode == 'capacity_fraction_strict'
+                    else result.get('capacity_rate')
+                ),
+                'calibration_capacity_vph': result.get('capacity_rate'),
+                'calibration_fft': (
+                    float(result['y_vector'][0])
+                    if mode == 'capacity_fraction_strict'
+                    and flow_spec['flow_fractions'][0] == 0
+                    else _free_flow_time(record)
+                ),
                 'calibration_window_hours': float(calibration_window_hours) if flow_fractions is not None else None,
                 'fit_status': 'simulated',
                 'observation_source': result.get('observation_source', 'simulated_contextual'),
@@ -885,10 +973,14 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
             'random_seed': int(seed if seed is not None else 0),
             'fitter_version': (
                 'historical_v1' if mode == 'historical_artifact_compatible'
-                else 'capacity_fraction_v1'
+                else BPR_CALIBRATION_VERSION
             ),
             'historical_reference_commit': '37eab33' if mode == 'historical_artifact_compatible' else None,
-            'route_semantics': 'measured_target_flow_with_straight_ahead_context' if mode == 'historical_artifact_compatible' else route_mode,
+            'route_semantics': (
+                'measured_target_flow_with_straight_ahead_context'
+                if mode == 'historical_artifact_compatible'
+                else 'offered_cohort_entry_wait_inclusive_nonbinding_continuation'
+            ),
             'link_count': len(link_records),
             'successful_links': int(len(df)),
             'failures': failures,
@@ -904,6 +996,10 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
             'synthetic_context_length_m': (
                 float(flow_spec.get('synthetic_context_length_m', 1.0))
                 if isinstance(flow_spec, dict) else None
+            ),
+            'probe_continuation_capacity_multiplier': (
+                float(flow_spec.get('probe_continuation_capacity_multiplier', 10.0))
+                if mode == 'capacity_fraction_strict' else None
             ),
             'simulation_horizon': int(
                 flow_spec.get('simulation_horizon', 10801)
@@ -928,10 +1024,16 @@ def generate_bpr_data(coordinates=None, num_samples=25, max_flow=250,
             'capacity_per_lane': float(capacity_per_lane) if flow_fractions is not None else None,
             'calibration_window_hours': float(calibration_window_hours) if flow_fractions is not None else None,
             'route_mode': 'contextual' if mode == 'historical_artifact_compatible' else (route_mode if flow_fractions is not None else None),
-            'flow_unit': 'simulator_measured_target_flow' if mode == 'historical_artifact_compatible' else ('vehicles_per_hour_equivalent' if flow_fractions is not None else 'simulator_agent_count'),
+            'flow_unit': (
+                'simulator_measured_target_flow'
+                if mode == 'historical_artifact_compatible'
+                else ('vehicles_per_calibration_window' if flow_fractions is not None
+                      else 'simulator_agent_count')
+            ),
             'flow_levels_by_link': {
                 str(int(result['link_id'])): {
                     'capacity_rate': result.get('capacity_rate'),
+                    'capacity_count': result.get('capacity_count'),
                     'flow_rates': [item['flow_rate'] for item in result.get('flow_plan', [])],
                     'demand_counts': [item['demand_count'] for item in result.get('flow_plan', [])],
                 }
