@@ -15,6 +15,7 @@ import pandas as pd
 warnings.filterwarnings('ignore')
 
 from queue_sim import Runner, QUEUE_SIM_AVAILABLE
+from queue_sim.bpr_data_generator import _departure_schedule
 from src.contracts import DemandClass, SeedManager, normalize_od_demand
 from src.network_artifact import load_network_artifact
 from src.run_state import available_cpus
@@ -81,7 +82,9 @@ def _write_queue_manifest(path, manifest, assignments):
         json.dump(manifest, handle, indent=2)
 
 
-def _reuse_saved_cycle_assignments(work_dir, network_hash, expected_count):
+def _reuse_saved_cycle_assignments(
+    work_dir, network_hash, expected_count, departure_window_seconds=0
+):
     """Reuse terminal queue artifacts, promoting legacy cycle failures safely."""
     ne_path = os.path.join(work_dir, 'NE_path_assignments.pkl')
     manifest_path = os.path.join(work_dir, 'queue_manifest.json')
@@ -94,6 +97,8 @@ def _reuse_saved_cycle_assignments(work_dir, network_hash, expected_count):
     if not isinstance(assignments, dict) or len(assignments) != int(expected_count):
         return None
     if manifest.get('network_hash') != network_hash:
+        return None
+    if int(manifest.get('departure_window_seconds', 0)) != int(departure_window_seconds):
         return None
     for value in assignments.values():
         if not isinstance(value, dict) or value.get('status') == 'failed':
@@ -201,7 +206,9 @@ def _rounded_counts(routes, total):
     return counts
 
 
-def _write_queue_inputs(artifact_dir, work_dir, demand_classes):
+def _write_queue_inputs(
+    artifact_dir, work_dir, demand_classes, departure_window_hours=None, seed=0
+):
     nodes, edges, manifest = load_network_artifact(artifact_dir)
     os.makedirs(work_dir, exist_ok=True)
     nodes_path = os.path.join(work_dir, 'canonical_nodes.csv')
@@ -209,9 +216,27 @@ def _write_queue_inputs(artifact_dir, work_dir, demand_classes):
     od_path = os.path.join(work_dir, 'canonical_od.csv')
     nodes.to_csv(nodes_path, index=False)
     edges.to_csv(edges_path, index=False)
+    od_totals = {}
+    for record in demand_classes:
+        od = (record.origin, record.destination)
+        od_totals[od] = od_totals.get(od, 0) + record.demand
+    od_departures = {}
+    for od, total in od_totals.items():
+        times = (
+            _departure_schedule(total, departure_window_hours)
+            if departure_window_hours is not None else [0] * total
+        )
+        od_departures[od] = SeedManager(seed).numpy(
+            'queue-departures', *od
+        ).permutation(times).tolist()
+    od_offsets = {od: 0 for od in od_totals}
     rows = []
     for record in demand_classes:
-        for _ in range(record.demand):
+        od = (record.origin, record.destination)
+        start = od_offsets[od]
+        departure_times = od_departures[od][start:start + record.demand]
+        od_offsets[od] += record.demand
+        for dept_time in departure_times:
             rows.append({
                 'origin_node_id': record.origin,
                 'destin_node_id': record.destination,
@@ -222,6 +247,7 @@ def _write_queue_inputs(artifact_dir, work_dir, demand_classes):
                 'current_charge': 0,
                 'target_charge': 100,
                 'go_to_station_id': np.nan,
+                'dept_time': int(dept_time),
             })
     pd.DataFrame(rows).to_csv(od_path, index=False)
     return (
@@ -523,8 +549,19 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
     demand_classes = normalize_od_demand(data['run_configuration']['od_demand'])
     if artifact_dir is None:
         raise ValueError('A canonical network artifact is required for queue simulation')
+    seed = seed_manager.seed if seed_manager is not None else config.pipeline.get('random_seed', 0)
+    bpr_config = config.pipeline.get('bpr_generation', {})
+    departure_window_hours = (
+        float(bpr_config.get('calibration_window_hours', 0.1))
+        if bpr_config.get('mode') == 'capacity_fraction_strict' else None
+    )
+    departure_window_seconds = (
+        int(round(departure_window_hours * 3600.0))
+        if departure_window_hours is not None else 0
+    )
     nodes_path, edges_path, od_path, manifest = _write_queue_inputs(
-        artifact_dir, work_dir, demand_classes
+        artifact_dir, work_dir, demand_classes,
+        departure_window_hours=departure_window_hours, seed=seed,
     )
     with open(os.path.join(work_dir, 'network_manifest.json'), 'w') as handle:
         json.dump(manifest, handle, indent=2)
@@ -533,7 +570,8 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
     configs = list(data['configurations'].keys())
     if resume:
         reused = _reuse_saved_cycle_assignments(
-            work_dir, manifest['network_hash'], len(configs)
+            work_dir, manifest['network_hash'], len(configs),
+            departure_window_seconds,
         )
         if reused is not None:
             ne_path, reused_assignments = reused
@@ -546,7 +584,6 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
                 for key, value in reused_assignments.items()
                 if value.get('final_gap') is not None
             }
-    seed = seed_manager.seed if seed_manager is not None else config.pipeline.get('random_seed', 0)
     available_workers = available_cpus()
     pool_size = available_workers if workers is None else max(1, int(workers))
     pool_size = min(pool_size, available_workers)
@@ -815,6 +852,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
                 for index, (entry, count) in enumerate(zip(entries, counts))
             ],
             'network_hash': manifest['network_hash'],
+            'departure_window_seconds': departure_window_seconds,
         }
         if state['status'] == CYCLE_APPROXIMATION_STATUS:
             _promote_cycle_result(
@@ -849,6 +887,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
         'workers_available': available_workers,
         'parallel_granularity': 'configuration_iteration_replication',
         'replications_per_iteration': int(num_iters),
+        'departure_window_seconds': departure_window_seconds,
         'resumed_configurations': sorted(
             loc_str for loc_str, state in states.items()
             if state.get('resumed_complete')

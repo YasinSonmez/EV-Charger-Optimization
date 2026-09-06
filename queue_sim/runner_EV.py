@@ -743,7 +743,7 @@ class Runner:
         for agent in self.sim.all_agents.values():
             if np.isnan(agent.arrival_time):
                 raise RuntimeError(f'Agent {agent.aid} has no arrival time')
-            self.tot_travel_time += agent.arrival_time
+            self.tot_travel_time += agent.arrival_time - agent.dept_time
         for link in self.sim.all_links.values():
             if link.ltype == 'vl_in' or not link.completed_travel_time_list:
                 continue
