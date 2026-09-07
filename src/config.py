@@ -37,6 +37,8 @@ SCENARIO_DEFAULTS = {
     "candidate_strategy": "interchanges_then_farthest_point",
     "interchange_merge_diameter_m": 250.0,
     "candidate_max_detour_ratio": 1.10,
+    "candidate_min_detour_percent": 5.0,
+    "candidate_max_detour_percent": 35.0,
     "candidate_corridor_radius_m": 500.0,
     "od_pair_count": 1,
     "od_strategy": "boundary_max_separation",
@@ -497,7 +499,8 @@ class Config:
         if not scenario.get("enabled", False):
             return
         if scenario.get("candidate_strategy") not in {
-            "interchanges_then_farthest_point", "od_corridor_interchanges"
+            "interchanges_then_farthest_point", "od_corridor_interchanges",
+            "od_detour_ranked",
         }:
             raise ValueError("unsupported scenario_generation.candidate_strategy")
         if scenario.get("od_strategy") != "boundary_max_separation":
@@ -508,15 +511,28 @@ class Config:
         if int(scenario.get("od_pair_count", 0)) < 1:
             raise ValueError("scenario_generation.od_pair_count must be >= 1")
         if (
-            scenario.get("candidate_strategy") == "od_corridor_interchanges"
+            scenario.get("candidate_strategy") in {
+                "od_corridor_interchanges", "od_detour_ranked",
+            }
             and candidate_count < int(scenario.get("od_pair_count", 1))
         ):
             raise ValueError(
-                "od_corridor_interchanges requires candidate_count >= od_pair_count"
+                "OD-aware candidate selection requires candidate_count >= od_pair_count"
             )
         if float(scenario.get("candidate_max_detour_ratio", 1.10)) < 1:
             raise ValueError(
                 "scenario_generation.candidate_max_detour_ratio must be >= 1"
+            )
+        min_detour_percent = float(scenario.get("candidate_min_detour_percent", 5.0))
+        max_detour_percent = float(scenario.get("candidate_max_detour_percent", 35.0))
+        if min_detour_percent < 0:
+            raise ValueError(
+                "scenario_generation.candidate_min_detour_percent must be non-negative"
+            )
+        if max_detour_percent < min_detour_percent:
+            raise ValueError(
+                "scenario_generation.candidate_max_detour_percent must be >= "
+                "candidate_min_detour_percent"
             )
         if float(scenario.get("candidate_corridor_radius_m", 500.0)) <= 0:
             raise ValueError(

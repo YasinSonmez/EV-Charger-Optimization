@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import networkx as nx
 import pandas as pd
+import pytest
 
 from src.config import Config
-from src.scenario_generation import generate_scenario
+from src.scenario_generation import (
+    _select_ranked_detour_candidates,
+    generate_scenario,
+)
 
 
 def test_generated_config_needs_no_internal_node_ids():
@@ -105,3 +110,23 @@ def test_od_corridor_candidates_respect_detour_limit_for_multiple_ods():
         values["selected_candidates_within_limit"] >= 1
         for values in first.metadata["candidate_diagnostics"]["per_od"].values()
     )
+
+
+def test_ranked_detour_candidates_span_filtered_rank_range():
+    graph = nx.MultiDiGraph()
+    for node in range(6):
+        graph.add_node(node, x=float(node), y=float(node % 2))
+    graph.add_edge(0, 1, travel_time=100.0)
+    for node, total in zip(range(2, 6), (105.0, 110.0, 115.0, 120.0)):
+        graph.add_edge(0, node, travel_time=total / 2)
+        graph.add_edge(node, 1, travel_time=total / 2)
+
+    selected, metadata, diagnostics = _select_ranked_detour_candidates(
+        graph, [(0, 1)], count=3,
+        min_detour_percent=5, max_detour_percent=20,
+    )
+
+    detours = [100 * (metadata[node]["minimum_detour_ratio"] - 1) for node in selected]
+    assert detours == pytest.approx([5.0, 15.0, 20.0])
+    assert diagnostics["selected_ranks"] == [0, 2, 3]
+    assert diagnostics["selected_rank_fractions"] == pytest.approx([0, 2 / 3, 1])

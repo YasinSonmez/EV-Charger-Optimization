@@ -252,6 +252,130 @@ def _select_corridor_candidates(
     return selected, candidate_metadata, diagnostics
 
 
+def _select_ranked_detour_candidates(
+    graph: nx.MultiDiGraph,
+    od_pairs: list[tuple[int, int]],
+    *,
+    count: int,
+    min_detour_percent: float = 5.0,
+    max_detour_percent: float = 20.0,
+):
+    """Choose evenly spaced ranks from nodes in a bounded detour interval.
+
+    For multiple ODs, a node's score is its smallest free-flow detour over all
+    OD pairs. Thus each candidate is ranked relative to the OD it can serve
+    most directly, while remaining deterministic and independent of node IDs.
+    """
+    reverse = graph.reverse(copy=False)
+    endpoints = {node for pair in od_pairs for node in pair}
+    contexts = []
+    for origin, destination in od_pairs:
+        baseline = float(nx.shortest_path_length(
+            graph, origin, destination, weight="travel_time"
+        ))
+        from_origin = nx.single_source_dijkstra_path_length(
+            graph, origin, weight="travel_time"
+        )
+        to_destination = nx.single_source_dijkstra_path_length(
+            reverse, destination, weight="travel_time"
+        )
+        route = nx.shortest_path(graph, origin, destination, weight="travel_time")
+        route_line = LineString([
+            (float(graph.nodes[node]["x"]), float(graph.nodes[node]["y"]))
+            for node in route
+        ])
+        ratios = {
+            node: (float(from_origin[node]) + float(to_destination[node])) / baseline
+            for node in graph
+            if node not in endpoints and node in from_origin and node in to_destination
+        }
+        distances = {
+            node: float(Point(
+                float(graph.nodes[node]["x"]), float(graph.nodes[node]["y"])
+            ).distance(route_line))
+            for node in ratios
+        }
+        contexts.append({
+            "od": (origin, destination), "baseline": baseline,
+            "ratios": ratios, "distances": distances,
+        })
+
+    lower = 1.0 + float(min_detour_percent) / 100.0
+    upper = 1.0 + float(max_detour_percent) / 100.0
+    ranked = []
+    for node in graph:
+        if node in endpoints or any(node not in context["ratios"] for context in contexts):
+            continue
+        ratios = [float(context["ratios"][node]) for context in contexts]
+        score = min(ratios)
+        if lower - 1e-12 <= score <= upper + 1e-12:
+            ranked.append((score, str(node), node))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    if len(ranked) < int(count):
+        raise ValueError(
+            f"only {len(ranked)} candidate nodes have minimum OD detour in "
+            f"[{min_detour_percent}%, {max_detour_percent}%]; requested {count}"
+        )
+
+    if int(count) == 1:
+        selected_ranks = [(len(ranked) - 1) // 2]
+    else:
+        selected_ranks = np.rint(
+            np.linspace(0, len(ranked) - 1, int(count))
+        ).astype(int).tolist()
+    selected = [ranked[index][2] for index in selected_ranks]
+    candidate_metadata = {}
+    for rank, node in zip(selected_ranks, selected):
+        ratios = {
+            f"{context['od'][0]},{context['od'][1]}": float(context["ratios"][node])
+            for context in contexts
+        }
+        closest_od = min(ratios, key=ratios.get)
+        distances = {
+            f"{context['od'][0]},{context['od'][1]}": float(context["distances"][node])
+            for context in contexts
+        }
+        candidate_metadata[node] = {
+            "kind": "ranked_detour",
+            "detour_rank": int(rank),
+            "detour_rank_fraction": (
+                0.5 if len(ranked) == 1 else float(rank) / (len(ranked) - 1)
+            ),
+            "detour_ratios": ratios,
+            "minimum_detour_ratio": float(ratios[closest_od]),
+            "corridor_distances_m": distances,
+            "minimum_corridor_distance_m": float(min(distances.values())),
+            "closest_od": closest_od,
+        }
+
+    diagnostics = {
+        "candidate_count": len(selected),
+        "eligible_candidate_nodes": len(ranked),
+        "minimum_detour_percent": float(min_detour_percent),
+        "maximum_detour_percent": float(max_detour_percent),
+        "selection": "ranked_linear",
+        "selected_ranks": selected_ranks,
+        "selected_rank_fractions": [
+            candidate_metadata[node]["detour_rank_fraction"] for node in selected
+        ],
+        "selected_detour_percents": [
+            100.0 * (candidate_metadata[node]["minimum_detour_ratio"] - 1.0)
+            for node in selected
+        ],
+        "per_od": {
+            f"{context['od'][0]},{context['od'][1]}": {
+                "baseline_free_flow_seconds": float(context["baseline"]),
+                "selected_candidates_within_limit": sum(
+                    lower - 1e-12 <= context["ratios"][node] <= upper + 1e-12
+                    for node in selected
+                ),
+            }
+            for context in contexts
+        },
+    }
+    return selected, candidate_metadata, diagnostics
+
+
 def generate_scenario(road_net, settings: dict) -> GeneratedScenario:
     """Select candidates and OD demand without requiring canonical node IDs."""
     graph = _canonical_graph(road_net)
@@ -286,6 +410,16 @@ def generate_scenario(road_net, settings: dict) -> GeneratedScenario:
             corridor_radius_m=float(settings.get("candidate_corridor_radius_m", 500.0)),
             interchange_merge_diameter_m=merge_diameter,
         )
+    elif strategy == "od_detour_ranked":
+        od_pairs = _select_od_pairs(
+            projected, [], count=od_count,
+            boundary_pool_size=boundary_pool_size,
+        )
+        candidates, candidate_metadata, diagnostics = _select_ranked_detour_candidates(
+            projected, od_pairs, count=candidate_count,
+            min_detour_percent=float(settings.get("candidate_min_detour_percent", 5.0)),
+            max_detour_percent=float(settings.get("candidate_max_detour_percent", 20.0)),
+        )
     else:
         raise ValueError(f"unsupported candidate strategy: {strategy}")
     candidates = [int(node) for node in candidates]
@@ -309,6 +443,10 @@ def generate_scenario(road_net, settings: dict) -> GeneratedScenario:
                 "lat": float(graph.nodes[node]["lat"]),
                 "lon": float(graph.nodes[node]["lon"]),
                 "kind": candidate_metadata[node]["kind"],
+                "detour_rank": candidate_metadata[node].get("detour_rank"),
+                "detour_rank_fraction": candidate_metadata[node].get(
+                    "detour_rank_fraction"
+                ),
                 "minimum_detour_ratio": candidate_metadata[node].get(
                     "minimum_detour_ratio"
                 ),

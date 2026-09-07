@@ -117,3 +117,21 @@ def test_corridor_candidate_configuration_validation():
     }
     with pytest.raises(ValueError, match="candidate_count >= od_pair_count"):
         Config.from_dict(raw)
+
+
+def test_ranked_detour_percent_bounds_are_validated():
+    raw = {
+        **VALID_CONFIG,
+        "scenario_generation": {
+            "candidate_count": 2, "num_chargers": 1,
+            "candidate_strategy": "od_detour_ranked",
+            "candidate_min_detour_percent": 5,
+            "candidate_max_detour_percent": 20,
+            "od_pair_count": 1,
+        },
+    }
+    config = Config.from_dict(raw)
+    assert config.scenario_generation["candidate_min_detour_percent"] == 5
+    raw["scenario_generation"]["candidate_max_detour_percent"] = 4
+    with pytest.raises(ValueError, match="must be >= candidate_min_detour_percent"):
+        Config.from_dict(raw)
