@@ -12,7 +12,27 @@ from src.config import Config
 from src.scenario_generation import (
     _select_ranked_detour_candidates,
     generate_scenario,
+    saturation_diagnostics,
 )
+
+
+def test_static_saturation_uses_window_capacity_and_requires_bypass():
+    graph = nx.MultiDiGraph()
+    for node in range(4):
+        graph.add_node(node)
+    graph.add_edge(0, 1, key=0, link_id=0, travel_time=1, capacity=1000)
+    graph.add_edge(1, 3, key=0, link_id=1, travel_time=1, capacity=1000)
+    graph.add_edge(0, 2, key=0, link_id=2, travel_time=1, capacity=1000)
+    graph.add_edge(0, 2, key=1, link_id=3, travel_time=10, capacity=1000)
+    graph.add_edge(2, 3, key=0, link_id=4, travel_time=1, capacity=1000)
+    graph.add_edge(2, 3, key=1, link_id=5, travel_time=10, capacity=1000)
+
+    result = saturation_diagnostics(
+        graph, [(0, 3)], [2], {"F1": 60, "F2": 120}, 0.1
+    )
+
+    assert result["minimum_candidate_maximum_bypassable_vc"] == pytest.approx(1.2)
+    assert result["candidate_scenarios"][0]["critical_window_capacity"] == 100
 
 
 def test_generated_config_needs_no_internal_node_ids():

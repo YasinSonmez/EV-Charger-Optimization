@@ -486,7 +486,7 @@ class RoadNet:
         )
         raw_edges['length'] = raw_edges['length'].astype(float)
         lane_source = 'lanes_numeric' if 'lanes_numeric' in raw_edges else 'lanes'
-        raw_edges['lanes'] = raw_edges[lane_source].apply(parse_lanes).round().astype(int)
+        raw_edges['lanes'] = raw_edges[lane_source].apply(parse_lanes).astype(float)
         if 'speed_kph' in raw_edges:
             raw_edges['maxmph'] = raw_edges['speed_kph'].astype(float) / 1.609344
         else:
@@ -499,7 +499,13 @@ class RoadNet:
                 raw_edges['maxmph'] * 1609.344 / 3600.0
             )
         raw_edges['geometry'] = raw_edges['geometry'].apply(wkt.dumps)
-        raw_edges['capacity'] = raw_edges['lanes'] * 1000
+        # This provisional column is replaced by the configured canonical
+        # capacity before export. Keep it for standalone RoadNet callers.
+        raw_edges['capacity'] = raw_edges['lanes'] * 1000.0
+        if 'speed_source' not in raw_edges:
+            raw_edges['speed_source'] = 'unknown'
+        if 'lanes_source' not in raw_edges:
+            raw_edges['lanes_source'] = 'unknown'
         if 'source_edge_ids' not in raw_edges:
             raw_edges['source_edge_ids'] = raw_edges.apply(
                 lambda row: (f"{row['u']}|{row['v']}|{row['key']}",), axis=1
@@ -512,7 +518,8 @@ class RoadNet:
         self.nodes = raw_nodes.drop(drop_node_columns, axis=1)
         self.edges = raw_edges[['link_id', 'start_node_id', 'end_node_id', 'type',
                                 'length', 'maxmph', 'lanes', 'capacity',
-                                'travel_time', 'source_edge_ids',
+                                'travel_time', 'speed_source', 'lanes_source',
+                                'source_edge_ids',
                                 'start_osmid', 'end_osmid', 'edge_key', 'geometry']]
         self.nodes = self.nodes.sort_values('node_id').reset_index(drop=True)
         self.edges = self.edges.sort_values('link_id').reset_index(drop=True)

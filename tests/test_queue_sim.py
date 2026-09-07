@@ -169,3 +169,25 @@ def test_station_at_node_accepts_single_incoming_link():
     station_node = runner.nodes_df.loc[runner.nodes_df['type'] == 'Station'].iloc[0]
     assert station_node['lon'] == pytest.approx(1.0)
     assert station_node['lat'] != pytest.approx(0.0)
+
+
+def test_queue_network_honors_canonical_link_capacity():
+    from queue_sim import QUEUE_SIM_AVAILABLE
+    if not QUEUE_SIM_AVAILABLE:
+        pytest.skip("queue simulator unavailable")
+    from queue_sim.queue_model_EV import Simulation
+
+    nodes = pd.DataFrame([
+        {'node_id': 0, 'lon': 0.0, 'lat': 0.0, 'type': 'real', 'node_osmid': 0},
+        {'node_id': 1, 'lon': 1.0, 'lat': 0.0, 'type': 'real', 'node_osmid': 1},
+    ])
+    links = pd.DataFrame([{
+        'link_id': 0, 'start_node_id': 0, 'end_node_id': 1,
+        'lanes': 1.0, 'length': 100.0, 'maxmph': 25.0, 'fft': 9.0,
+        'capacity': 777.0, 'type': 'secondary',
+        'geometry': 'LINESTRING (0 0, 1 0)',
+    }])
+    simulation = Simulation()
+    simulation.create_network(nodes, links, pd.DataFrame())
+
+    assert simulation.all_links[0].capacity == pytest.approx(777.0)

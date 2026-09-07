@@ -1333,6 +1333,7 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
     print("=" * 80)
     t0 = time.time()
     rf = config.road_filter
+    bpr_config = dict(config.pipeline.get("bpr_generation", {}))
     hw_types = rf.get('highway_types') if rf.get('enabled', True) else None
     from src.road_network import RoadNet
     shared_road_net = RoadNet('pipeline')
@@ -1355,6 +1356,11 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
         )
     network_stages = shared_road_net.stage_counts
     network_stage_maps = shared_road_net.stage_maps
+    capacity_per_lane = float(bpr_config.get('capacity_per_lane', 1900.0))
+    shared_road_net.edges['capacity'] = (
+        pd.to_numeric(shared_road_net.edges['lanes'], errors='raise')
+        * capacity_per_lane
+    )
     network_node_count = len(shared_road_net.nodes)
     network_edge_count = len(shared_road_net.edges)
     expected_nodes = config.network.get('expected_nodes')
@@ -1392,6 +1398,7 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
             'contract_threshold': rf.get('contract_threshold', 30),
             'intersection_tolerance': rf.get('intersection_tolerance', 0),
             'prune_dead_ends': rf.get('prune_dead_ends', False),
+            'capacity_per_directional_lane_vph': capacity_per_lane,
             'random_seed': seed_manager.seed,
         },
     )
@@ -1401,7 +1408,13 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
     scenario_metadata = None
     if config.scenario_generation.get("enabled", False):
         from src.scenario_generation import generate_scenario, plot_scenario
-        generated = generate_scenario(shared_road_net, config.scenario_generation)
+        generated = generate_scenario(
+            shared_road_net,
+            config.scenario_generation,
+            calibration_window_hours=float(
+                bpr_config.get('calibration_window_hours', 0.1)
+            ),
+        )
         config.possible_charger_positions = generated.candidate_node_ids
         config.num_chargers = int(config.scenario_generation["num_chargers"])
         config.od_demand = generated.od_demand
@@ -1443,7 +1456,6 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
     })
 
     # Step 1: BPR fitting
-    bpr_config = dict(config.pipeline.get("bpr_generation", {}))
     global_parallel_workers = config.pipeline.get("parallel_workers")
     if global_parallel_workers is not None:
         if bpr_config.get('workers') is None:

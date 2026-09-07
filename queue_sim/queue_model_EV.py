@@ -758,7 +758,16 @@ class Simulation:
         links_df = links_df.copy()
         charging_stations_df = charging_stations_df.copy()
         links_df['lanes'] = pd.to_numeric(links_df['lanes'], errors='coerce').fillna(1.0)
-        links_df['capacity'] = links_df['lanes'] * 1900 ###################################################################### ADDITION INLINE
+        supplied_capacity = (
+            pd.to_numeric(links_df['capacity'], errors='coerce')
+            if 'capacity' in links_df
+            else pd.Series(np.nan, index=links_df.index, dtype=float)
+        )
+        fallback_capacity = links_df['lanes'] * 1900.0
+        links_df['capacity'] = supplied_capacity.where(
+            np.isfinite(supplied_capacity) & (supplied_capacity > 0),
+            fallback_capacity,
+        )
 ###################################################################### ADDITION STARTS
         links_df.loc[links_df['type'] == 'In_Station','capacity'] = np.nan
         links_df.loc[links_df['type'] == 'Out_Station', 'capacity'] = np.nan

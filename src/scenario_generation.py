@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,11 +35,15 @@ def _canonical_graph(road_net) -> nx.MultiDiGraph:
             node_osmid=getattr(row, "node_osmid", None),
         )
     for row in road_net.edges.itertuples():
+        lanes = float(getattr(row, "lanes", 1.0))
+        capacity = float(getattr(row, "capacity", lanes * 1000.0))
         graph.add_edge(
             int(row.start_node_id), int(row.end_node_id),
             key=int(row.link_id), link_id=int(row.link_id),
             length=float(row.length),
             travel_time=float(row.travel_time),
+            capacity=capacity,
+            lanes=lanes,
             highway=str(row.type).split("|"),
         )
     return graph
@@ -376,7 +381,96 @@ def _select_ranked_detour_candidates(
     return selected, candidate_metadata, diagnostics
 
 
-def generate_scenario(road_net, settings: dict) -> GeneratedScenario:
+def _path_edges(graph: nx.MultiDiGraph, path: list[int]) -> list[tuple[int, int, int]]:
+    edges = []
+    for source, target in zip(path[:-1], path[1:]):
+        key = min(
+            graph[source][target],
+            key=lambda value: float(graph[source][target][value].get("travel_time", math.inf)),
+        )
+        edges.append((source, target, key))
+    return edges
+
+
+def _route_edges(graph, source, target, via=None):
+    if via is None:
+        return _path_edges(
+            graph, nx.shortest_path(graph, source, target, weight="travel_time")
+        )
+    first = nx.shortest_path(graph, source, via, weight="travel_time")
+    second = nx.shortest_path(graph, via, target, weight="travel_time")
+    return _path_edges(graph, first) + _path_edges(graph, second)
+
+
+def _has_bypass(graph, source, target, edge, via=None):
+    reduced = nx.subgraph_view(
+        graph, filter_edge=lambda u, v, key: (u, v, key) != edge
+    )
+    try:
+        if via is None:
+            return nx.has_path(reduced, source, target)
+        return nx.has_path(reduced, source, via) and nx.has_path(reduced, via, target)
+    except nx.NodeNotFound:
+        return False
+
+
+def saturation_diagnostics(
+    graph: nx.MultiDiGraph,
+    od_pairs: list[tuple[int, int]],
+    candidates: list[int],
+    demand: dict,
+    calibration_window_hours: float,
+) -> dict[str, Any]:
+    """Cheap all-or-nothing offered-load check, not a simulation result."""
+    scenarios = []
+    f1 = int(demand.get("F1", 0))
+    f2 = int(demand.get("F2", 0))
+    for candidate in candidates:
+        loads = defaultdict(float)
+        bypassable = set()
+        for source, target in od_pairs:
+            f1_edges = _route_edges(graph, source, target)
+            f2_edges = _route_edges(graph, source, target, via=candidate)
+            for edge in f1_edges:
+                loads[edge] += f1
+                if _has_bypass(graph, source, target, edge):
+                    bypassable.add(edge)
+            for edge in f2_edges:
+                loads[edge] += f2
+                if _has_bypass(graph, source, target, edge, via=candidate):
+                    bypassable.add(edge)
+        records = []
+        for edge, load in loads.items():
+            capacity = float(graph.edges[edge].get("capacity", math.nan))
+            window_capacity = capacity * float(calibration_window_hours)
+            ratio = load / window_capacity if window_capacity > 0 else math.inf
+            records.append((ratio, edge, load, window_capacity, edge in bypassable))
+        usable = [record for record in records if record[-1]]
+        best = max(usable, default=(0.0, None, 0.0, math.nan, False))
+        scenarios.append({
+            "candidate": int(candidate),
+            "maximum_bypassable_vc": float(best[0]),
+            "critical_link_id": (
+                int(graph.edges[best[1]].get("link_id")) if best[1] else None
+            ),
+            "critical_link_load": float(best[2]),
+            "critical_window_capacity": float(best[3]),
+        })
+    values = [item["maximum_bypassable_vc"] for item in scenarios]
+    return {
+        "method": "free_flow_all_or_nothing_bypassable_link",
+        "calibration_window_hours": float(calibration_window_hours),
+        "demand_per_od": {"F1": f1, "F2": f2},
+        "candidate_scenarios": scenarios,
+        "minimum_candidate_maximum_bypassable_vc": float(min(values, default=0.0)),
+        "maximum_candidate_maximum_bypassable_vc": float(max(values, default=0.0)),
+        "interpretation": "static offered-load screen; not realized equilibrium flow",
+    }
+
+
+def generate_scenario(
+    road_net, settings: dict, calibration_window_hours: float = 0.1
+) -> GeneratedScenario:
     """Select candidates and OD demand without requiring canonical node IDs."""
     graph = _canonical_graph(road_net)
     if not nx.is_strongly_connected(graph):
@@ -476,6 +570,9 @@ def generate_scenario(road_net, settings: dict) -> GeneratedScenario:
             for origin, destination in od_pairs
         ],
     }
+    metadata["saturation_diagnostics"] = saturation_diagnostics(
+        graph, od_pairs, candidates, demand, calibration_window_hours
+    )
     return GeneratedScenario(candidates, od_demand, metadata)
 
 

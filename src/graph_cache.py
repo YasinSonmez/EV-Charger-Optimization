@@ -9,6 +9,10 @@ import osmnx as ox
 
 
 GRAPH_CACHE_DIR = "data/graphs"
+OSM_WAY_TAG_SCHEMA = (
+    "lanes:forward", "lanes:backward", "lanes:both_ways",
+    "maxspeed:forward", "maxspeed:backward",
+)
 
 
 def graph_cache_dir():
@@ -27,6 +31,9 @@ def _cache_key(coords, highway_types, *, network_type, simplify, retain_all,
         "retain_all": bool(retain_all),
         "truncate_by_edge": bool(truncate_by_edge),
         "custom_filter": custom_filter,
+        # Parsed graph caches created before these directional tags were
+        # retained cannot support defensible per-direction capacities.
+        "osm_way_tag_schema": OSM_WAY_TAG_SCHEMA,
     }, sort_keys=True)
     return hashlib.md5(key.encode()).hexdigest()[:12]
 
@@ -102,6 +109,9 @@ def get_graph(coords, highway_types=None, force_refresh=False, *,
         )
 
     print(f"  Downloading OSM graph {key}...")
+    ox.settings.useful_tags_way = list(dict.fromkeys(
+        [*ox.settings.useful_tags_way, *OSM_WAY_TAG_SCHEMA]
+    ))
     G = ox.graph_from_bbox(
         coords,
         network_type=network_type,

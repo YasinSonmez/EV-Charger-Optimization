@@ -132,8 +132,72 @@ def _parse_number(value, default: float) -> float:
     return min(parsed) if parsed else float(default)
 
 
+def _optional_number(value) -> float | None:
+    values = value if isinstance(value, (list, tuple, set, np.ndarray)) else [value]
+    parsed = []
+    for item in values:
+        if item is None:
+            continue
+        match = re.search(r"[-+]?\d*\.?\d+", str(item))
+        if match:
+            parsed.append(float(match.group()))
+    return min(parsed) if parsed else None
+
+
 def parse_lanes(value) -> float:
     return max(1.0, _parse_number(value, 1.0))
+
+
+def parse_directional_lanes(data) -> tuple[float, str]:
+    """Return lanes available to one directed edge and their provenance.
+
+    OSM ``lanes`` is the total lane count on a two-way way. OSMnx represents
+    that way with one edge in each direction, so copying the total onto both
+    edges doubles capacity. Directional tags take priority when available.
+    """
+    oneway_value = data.get("oneway", False)
+    oneway = oneway_value is True or str(oneway_value).lower() in {
+        "yes", "true", "1", "-1",
+    }
+    reversed_value = data.get("reversed", False)
+    reversed_edge = reversed_value is True or str(reversed_value).lower() == "true"
+    directional_key = "lanes:backward" if reversed_edge else "lanes:forward"
+    directional = _optional_number(data.get(directional_key))
+    if directional is not None and directional > 0:
+        return float(directional), f"osm:{directional_key}"
+
+    total = _optional_number(data.get("lanes"))
+    if oneway:
+        if total is None:
+            return 1.0, "imputed:oneway_default"
+        return max(1.0, float(total)), "osm:lanes_oneway"
+
+    if total is None:
+        return 1.0, "imputed:twoway_default"
+    both_ways = max(0.0, _optional_number(data.get("lanes:both_ways")) or 0.0)
+    return max(1.0, (float(total) - both_ways) / 2.0), "osm:lanes_total_split"
+
+
+def _explicit_speed_kph(data) -> float | None:
+    reversed_value = data.get("reversed", False)
+    reversed_edge = reversed_value is True or str(reversed_value).lower() == "true"
+    directional_key = "maxspeed:backward" if reversed_edge else "maxspeed:forward"
+    for value in (data.get(directional_key), data.get("maxspeed")):
+        values = value if isinstance(value, (list, tuple, set, np.ndarray)) else [value]
+        parsed = []
+        for item in values:
+            if item is None:
+                continue
+            match = re.search(r"[-+]?\d*\.?\d+", str(item))
+            if not match:
+                continue
+            speed = float(match.group())
+            if "mph" in str(item).lower():
+                speed *= 1.609344
+            parsed.append(speed)
+        if parsed:
+            return max(1.0, min(parsed))
+    return None
 
 
 def parse_speed_kph(value, highway=None) -> float:
@@ -160,8 +224,22 @@ def prepare_source_graph(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
     result = copy.deepcopy(graph)
     result.graph.pop("simplified", None)
     result.graph.pop("consolidated", None)
+    observed_speeds = defaultdict(list)
+    for _, _, _, data in result.edges(keys=True, data=True):
+        speed = _explicit_speed_kph(data)
+        if speed is not None:
+            for highway in highway_values(data.get("highway")):
+                observed_speeds[highway].append(speed)
+    class_medians = {
+        highway: float(np.median(values))
+        for highway, values in observed_speeds.items() if values
+    }
     for u, v, key, data in result.edges(keys=True, data=True):
-        for attribute in ("highway", "maxspeed", "lanes", "name", "ref", "osmid"):
+        for attribute in (
+            "highway", "maxspeed", "maxspeed:forward", "maxspeed:backward",
+            "lanes", "lanes:forward", "lanes:backward", "lanes:both_ways",
+            "name", "ref", "osmid",
+        ):
             if isinstance(data.get(attribute), list):
                 data[attribute] = tuple(data[attribute])
         if data.get("geometry") is None:
@@ -180,11 +258,27 @@ def prepare_source_graph(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
                 )
             elif geometry is not None:
                 length = float(geometry.length)
-        speed_kph = parse_speed_kph(data.get("maxspeed"), data.get("highway"))
+        speed_kph = _explicit_speed_kph(data)
+        if speed_kph is not None:
+            speed_source = "osm:maxspeed"
+        else:
+            medians = [
+                class_medians[tag] for tag in highway_values(data.get("highway"))
+                if tag in class_medians
+            ]
+            if medians:
+                speed_kph = min(medians)
+                speed_source = "imputed:local_highway_median"
+            else:
+                speed_kph = parse_speed_kph(None, data.get("highway"))
+                speed_source = "imputed:highway_default"
+        directional_lanes, lanes_source = parse_directional_lanes(data)
         data["length"] = float(length)
         data["speed_kph"] = speed_kph
+        data["speed_source"] = speed_source
         data["travel_time"] = length / (speed_kph * 1000.0 / 3600.0) if length > 0 else math.nan
-        data["lanes_numeric"] = parse_lanes(data.get("lanes"))
+        data["lanes_numeric"] = directional_lanes
+        data["lanes_source"] = lanes_source
         data["source_edge_ids"] = (f"{u}|{v}|{key}",)
     return result
 
@@ -233,6 +327,8 @@ def topology_simplify(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
                 "travel_time": sum,
                 "source_edge_ids": _flatten_unique,
                 "lanes_numeric": min,
+                "speed_source": _flatten_unique,
+                "lanes_source": _flatten_unique,
             },
         )
         for _, _, _, data in simplified.edges(keys=True, data=True):

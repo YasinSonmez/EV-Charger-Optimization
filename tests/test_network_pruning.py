@@ -17,12 +17,50 @@ from src.network_pruning import (
     consolidate_intersections,
     filter_highways,
     path_fidelity,
+    parse_directional_lanes,
     prepare_source_graph,
     project_graph,
     recover_directed_connectors,
     removable_pass_through_nodes,
     topology_simplify,
 )
+
+
+def test_directional_lanes_do_not_duplicate_two_way_total():
+    forward, forward_source = parse_directional_lanes({
+        "lanes": "2", "oneway": False, "reversed": False,
+    })
+    reverse, reverse_source = parse_directional_lanes({
+        "lanes": "2", "oneway": False, "reversed": True,
+    })
+    assert forward == pytest.approx(1.0)
+    assert reverse == pytest.approx(1.0)
+    assert forward_source == reverse_source == "osm:lanes_total_split"
+
+
+def test_explicit_directional_lanes_take_priority():
+    lanes, source = parse_directional_lanes({
+        "lanes": "5", "lanes:forward": "3", "lanes:backward": "2",
+        "oneway": False, "reversed": True,
+    })
+    assert lanes == pytest.approx(2.0)
+    assert source == "osm:lanes:backward"
+
+
+def test_missing_speed_uses_local_highway_median():
+    graph = _graph()
+    _add_node(graph, 0, 0, 0)
+    _add_node(graph, 1, 10, 0)
+    _add_node(graph, 2, 20, 0)
+    _add_edge(graph, 0, 1, highway="secondary")
+    _add_edge(graph, 1, 2, highway="secondary")
+    graph.edges[0, 1, 0]["maxspeed"] = "40 mph"
+    graph.edges[1, 2, 0].pop("maxspeed")
+
+    prepared = prepare_source_graph(graph)
+
+    assert prepared.edges[1, 2, 0]["speed_kph"] == pytest.approx(64.37376)
+    assert prepared.edges[1, 2, 0]["speed_source"] == "imputed:local_highway_median"
 
 
 def _graph(crs="EPSG:32618"):
@@ -56,6 +94,7 @@ def test_graph_download_uses_configured_root_for_osmnx_cache(tmp_path, monkeypat
 
     def fake_graph_from_bbox(*args, **kwargs):
         observed["cache_folder"] = Path(ox.settings.cache_folder)
+        observed["useful_tags_way"] = set(ox.settings.useful_tags_way)
         return nx.MultiDiGraph()
 
     import osmnx as ox
@@ -71,6 +110,10 @@ def test_graph_download_uses_configured_root_for_osmnx_cache(tmp_path, monkeypat
 
     assert observed["cache_folder"] == tmp_path / "osmnx"
     assert observed["cache_folder"].is_dir()
+    assert {
+        "lanes:forward", "lanes:backward", "lanes:both_ways",
+        "maxspeed:forward", "maxspeed:backward",
+    }.issubset(observed["useful_tags_way"])
 
 
 def test_mixed_highway_tag_keeps_any_allowed_member():
