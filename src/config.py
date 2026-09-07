@@ -36,6 +36,8 @@ SCENARIO_DEFAULTS = {
     "num_chargers": 2,
     "candidate_strategy": "interchanges_then_farthest_point",
     "interchange_merge_diameter_m": 250.0,
+    "candidate_max_detour_ratio": 1.10,
+    "candidate_corridor_radius_m": 500.0,
     "od_pair_count": 1,
     "od_strategy": "boundary_max_separation",
     "boundary_pool_size": 64,
@@ -494,7 +496,9 @@ class Config:
         scenario = self.scenario_generation
         if not scenario.get("enabled", False):
             return
-        if scenario.get("candidate_strategy") != "interchanges_then_farthest_point":
+        if scenario.get("candidate_strategy") not in {
+            "interchanges_then_farthest_point", "od_corridor_interchanges"
+        }:
             raise ValueError("unsupported scenario_generation.candidate_strategy")
         if scenario.get("od_strategy") != "boundary_max_separation":
             raise ValueError("unsupported scenario_generation.od_strategy")
@@ -503,6 +507,21 @@ class Config:
             raise ValueError("scenario_generation.candidate_count must be >= num_chargers")
         if int(scenario.get("od_pair_count", 0)) < 1:
             raise ValueError("scenario_generation.od_pair_count must be >= 1")
+        if (
+            scenario.get("candidate_strategy") == "od_corridor_interchanges"
+            and candidate_count < int(scenario.get("od_pair_count", 1))
+        ):
+            raise ValueError(
+                "od_corridor_interchanges requires candidate_count >= od_pair_count"
+            )
+        if float(scenario.get("candidate_max_detour_ratio", 1.10)) < 1:
+            raise ValueError(
+                "scenario_generation.candidate_max_detour_ratio must be >= 1"
+            )
+        if float(scenario.get("candidate_corridor_radius_m", 500.0)) <= 0:
+            raise ValueError(
+                "scenario_generation.candidate_corridor_radius_m must be positive"
+            )
         if int(scenario.get("boundary_pool_size", 0)) < 2:
             raise ValueError("scenario_generation.boundary_pool_size must be >= 2")
         demand = scenario.get("demand", {})

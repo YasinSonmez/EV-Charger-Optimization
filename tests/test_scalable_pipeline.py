@@ -52,3 +52,56 @@ def test_scenario_generation_is_deterministic_and_feasible():
     assert first == second
     assert len(first.candidate_node_ids) == 3
     assert list(first.od_demand.values()) == [[2, 3]]
+
+
+def test_od_corridor_candidates_respect_detour_limit_for_multiple_ods():
+    nodes = pd.DataFrame({
+        "node_id": list(range(12)),
+        "lon": [-77.06 + 0.01 * (i % 6) for i in range(12)],
+        "lat": [38.90] * 6 + [38.91] * 6,
+    })
+    starts, ends = [], []
+    undirected = (
+        [(i, i + 1) for i in range(5)]
+        + [(i, i + 1) for i in range(6, 11)]
+        + [(0, 6), (5, 11)]
+    )
+    for start, end in undirected:
+        starts.extend([start, end])
+        ends.extend([end, start])
+    edges = pd.DataFrame({
+        "link_id": list(range(len(starts))),
+        "start_node_id": starts, "end_node_id": ends,
+        "length": [100.0] * len(starts),
+        "travel_time": [10.0] * len(starts),
+        "type": ["secondary"] * len(starts),
+    })
+    road_net = SimpleNamespace(nodes=nodes, edges=edges)
+    settings = {
+        "candidate_count": 4,
+        "candidate_strategy": "od_corridor_interchanges",
+        "candidate_max_detour_ratio": 1.25,
+        "candidate_corridor_radius_m": 500,
+        "interchange_merge_diameter_m": 250,
+        "od_pair_count": 2, "boundary_pool_size": 12,
+        "demand": {"F1": 2, "F2": 3}, "seed": 42,
+    }
+
+    first = generate_scenario(road_net, settings)
+    second = generate_scenario(road_net, settings)
+
+    assert first == second
+    assert len(first.od_demand) == 2
+    assert len(first.candidate_node_ids) == 4
+    assert all(
+        candidate["minimum_detour_ratio"] <= 1.25
+        for candidate in first.metadata["candidates"]
+    )
+    assert all(
+        candidate["minimum_corridor_distance_m"] <= 500
+        for candidate in first.metadata["candidates"]
+    )
+    assert all(
+        values["selected_candidates_within_limit"] >= 1
+        for values in first.metadata["candidate_diagnostics"]["per_od"].values()
+    )

@@ -92,3 +92,28 @@ def test_get_queue_param():
     cfg = Config.from_dict(VALID_CONFIG)
     assert cfg.get_queue_param("K") == 8
     assert cfg.get_queue_param("NONEXISTENT", "default") == "default"
+
+
+def test_corridor_candidate_configuration_validation():
+    raw = {
+        **VALID_CONFIG,
+        "scenario_generation": {
+            "candidate_count": 2,
+            "num_chargers": 1,
+            "candidate_strategy": "od_corridor_interchanges",
+            "candidate_max_detour_ratio": 1.25,
+            "od_pair_count": 2,
+        },
+    }
+    config = Config.from_dict(raw)
+    assert config.scenario_generation["candidate_max_detour_ratio"] == 1.25
+
+    raw = {
+        **raw,
+        "num_chargers": 1,
+        "scenario_generation": {
+            **raw["scenario_generation"], "candidate_count": 1,
+        },
+    }
+    with pytest.raises(ValueError, match="candidate_count >= od_pair_count"):
+        Config.from_dict(raw)

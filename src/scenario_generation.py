@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 import networkx as nx
 import numpy as np
+from shapely.geometry import LineString, Point
 
 from src.network_coarsening import select_charger_candidate_layer
 from src.network_pruning import project_graph
@@ -107,26 +108,187 @@ def _select_od_pairs(
     )
 
 
+def _select_corridor_candidates(
+    graph: nx.MultiDiGraph,
+    od_pairs: list[tuple[int, int]],
+    *,
+    count: int,
+    max_detour_ratio: float,
+    corridor_radius_m: float,
+    interchange_merge_diameter_m: float,
+):
+    """Select interchange-aware candidates near one or more OD corridors.
+
+    A node is in an OD corridor when routing through it adds no more than the
+    configured free-flow detour. Candidate slots are first divided among ODs,
+    then any unfilled slots are selected from the union of all corridors.
+    """
+    reverse = graph.reverse(copy=False)
+    contexts = []
+    endpoints = {node for pair in od_pairs for node in pair}
+    for origin, destination in od_pairs:
+        baseline = float(nx.shortest_path_length(
+            graph, origin, destination, weight="travel_time"
+        ))
+        from_origin = nx.single_source_dijkstra_path_length(
+            graph, origin, weight="travel_time"
+        )
+        to_destination = nx.single_source_dijkstra_path_length(
+            reverse, destination, weight="travel_time"
+        )
+        route = nx.shortest_path(
+            graph, origin, destination, weight="travel_time"
+        )
+        route_line = LineString([
+            (float(graph.nodes[node]["x"]), float(graph.nodes[node]["y"]))
+            for node in route
+        ])
+        ratios = {
+            node: (float(from_origin[node]) + float(to_destination[node])) / baseline
+            for node in graph
+            if node not in endpoints
+            and node in from_origin and node in to_destination
+        }
+        distances = {
+            node: float(Point(
+                float(graph.nodes[node]["x"]), float(graph.nodes[node]["y"])
+            ).distance(route_line))
+            for node in ratios
+        }
+        eligible = {
+            node for node, ratio in ratios.items()
+            if ratio <= float(max_detour_ratio) + 1e-12
+            and distances[node] <= float(corridor_radius_m) + 1e-9
+        }
+        contexts.append({
+            "od": (origin, destination), "baseline": baseline,
+            "ratios": ratios, "distances": distances, "eligible": eligible,
+        })
+
+    selected = []
+    candidate_metadata = {}
+    base_quota, remainder = divmod(int(count), len(contexts))
+    for index, context in enumerate(contexts):
+        quota = base_quota + (1 if index < remainder else 0)
+        quota = min(quota, len(context["eligible"]))
+        if quota <= 0:
+            continue
+        local_graph = graph.subgraph(context["eligible"]).copy()
+        local, local_metadata, _ = select_charger_candidate_layer(
+            local_graph,
+            max_candidates=quota,
+            interchange_merge_diameter_m=interchange_merge_diameter_m,
+        )
+        for node in local:
+            if node not in candidate_metadata:
+                selected.append(node)
+                candidate_metadata[node] = local_metadata[node]
+
+    eligible_union = set().union(*(context["eligible"] for context in contexts))
+    if len(selected) < int(count) and eligible_union:
+        union_graph = graph.subgraph(eligible_union).copy()
+        fill_count = min(len(eligible_union), int(count) + len(selected))
+        fill, fill_metadata, _ = select_charger_candidate_layer(
+            union_graph,
+            max_candidates=fill_count,
+            interchange_merge_diameter_m=interchange_merge_diameter_m,
+        )
+        for node in fill:
+            if node in candidate_metadata:
+                continue
+            selected.append(node)
+            candidate_metadata[node] = fill_metadata[node]
+            if len(selected) == int(count):
+                break
+
+    if len(selected) < int(count):
+        raise ValueError(
+            f"only {len(selected)} distinct candidate nodes satisfy the "
+            f"maximum detour ratio {max_detour_ratio}; requested {count}"
+        )
+
+    for node in selected:
+        ratios = {
+            f"{origin},{destination}": float(context["ratios"][node])
+            for context in contexts
+            for origin, destination in [context["od"]]
+        }
+        closest_od = min(ratios, key=ratios.get)
+        candidate_metadata[node].update({
+            "detour_ratios": ratios,
+            "minimum_detour_ratio": float(ratios[closest_od]),
+            "corridor_distances_m": {
+                f"{context['od'][0]},{context['od'][1]}": float(
+                    context["distances"][node]
+                )
+                for context in contexts
+            },
+            "minimum_corridor_distance_m": float(min(
+                context["distances"][node] for context in contexts
+            )),
+            "closest_od": closest_od,
+        })
+
+    diagnostics = {
+        "candidate_count": len(selected),
+        "eligible_candidate_nodes": len(eligible_union),
+        "maximum_detour_ratio": float(max_detour_ratio),
+        "corridor_radius_m": float(corridor_radius_m),
+        "selected_minimum_detour_ratio_max": float(max(
+            candidate_metadata[node]["minimum_detour_ratio"] for node in selected
+        )),
+        "per_od": {
+            f"{context['od'][0]},{context['od'][1]}": {
+                "baseline_free_flow_seconds": float(context["baseline"]),
+                "eligible_candidate_nodes": len(context["eligible"]),
+                "selected_candidates_within_limit": sum(
+                    context["ratios"][node] <= float(max_detour_ratio) + 1e-12
+                    for node in selected
+                ),
+            }
+            for context in contexts
+        },
+    }
+    return selected, candidate_metadata, diagnostics
+
+
 def generate_scenario(road_net, settings: dict) -> GeneratedScenario:
     """Select candidates and OD demand without requiring canonical node IDs."""
     graph = _canonical_graph(road_net)
     if not nx.is_strongly_connected(graph):
         raise ValueError("scenario generation requires a strongly connected graph")
     projected = project_graph(graph)
-    candidates, candidate_metadata, diagnostics = select_charger_candidate_layer(
-        projected,
-        max_candidates=int(settings["candidate_count"]),
-        interchange_merge_diameter_m=float(
-            settings.get("interchange_merge_diameter_m", 250.0)
-        ),
+    strategy = settings.get(
+        "candidate_strategy", "interchanges_then_farthest_point"
     )
+    candidate_count = int(settings["candidate_count"])
+    merge_diameter = float(settings.get("interchange_merge_diameter_m", 250.0))
+    od_count = int(settings.get("od_pair_count", 1))
+    boundary_pool_size = int(settings.get("boundary_pool_size", 64))
+    if strategy == "interchanges_then_farthest_point":
+        candidates, candidate_metadata, diagnostics = select_charger_candidate_layer(
+            projected,
+            max_candidates=candidate_count,
+            interchange_merge_diameter_m=merge_diameter,
+        )
+        od_pairs = _select_od_pairs(
+            projected, candidates, count=od_count,
+            boundary_pool_size=boundary_pool_size,
+        )
+    elif strategy == "od_corridor_interchanges":
+        od_pairs = _select_od_pairs(
+            projected, [], count=od_count,
+            boundary_pool_size=boundary_pool_size,
+        )
+        candidates, candidate_metadata, diagnostics = _select_corridor_candidates(
+            projected, od_pairs, count=candidate_count,
+            max_detour_ratio=float(settings.get("candidate_max_detour_ratio", 1.10)),
+            corridor_radius_m=float(settings.get("candidate_corridor_radius_m", 500.0)),
+            interchange_merge_diameter_m=merge_diameter,
+        )
+    else:
+        raise ValueError(f"unsupported candidate strategy: {strategy}")
     candidates = [int(node) for node in candidates]
-    od_pairs = _select_od_pairs(
-        projected,
-        candidates,
-        count=int(settings.get("od_pair_count", 1)),
-        boundary_pool_size=int(settings.get("boundary_pool_size", 64)),
-    )
     demand = settings.get("demand", {})
     od_demand = {
         f"{int(origin)},{int(destination)}": [
@@ -136,7 +298,7 @@ def generate_scenario(road_net, settings: dict) -> GeneratedScenario:
     }
     metadata = {
         "strategy": {
-            "candidates": "interchanges_then_farthest_point",
+            "candidates": strategy,
             "od": "boundary_max_separation",
         },
         "seed": int(settings.get("seed", 42)),
@@ -147,6 +309,17 @@ def generate_scenario(road_net, settings: dict) -> GeneratedScenario:
                 "lat": float(graph.nodes[node]["lat"]),
                 "lon": float(graph.nodes[node]["lon"]),
                 "kind": candidate_metadata[node]["kind"],
+                "minimum_detour_ratio": candidate_metadata[node].get(
+                    "minimum_detour_ratio"
+                ),
+                "closest_od": candidate_metadata[node].get("closest_od"),
+                "detour_ratios": candidate_metadata[node].get("detour_ratios"),
+                "minimum_corridor_distance_m": candidate_metadata[node].get(
+                    "minimum_corridor_distance_m"
+                ),
+                "corridor_distances_m": candidate_metadata[node].get(
+                    "corridor_distances_m"
+                ),
             }
             for node in candidates
         ],
