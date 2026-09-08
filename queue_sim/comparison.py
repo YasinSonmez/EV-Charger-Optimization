@@ -8,7 +8,6 @@ import pickle
 import random
 import time
 import warnings
-from itertools import combinations
 from multiprocessing import Pool
 
 import numpy as np
@@ -18,7 +17,14 @@ warnings.filterwarnings('ignore')
 
 from queue_sim import Runner, QUEUE_SIM_AVAILABLE
 from queue_sim.find_nash import CYCLE_APPROXIMATION_STATUS, _prune_flow_data
-from src.contracts import normalize_od_demand, SeedManager
+from src.contracts import (
+    SeedManager,
+    canonical_placement,
+    enumerate_placements,
+    normalize_od_demand,
+    ordered_unique_positions,
+    single_swap_neighbors,
+)
 from src.network_artifact import load_network_artifact
 from src.run_state import available_cpus
 
@@ -40,7 +46,7 @@ def _assignment_is_usable(value):
 def _run_sim(positions, data, ne, k, demand_classes, input_paths, output_root,
              ent_cap, ch_cap, ex_cap, cost, simulation_horizon,
              seed=None, scenario='placement'):
-    locs = tuple(sorted(set(positions)))
+    locs = canonical_placement(positions)
     loc_str = ','.join(map(str, locs))
     if loc_str not in ne:
         raise KeyError(f'No Nash assignment for charger placement {loc_str}')
@@ -70,30 +76,45 @@ def _run_sim(positions, data, ne, k, demand_classes, input_paths, output_root,
     return float(runner.tot_travel_time)
 
 
-def _greedy_rep(args):
+def _comparison_rep(args):
+    """Run one paired replication, caching each unordered placement once."""
     (rep, file_path, ne_path, k, num_stations, possible_positions,
      demand_classes, input_paths, work_dir, ent_cap, ch_cap, ex_cap, cost,
-     simulation_horizon, single_swap, seed) = args
+     simulation_horizon, single_swap, combinations_list, seed) = args
     with open(file_path, 'rb') as handle:
         data = pickle.load(handle)
     with open(ne_path, 'rb') as handle:
         ne = pickle.load(handle)
 
+    cache = {}
+    cache_elapsed = {}
+    cache_hits = 0
+
+    def evaluate(positions):
+        nonlocal cache_hits
+        placement = canonical_placement(positions)
+        if placement in cache:
+            cache_hits += 1
+            return cache[placement]
+        started = time.perf_counter()
+        cache[placement] = _run_sim(
+            placement, data, ne, k, demand_classes, input_paths, work_dir,
+            ent_cap, ch_cap, ex_cap, cost, simulation_horizon,
+            seed=SeedManager(seed).derive('placement', rep, placement),
+            scenario=f'comparison_rep_{rep}',
+        )
+        cache_elapsed[placement] = time.perf_counter() - started
+        return cache[placement]
+
     best_positions = []
     best_time = float('inf')
-    remaining = list(possible_positions)
+    remaining = list(ordered_unique_positions(possible_positions))
     for _ in range(num_stations):
         best_round_time = float('inf')
         new_best = None
         for candidate in remaining:
-            positions = [candidate] + best_positions
-            value = _run_sim(
-                positions, data, ne, k, demand_classes, input_paths, work_dir,
-                ent_cap, ch_cap, ex_cap, cost,
-                simulation_horizon,
-                seed=SeedManager(seed).derive('placement', rep, positions),
-                scenario=f'greedy_rep_{rep}',
-            )
+            positions = canonical_placement([candidate] + best_positions)
+            value = evaluate(positions)
             if value < best_round_time:
                 best_round_time = value
                 new_best = candidate
@@ -104,49 +125,138 @@ def _greedy_rep(args):
         best_time = best_round_time
 
     if single_swap:
-        improved = True
-        while improved:
-            improved = False
-            for unsel in possible_positions:
-                if unsel in best_positions:
-                    continue
-                for index, _selected in enumerate(best_positions):
-                    trial = list(best_positions)
-                    trial[index] = unsel
-                    value = _run_sim(
-                        trial, data, ne, k, demand_classes, input_paths, work_dir,
-                        ent_cap, ch_cap, ex_cap, cost,
-                        simulation_horizon,
-                        seed=SeedManager(seed).derive('placement', rep, trial),
-                        scenario=f'greedy_swap_rep_{rep}',
-                    )
-                    if value < best_time:
-                        best_time = value
-                        best_positions = trial
-                        improved = True
-                        break
-                if improved:
-                    break
-    return best_positions, best_time
+        swap_results = [
+            (evaluate(trial), trial)
+            for trial in single_swap_neighbors(best_positions, possible_positions)
+        ]
+        if swap_results:
+            swap_time, swap_positions = min(
+                swap_results, key=lambda value: (value[0], value[1])
+            )
+            if swap_time < best_time:
+                best_time = swap_time
+                best_positions = list(swap_positions)
+
+    exhaustive_values = [evaluate(combination) for combination in combinations_list]
+    return {
+        'greedy_positions': canonical_placement(best_positions),
+        'greedy_time': float(best_time),
+        'exhaustive_values': exhaustive_values,
+        'placement_values': cache,
+        'placement_elapsed_seconds': cache_elapsed,
+        'unique_simulations': len(cache),
+        'cache_hits': cache_hits,
+    }
 
 
-def _exhaustive_rep(args):
-    (rep, file_path, ne_path, k, combs, demand_classes, input_paths,
-     work_dir, ent_cap, ch_cap, ex_cap, cost, simulation_horizon, seed) = args
-    with open(file_path, 'rb') as handle:
-        data = pickle.load(handle)
-    with open(ne_path, 'rb') as handle:
-        ne = pickle.load(handle)
-    values = []
-    for combination in combs:
-        values.append(_run_sim(
-            list(combination), data, ne, k, demand_classes, input_paths, work_dir,
-            ent_cap, ch_cap, ex_cap, cost,
-            simulation_horizon,
-            seed=SeedManager(seed).derive('placement', rep, combination),
-            scenario=f'exhaustive_rep_{rep}',
+def _build_queue_search_summary(
+    paired_results, possible_positions, num_stations, single_swap,
+):
+    """Reconstruct one mean-objective search path from paired replications."""
+    candidates = ordered_unique_positions(possible_positions)
+    sample_count = len(paired_results)
+    samples = {}
+    elapsed = {}
+    for result in paired_results:
+        for placement, value in result['placement_values'].items():
+            placement = canonical_placement(placement)
+            samples.setdefault(placement, []).append(float(value))
+        for placement, value in result['placement_elapsed_seconds'].items():
+            placement = canonical_placement(placement)
+            elapsed[placement] = elapsed.get(placement, 0.0) + float(value)
+    objective = {
+        placement: float(np.mean(values))
+        for placement, values in samples.items()
+        if len(values) == sample_count
+    }
+
+    trace = []
+    trace_by_placement = {}
+
+    def record(placement, phase, round_index=None):
+        placement = canonical_placement(placement)
+        if placement not in objective:
+            raise RuntimeError(
+                'Mean queue search is missing complete paired observations for '
+                f'placement {placement}'
+            )
+        if placement in trace_by_placement:
+            trace_by_placement[placement]['also_used_by'].append(phase)
+            return
+        item = {
+            'evaluation_order': len(trace) + 1,
+            'phase': phase,
+            'round': round_index,
+            'placement': list(placement),
+            'objective': objective[placement],
+            'worker_seconds': float(elapsed.get(placement, 0.0)),
+            'also_used_by': [],
+        }
+        trace.append(item)
+        trace_by_placement[placement] = item
+
+    selected = ()
+    greedy_rounds = []
+    for round_index in range(1, int(num_stations) + 1):
+        trials = [
+            canonical_placement(selected + (candidate,))
+            for candidate in candidates if candidate not in selected
+        ]
+        for placement in trials:
+            record(placement, 'greedy', round_index)
+        selected = min(trials, key=lambda value: objective[value])
+        greedy_rounds.append({
+            'round': round_index,
+            'trials': [list(value) for value in trials],
+            'selected': list(selected),
+            'objective': objective[selected],
+        })
+    greedy_selection = selected
+
+    swap_selection = greedy_selection
+    if single_swap:
+        swap_trials = single_swap_neighbors(greedy_selection, candidates)
+        for placement in swap_trials:
+            record(placement, 'single_swap')
+        swap_selection = min(
+            [greedy_selection] + swap_trials,
+            key=lambda value: objective[value],
+        )
+
+    exhaustive_trials = enumerate_placements(candidates, num_stations)
+    for placement in exhaustive_trials:
+        record(placement, 'exhaustive')
+    exhaustive_selection = min(
+        exhaustive_trials, key=lambda value: objective[value]
+    )
+
+    phase_worker_seconds = {
+        phase: float(sum(
+            item['worker_seconds'] for item in trace if item['phase'] == phase
         ))
-    return values
+        for phase in ('greedy', 'single_swap', 'exhaustive')
+    }
+    return {
+        'candidate_order': list(candidates),
+        'num_chargers': int(num_stations),
+        'single_swap_enabled': bool(single_swap),
+        'greedy': {
+            'placement': list(greedy_selection),
+            'objective': objective[greedy_selection],
+        },
+        'single_swap': {
+            'placement': list(swap_selection),
+            'objective': objective[swap_selection],
+        },
+        'exhaustive': {
+            'placement': list(exhaustive_selection),
+            'objective': objective[exhaustive_selection],
+        },
+        'greedy_rounds': greedy_rounds,
+        'trace': trace,
+        'phase_worker_seconds': phase_worker_seconds,
+        'paired_replications': sample_count,
+    }
 
 
 def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_path,
@@ -215,49 +325,57 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
     seed = seed_manager.seed if seed_manager is not None else config.pipeline.get('random_seed', 0)
     num_stations = config.num_chargers
     possible_positions = config.possible_charger_positions
-    combinations_list = [list(c) for c in combinations(possible_positions, num_stations)]
+    combinations_list = enumerate_placements(possible_positions, num_stations)
+    required_placements = set(combinations_list) | set(
+        enumerate_placements(possible_positions, 1)
+    )
+    cg_placements = {
+        canonical_placement(value) for value in data.get('configurations', {})
+    }
+    missing_cg = sorted(required_placements - cg_placements)
+    missing_ne = sorted(
+        placement for placement in required_placements
+        if ','.join(map(str, placement)) not in ne
+    )
+    if missing_cg or missing_ne:
+        raise ValueError(
+            'Queue comparison placement universe does not match CG/NE outputs: '
+            f'missing_from_cg={missing_cg}, missing_from_ne={missing_ne}'
+        )
     sim_args = (
         demand_classes, input_paths, work_dir, q['ENT_CAPACITY'],
         q['CHARGING_CAPACITY'], q['EXIT_CAPACITY'], q['COST'],
         q.get('SIMULATION_HORIZON', 10801),
     )
 
-    greedy_args = [
+    comparison_args = [
         (rep, all_opt_results_path, ne_assignments_path, k, num_stations,
-         possible_positions, *sim_args, q.get('single_swap', True), seed)
+         possible_positions, *sim_args, q.get('single_swap', True),
+         combinations_list, seed)
         for rep in range(n_reps)
     ]
     with Pool(workers) as pool:
-        greedy_raw = pool.map(_greedy_rep, greedy_args)
+        paired_raw = pool.map(_comparison_rep, comparison_args)
 
-    position_history = [value[0] for value in greedy_raw]
-    time_history = [value[1] for value in greedy_raw]
-    unique_positions = []
-    for positions in position_history:
-        normalized = sorted(positions)
-        if normalized not in unique_positions:
-            unique_positions.append(normalized)
-    greedy_results = []
-    for positions in unique_positions:
-        values = [time_history[i] for i, observed in enumerate(position_history)
-                  if sorted(observed) == positions]
-        greedy_results.append({'positions': positions, 'avg_travel_time': float(np.mean(values))})
-
-    exhaustive_args = [
-        (rep, all_opt_results_path, ne_assignments_path, k, combinations_list,
-         *sim_args, seed)
-        for rep in range(n_reps)
-    ]
-    with Pool(workers) as pool:
-        exhaustive_raw = pool.map(_exhaustive_rep, exhaustive_args)
-    exhaustive_values = np.asarray(exhaustive_raw, dtype=float)
+    exhaustive_values = np.asarray(
+        [value['exhaustive_values'] for value in paired_raw], dtype=float
+    )
     exhaustive_avg = np.mean(exhaustive_values, axis=0).tolist()
+    search = _build_queue_search_summary(
+        paired_raw, possible_positions, num_stations,
+        q.get('single_swap', True),
+    )
+    post_greedy = search['single_swap'] if q.get('single_swap', True) else search['greedy']
+    greedy_results = [{
+        'positions': post_greedy['placement'],
+        'avg_travel_time': float(post_greedy['objective']),
+    }]
     exhaustive_results = [
-        {'positions': combination, 'avg_travel_time': float(value)}
+        {'positions': list(combination), 'avg_travel_time': float(value)}
         for combination, value in zip(combinations_list, exhaustive_avg)
     ]
 
-    best_greedy = min(greedy_results, key=lambda value: value['avg_travel_time'])
+    best_greedy = greedy_results[0]
     best_exhaustive = min(exhaustive_results, key=lambda value: value['avg_travel_time'])
     best_e_time = best_exhaustive['avg_travel_time']
     suboptimality = (
@@ -277,13 +395,26 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
             if approximate else 'converged_nash'
         ),
         'best_greedy': best_greedy,
+        'greedy_before_swap': {
+            'positions': search['greedy']['placement'],
+            'avg_travel_time': search['greedy']['objective'],
+        },
+        'best_single_swap': {
+            'positions': search['single_swap']['placement'],
+            'avg_travel_time': search['single_swap']['objective'],
+        },
         'best_exhaustive': best_exhaustive,
         'suboptimality_pct': float(suboptimality),
         'greedy_results': greedy_results,
         'exhaustive_results': exhaustive_results,
+        'placement_search': search,
         'config': {
             'N': n_reps, 'K': k, 'num_stations': num_stations,
             'single_swap': q.get('single_swap', True),
+            'greedy_method': (
+                'greedy_plus_single_swap'
+                if q.get('single_swap', True) else 'greedy'
+            ),
             'multi_od': True,
         },
         'network_hash': network_manifest['network_hash'],
@@ -293,6 +424,13 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
             'workers_requested': workers_requested,
             'workers_available': available_workers,
             'replications': int(n_reps),
+            'unique_simulations': int(sum(
+                value['unique_simulations'] for value in paired_raw
+            )),
+            'placement_cache_hits': int(sum(
+                value['cache_hits'] for value in paired_raw
+            )),
+            'paired_placement_cache': True,
         },
     }
     result_path = os.path.join(work_dir, 'comparison_results.json')

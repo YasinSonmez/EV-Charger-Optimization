@@ -16,7 +16,12 @@ warnings.filterwarnings('ignore')
 
 from queue_sim import Runner, QUEUE_SIM_AVAILABLE
 from queue_sim.bpr_data_generator import _departure_schedule
-from src.contracts import DemandClass, SeedManager, normalize_od_demand
+from src.contracts import (
+    DemandClass,
+    SeedManager,
+    canonical_placement,
+    normalize_od_demand,
+)
 from src.network_artifact import load_network_artifact
 from src.run_state import available_cpus
 
@@ -567,7 +572,10 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
         json.dump(manifest, handle, indent=2)
 
     input_paths = (nodes_path, edges_path, od_path)
-    configs = list(data['configurations'].keys())
+    configs = sorted(
+        {canonical_placement(value) for value in data['configurations']},
+        key=lambda value: (len(value), value),
+    )
     if resume:
         reused = _reuse_saved_cycle_assignments(
             work_dir, manifest['network_hash'], len(configs),
@@ -606,7 +614,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             raise ValueError('queue_simulation.resume_from must contain a mapping')
 
     for charger_locs in configs:
-        charger_locs_tuple = tuple(charger_locs)
+        charger_locs_tuple = canonical_placement(charger_locs)
         loc_str = ','.join(map(str, charger_locs_tuple))
         flow_data = _prune_flow_data(data, charger_locs_tuple, q['K'])
         assignments_no = {}

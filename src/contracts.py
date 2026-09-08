@@ -12,6 +12,7 @@ import hashlib
 import json
 import random
 import time
+from itertools import combinations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -20,6 +21,44 @@ import numpy as np
 
 VEHICLE_TYPES = ("F1", "F2")
 BPR_CALIBRATION_VERSION = "offered_cohort_entry_wait_v2"
+
+
+def canonical_placement(positions: Iterable[int]) -> tuple[int, ...]:
+    """Return the order-independent identity of a charger placement."""
+    return tuple(sorted({int(position) for position in positions}))
+
+
+def ordered_unique_positions(positions: Iterable[int]) -> tuple[int, ...]:
+    """Preserve configured candidate order while removing duplicates."""
+    return tuple(dict.fromkeys(int(position) for position in positions))
+
+
+def enumerate_placements(
+    possible_positions: Iterable[int], size: int,
+) -> list[tuple[int, ...]]:
+    """Enumerate unique charger sets in deterministic canonical order."""
+    candidates = ordered_unique_positions(possible_positions)
+    size = int(size)
+    if size < 0 or size > len(candidates):
+        raise ValueError(
+            f"placement size {size} is invalid for {len(candidates)} candidates"
+        )
+    return [canonical_placement(values) for values in combinations(candidates, size)]
+
+
+def single_swap_neighbors(
+    placement: Iterable[int], possible_positions: Iterable[int],
+) -> list[tuple[int, ...]]:
+    """Return every unique placement reachable by exactly one replacement."""
+    selected = ordered_unique_positions(placement)
+    candidates = ordered_unique_positions(possible_positions)
+    neighbors = [
+        canonical_placement(set(selected) - {removed} | {added})
+        for removed in selected
+        for added in candidates
+        if added not in selected
+    ]
+    return list(dict.fromkeys(neighbors))
 
 
 @dataclass(frozen=True)

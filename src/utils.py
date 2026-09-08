@@ -6,7 +6,6 @@ import pickle
 import re
 import glob
 from datetime import datetime
-from itertools import combinations
 from math import comb
 import shutil # For copying the file
 import json # Added for loading config file
@@ -15,6 +14,11 @@ import resource
 
 from src.traffic_optimizer import Network
 from src.run_state import available_cpus
+from src.contracts import (
+    canonical_placement,
+    enumerate_placements,
+    single_swap_neighbors,
+)
 
 
 def _cg_placement_worker(job):
@@ -480,8 +484,13 @@ def _plot_flow_on_axis(grid, ax, title, flows, min_flow=None, max_flow=None, flo
 
 def save_all_flow_heatmaps(grids, config, results_folder, time_history=None):
     """Generate and save flow heatmaps for all configurations in the results folder"""
-    # Find the best configuration
-    best_idx = np.argmin([grid.travel_time_obj for grid in grids])
+    # Compare only placements with the requested final charger count.
+    target_size = int(config.get('num_chargers', 0))
+    eligible = [
+        index for index, grid in enumerate(grids)
+        if len(canonical_placement(grid.chargers)) == target_size
+    ]
+    best_idx = min(eligible, key=lambda index: grids[index].travel_time_obj)
     
     # heatmap_summary.txt replaced by unified run_summary.txt from pipeline.py
     
@@ -587,6 +596,8 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
     iteration_count = 0
     grids = []  # array of grids with different chargers
     configurations = {}  # Dictionary to store results for each configuration
+    placement_trace = []
+    phase_wall_seconds = {'greedy': 0.0, 'single_swap': 0.0, 'exhaustive': 0.0}
 
     chargers_set = set()
     best_charger = None
@@ -610,9 +621,10 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
         'max_iter': max_iter,
     }
 
-    def evaluate_placements(placements):
+    def evaluate_placements(placements, phase, round_index=None):
         nonlocal iteration_count
-        ordered = [tuple(sorted(item)) for item in placements]
+        phase_started = time.perf_counter()
+        ordered = list(dict.fromkeys(canonical_placement(item) for item in placements))
         resolved = {}
         jobs = []
         for placement in ordered:
@@ -649,6 +661,15 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
                 grid.plot_info()
             grids.append(grid)
             output.append(grid)
+            placement_trace.append({
+                'evaluation_order': len(placement_trace) + 1,
+                'phase': phase,
+                'round': round_index,
+                'placement': list(placement),
+                'objective': float(grid.travel_time_obj),
+                'worker_seconds': float(elapsed),
+            })
+        phase_wall_seconds[phase] += time.perf_counter() - phase_started
         return output
 
     # Step 1: Perform grid search to find the initial best placement
@@ -662,12 +683,14 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
                 chargers_i = (charger_ji,)
             else:
                 chargers_i = (best_charger) + (charger_ji,)
-                chargers_i = tuple(sorted(chargers_i))
+                chargers_i = canonical_placement(chargers_i)
             chargers_set.add(chargers_i)
             round_placements.append(chargers_i)
             round_candidates.append(charger_ji)
         for charger_ji, grid_i in zip(
-                round_candidates, evaluate_placements(round_placements)):
+                round_candidates, evaluate_placements(
+                    round_placements, 'greedy', num_chargers_j
+                )):
             if grid_i.travel_time_obj < best_charger_position_travel_time:
                 best_charger_position_travel_time = grid_i.travel_time_obj
                 best_charger_tmp = tuple(grid_i.chargers)
@@ -676,41 +699,78 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
         best_charger = best_charger_tmp
         possible_charger_positions_j.remove(best_charger_position_j)
 
+    greedy_selection = canonical_placement(best_charger)
+    greedy_objective = float(best_grid.travel_time_obj)
+    best_travel_time = float(best_grid.travel_time_obj)
+
     # Step 2: Single Swap Optimization (if enabled)
     if single_swap:
         best_chargers = best_charger
-        all_possible_swaps = []
-        for idx1, charger1 in enumerate(best_chargers):
-            for charger2 in possible_charger_positions:
-                if charger2 not in best_chargers:
-                    swapped_chargers = list(best_chargers)
-                    swapped_chargers[idx1] = charger2
-                    swapped_chargers = tuple(sorted(swapped_chargers))
-                    if swapped_chargers not in chargers_set:
-                        all_possible_swaps.append(swapped_chargers)
-                        chargers_set.add(swapped_chargers)
+        all_possible_swaps = [
+            placement
+            for placement in single_swap_neighbors(
+                best_chargers, possible_charger_positions
+            )
+            if placement not in chargers_set
+        ]
+        chargers_set.update(all_possible_swaps)
 
         # Evaluate independent swaps concurrently.
-        for grid_i in evaluate_placements(all_possible_swaps):
+        for grid_i in evaluate_placements(all_possible_swaps, 'single_swap'):
             if grid_i.travel_time_obj < best_travel_time:
                 best_travel_time = grid_i.travel_time_obj
-                best_charger = swapped_chargers
+                best_charger = canonical_placement(grid_i.chargers)
                 best_grid = grid_i
+    swap_selection = canonical_placement(best_charger)
+    swap_objective = float(best_grid.travel_time_obj)
 
     # Step 3: Full Search on All Possible Charger Combinations (if enabled)
     if calculate_on_all_possible_positions:
         exhaustive = []
-        for chargers_i in list(combinations(possible_charger_positions, num_chargers)):
-            chargers_i = tuple(sorted(chargers_i))
+        for chargers_i in enumerate_placements(possible_charger_positions, num_chargers):
             if chargers_i in chargers_set:
                 continue
             chargers_set.add(chargers_i)
             exhaustive.append(chargers_i)
-        for grid_i in evaluate_placements(exhaustive):
+        for grid_i in evaluate_placements(exhaustive, 'exhaustive'):
             if grid_i.travel_time_obj < best_travel_time:
                 best_travel_time = grid_i.travel_time_obj
-                best_charger = chargers_i
+                best_charger = canonical_placement(grid_i.chargers)
                 best_grid = grid_i
+
+    target_grids = [
+        grid for grid in grids
+        if len(canonical_placement(grid.chargers)) == int(num_chargers)
+    ]
+    if not target_grids:
+        raise RuntimeError('No target-size charger placement was evaluated')
+    exhaustive_best_grid = min(target_grids, key=lambda grid: grid.travel_time_obj)
+    exhaustive_selection = canonical_placement(exhaustive_best_grid.chargers)
+    exhaustive_objective = float(exhaustive_best_grid.travel_time_obj)
+    placement_search = {
+        'candidate_order': [int(value) for value in possible_charger_positions],
+        'num_chargers': int(num_chargers),
+        'single_swap_enabled': bool(single_swap),
+        'greedy': {
+            'placement': list(greedy_selection), 'objective': greedy_objective,
+        },
+        'single_swap': {
+            'placement': list(swap_selection), 'objective': swap_objective,
+        },
+        'exhaustive': {
+            'placement': list(exhaustive_selection),
+            'objective': exhaustive_objective,
+        },
+        'trace': placement_trace,
+        'phase_wall_seconds': phase_wall_seconds,
+        'phase_worker_seconds': {
+            phase: float(sum(
+                item['worker_seconds'] for item in placement_trace
+                if item['phase'] == phase
+            ))
+            for phase in phase_wall_seconds
+        },
+    }
 
     # Create the results directory with timestamp
     filename = 'n=' + str(grid_i.n) + ' d=' + str(grids[-1].d) + ' possible_charger_positions=' + str(len(possible_charger_positions)) + ' num_chargers=' + str(num_chargers)
@@ -758,7 +818,7 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
     save_all_flow_heatmaps(grids, run_config_params, foldername, time_history)
     
     # Print the best result
-    best_grid = grids[np.argmin([grid.travel_time_obj for grid in grids])]
+    best_grid = exhaustive_best_grid
     print("\nResults:")
     print(f"Best charger configuration: {best_grid.chargers}")
     print(f"Best travel time objective: {best_grid.travel_time_obj:.4f}")
@@ -778,7 +838,7 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
         for i, grid in enumerate(grids):
             # Get optimization results including properly structured link flows
             grid_results = save_optimization_pickle(grid)
-            chargers_tuple = tuple(sorted(grid.chargers))
+            chargers_tuple = canonical_placement(grid.chargers)
             
             # Determine if this is the best configuration
             is_best = (grid.travel_time_obj == best_grid.travel_time_obj)
@@ -886,6 +946,13 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
         
         with open(os.path.join(foldername, 'all_optimization_results.pkl'), 'wb') as f:
             pickle.dump(results_dict, f)
+
+    aggregate_path = os.path.join(foldername, 'all_optimization_results.pkl')
+    if os.path.isfile(aggregate_path):
+        with open(aggregate_path, 'rb') as handle:
+            aggregate_results = pickle.load(handle)
+        aggregate_results['placement_search'] = placement_search
+        _atomic_pickle(aggregate_path, aggregate_results)
 
     return grids, time_history, foldername
 

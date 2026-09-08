@@ -584,7 +584,11 @@ def _plot_objective_comparison(cg_results, queue_results, output_path):
     if not cg_results or not queue_results:
         return
 
-    cg_configs = cg_results.get('all_configs', [])
+    target_size = int(queue_results.get('config', {}).get('num_stations', 0))
+    cg_configs = [
+        value for value in cg_results.get('all_configs', [])
+        if not target_size or len(set(value.get('chargers', []))) == target_size
+    ]
     q_results = queue_results.get('exhaustive_results', [])
 
     cg_labels = [str(c['chargers']) for c in cg_configs]
@@ -655,6 +659,67 @@ def _plot_objective_comparison(cg_results, queue_results, output_path):
     fig.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"Objective comparison plot saved to {output_path}")
+
+
+def _plot_placement_search_comparison(cg_search, queue_search, output_path):
+    """Show evaluation order and final algorithm choices for both models."""
+    if not cg_search or not queue_search:
+        return
+    phase_style = {
+        'greedy': ('tab:blue', 'o'),
+        'single_swap': ('tab:green', 's'),
+        'exhaustive': ('tab:orange', '^'),
+    }
+    fig, axes = plt.subplots(2, 1, figsize=(15, 11), constrained_layout=True)
+    for ax, title, search, ylabel in (
+        (axes[0], 'Congestion-game placement search', cg_search, 'CG objective'),
+        (axes[1], 'Queue placement search (paired replication mean)', queue_search,
+         'Queue total travel time'),
+    ):
+        trace = search.get('trace', [])
+        x = np.arange(1, len(trace) + 1)
+        y = np.asarray([item['objective'] for item in trace], dtype=float)
+        ax.plot(x, y, color='0.75', linewidth=1, zorder=1)
+        for phase, (color, marker) in phase_style.items():
+            indices = [i for i, item in enumerate(trace) if item['phase'] == phase]
+            if indices:
+                ax.scatter(
+                    x[indices], y[indices], color=color, marker=marker, s=55,
+                    label=phase.replace('_', ' ').title(), zorder=2,
+                )
+        placement_to_point = {
+            tuple(item['placement']): (index + 1, item['objective'])
+            for index, item in enumerate(trace)
+        }
+        choice_style = {
+            'greedy': ('G', 'tab:blue'),
+            'single_swap': ('S', 'tab:green'),
+            'exhaustive': ('E', 'tab:red'),
+        }
+        for method, (label, color) in choice_style.items():
+            choice = search.get(method, {})
+            point = placement_to_point.get(tuple(choice.get('placement', [])))
+            if point:
+                ax.scatter(
+                    [point[0]], [point[1]], facecolors='none', edgecolors=color,
+                    linewidths=2.2, s=190, zorder=3,
+                )
+                ax.annotate(
+                    f"{label}: {choice['placement']}", point,
+                    xytext=(4, 8), textcoords='offset points', fontsize=8,
+                    color=color,
+                )
+        labels = [str(item['placement']) for item in trace]
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=50, ha='right', fontsize=8)
+        ax.set_xlabel('Unique placement evaluation order')
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(axis='y', alpha=0.25)
+        ax.legend(loc='best', fontsize=8)
+    fig.savefig(output_path, dpi=160, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Placement search comparison saved to {output_path}")
 
 
 def _save_convergence_csv(convergence_data, path):
@@ -956,6 +1021,14 @@ def _generate_run_summary(experiment_dir, config, timing, cg_results, queue_resu
         lines.append(f"  Best placement:     {cg_results.get('best_chargers', 'N/A')}")
         obj = cg_results.get('best_objective', 'N/A')
         lines.append(f"  Best objective:     {obj:.4f}" if isinstance(obj, (int, float)) else f"  Best objective:     {obj}")
+        cg_search = cg_results.get('placement_search', {})
+        for method in ('greedy', 'single_swap', 'exhaustive'):
+            outcome = cg_search.get(method)
+            if outcome:
+                lines.append(
+                    f"  {method.replace('_', ' ').title():<12s}: "
+                    f"{outcome['placement']}  objective={outcome['objective']:.4f}"
+                )
         lines.append("  All rankings:")
         for cfg in cg_results.get('all_configs', []):
             cfg_str = str(cfg['chargers'])
@@ -981,6 +1054,9 @@ def _generate_run_summary(experiment_dir, config, timing, cg_results, queue_resu
     lines.append("-" * 40)
     if queue_results:
         qc = queue_results.get('config', {})
+        greedy_label = (
+            'Greedy + single swap' if qc.get('single_swap') else 'Greedy'
+        )
         lines.append(
             f"  Assignment quality: {queue_results.get('assignment_quality', 'unknown')}"
         )
@@ -992,7 +1068,7 @@ def _generate_run_summary(experiment_dir, config, timing, cg_results, queue_resu
         lines.append(f"  K-routes:   {qc.get('K', 'N/A')}")
         lines.append(f"  MC reps:    {qc.get('N', 'N/A')}")
         lines.append(f"  Single-swap: {qc.get('single_swap', 'N/A')}")
-        lines.append(f"  Greedy best:    {queue_results['best_greedy']['positions']}  "
+        lines.append(f"  {greedy_label} best: {queue_results['best_greedy']['positions']}  "
                      f"TT = {queue_results['best_greedy']['avg_travel_time']:.1f}")
         lines.append(f"  Exhaustive best: {queue_results['best_exhaustive']['positions']}  "
                      f"TT = {queue_results['best_exhaustive']['avg_travel_time']:.1f}")
@@ -1131,6 +1207,7 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
     lines.append(f"| **Total** | **{total:.1f}** | 100% |")
 
     if cg_results:
+        cg_search = cg_results.get('placement_search', {})
         lines.extend([
             "",
             "## Congestion-Game Results",
@@ -1138,6 +1215,27 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
             f"- Configurations evaluated: {cg_results.get('num_configs', 'N/A')}",
             f"- Best placement: {cg_results.get('best_chargers', 'N/A')}",
             f"- Best objective (total delay): {cg_results.get('best_objective', 'N/A'):.4f}" if isinstance(cg_results.get('best_objective'), (int, float)) else f"- Best objective: {cg_results.get('best_objective', 'N/A')}",
+        ])
+        if cg_search:
+            lines.extend([
+                "",
+                "### CG Algorithm Outcomes",
+                "",
+                "| Method | Placement | Objective | Phase wall time (s) | Worker work (s) |",
+                "|---|---|---:|---:|---:|",
+            ])
+            cg_wall = cg_search.get('phase_wall_seconds', {})
+            cg_work = cg_search.get('phase_worker_seconds', {})
+            for method in ('greedy', 'single_swap', 'exhaustive'):
+                outcome = cg_search.get(method, {})
+                if not outcome:
+                    continue
+                lines.append(
+                    f"| {method.replace('_', ' ').title()} | {outcome['placement']} | "
+                    f"{outcome['objective']:.4f} | {cg_wall.get(method, 0.0):.2f} | "
+                    f"{cg_work.get(method, 0.0):.2f} |"
+                )
+        lines.extend([
             "",
             "### All CG Configurations",
             "",
@@ -1170,6 +1268,10 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
             lines.append(f"| {config_str} | {n_iters} | {final_diff:.1f} |")
 
     if queue_results:
+        greedy_label = (
+            "Greedy + single swap"
+            if queue_results.get('config', {}).get('single_swap') else "Greedy"
+        )
         lines.extend([
             "",
             "## Queue-Based Simulation Results",
@@ -1185,18 +1287,33 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
                 "been verified as Nash equilibria.",
                 "",
             ])
+        if queue_results.get('timing', {}).get('paired_placement_cache'):
+            lines.extend([
+                "Greedy and exhaustive use the same canonical placement identity "
+                "and paired Monte Carlo realization. A placement appearing in both "
+                "tables was simulated only once per replication and reused.",
+                "",
+            ])
+        queue_search = queue_results.get('placement_search', {})
+        if queue_search:
+            lines.extend([
+                "### Queue Algorithm Outcomes",
+                "",
+                "| Method | Placement | Avg travel time | Incremental worker work (s) |",
+                "|---|---|---:|---:|",
+            ])
+            queue_work = queue_search.get('phase_worker_seconds', {})
+            for method in ('greedy', 'single_swap', 'exhaustive'):
+                outcome = queue_search.get(method, {})
+                if not outcome:
+                    continue
+                lines.append(
+                    f"| {method.replace('_', ' ').title()} | {outcome['placement']} | "
+                    f"{outcome['objective']:.1f} | {queue_work.get(method, 0.0):.2f} |"
+                )
+            lines.append("")
         lines.extend([
-            "### Greedy",
-            "",
-            f"| Placement | Avg travel time |",
-            f"|---|---|",
-        ])
-        for r in queue_results.get('greedy_results', []):
-            lines.append(f"| {r['positions']} | {r['avg_travel_time']:.1f} |")
-
-        lines.extend([
-            "",
-            "### Exhaustive",
+            "### All Exhaustive Queue Placements",
             "",
             f"| Placement | Avg travel time |",
             f"|---|---|",
@@ -1208,13 +1325,18 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
             "",
             "### Summary",
             "",
-            f"- Best greedy: {queue_results['best_greedy']['positions']} (avg TT = {queue_results['best_greedy']['avg_travel_time']:.1f})",
+            f"- Best {greedy_label.lower()}: {queue_results['best_greedy']['positions']} (avg TT = {queue_results['best_greedy']['avg_travel_time']:.1f})",
             f"- Best exhaustive: {queue_results['best_exhaustive']['positions']} (avg TT = {queue_results['best_exhaustive']['avg_travel_time']:.1f})",
             f"- Greedy suboptimality: {queue_results['suboptimality_pct']:.2f}%",
             f"- Monte Carlo reps: {queue_results['config']['N']}",
             f"- K (routes): {queue_results['config']['K']}",
             f"- Single swap: {queue_results['config']['single_swap']}",
         ])
+        if queue_results.get('timing', {}).get('paired_placement_cache'):
+            lines.extend([
+                f"- Unique queue simulations: {queue_results['timing']['unique_simulations']}",
+                f"- Avoided duplicate simulations: {queue_results['timing']['placement_cache_hits']}",
+            ])
     elif not QUEUE_SIM_AVAILABLE:
         lines.extend([
             "",
@@ -1235,7 +1357,7 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
             f"| Model | Best placement | Objective |",
             f"|---|---|---|",
             f"| Congestion game | {cg_best} | {cg_results.get('best_objective', 'N/A'):.4f}" if isinstance(cg_results.get('best_objective'), (int, float)) else f"| Congestion game | {cg_best} | N/A |",
-            f"| Queue greedy | {q_greedy} | {queue_results['best_greedy']['avg_travel_time']:.1f} |",
+            f"| Queue {greedy_label.lower()} | {q_greedy} | {queue_results['best_greedy']['avg_travel_time']:.1f} |",
             f"| Queue exhaustive | {q_exhaustive} | {queue_results['best_exhaustive']['avg_travel_time']:.1f} |",
             "",
         ])
@@ -1260,6 +1382,9 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
         f"| `plots/timing_breakdown.png` | Pipeline step durations |",
         f"| `plots/bpr_fit_samples.png` | BPR fit diagnostics (random + worst-R² links) |",
         f"| `plots/objective_comparison.png` | CG vs Queue normalized objective bar chart |",
+        f"| `plots/placement_search_comparison.png` | Ordered greedy, one-swap, and exhaustive search outcomes |",
+        f"| `placement_search_summary.json` | Algorithm choices, candidate order, and phase timings |",
+        f"| `placement_search_trace.csv` | Machine-readable placement evaluation sequence |",
     ])
     if queue_results:
         lines.extend([
@@ -1571,7 +1696,17 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
             )
         timing['cg_optimization'] = time.time() - t0
         timing_recorder.add('cg_optimization', timing['cg_optimization'], configurations=len(grids))
-        best_grid = grids[np.argmin([g.travel_time_obj for g in grids])]
+        target_grids = [
+            grid for grid in grids
+            if len(set(int(value) for value in grid.chargers)) == config.num_chargers
+        ]
+        if not target_grids:
+            raise RuntimeError('CG optimization produced no target-size placement')
+        best_grid = min(target_grids, key=lambda grid: grid.travel_time_obj)
+        all_opt_path = os.path.join(experiment_dir, 'all_optimization_results.pkl')
+        with open(all_opt_path, 'rb') as handle:
+            optimization_data = pickle.load(handle)
+        cg_search = optimization_data.get('placement_search', {})
         cg_results = {
             'best_chargers': [int(x) for x in best_grid.chargers],
             'best_objective': float(best_grid.travel_time_obj),
@@ -1586,8 +1721,8 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
             ],
             'stage_counts': grids[0].net.stage_counts if hasattr(grids[0], 'net') else {},
             'bpr_provenance': getattr(best_grid, 'bpr_provenance', {}),
+            'placement_search': cg_search,
         }
-        all_opt_path = os.path.join(experiment_dir, 'all_optimization_results.pkl')
         grid_solver_metadata = getattr(
             best_grid, 'solver_metadata', getattr(best_grid.net, 'solver_metadata', {})
         )
@@ -1595,8 +1730,6 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
         if os.path.exists(all_opt_path):
             # Attach the exact artifact identity and solver provenance to the
             # object consumed by route recovery and queue stages.
-            with open(all_opt_path, 'rb') as handle:
-                optimization_data = pickle.load(handle)
             run_configuration = dict(optimization_data.get('run_configuration', {}))
             run_configuration.update({
                 'network_hash': network_hash,
@@ -1671,6 +1804,35 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
         if cg_results and queue_results:
             _plot_objective_comparison(cg_results, queue_results,
                                        os.path.join(plot_dir, 'objective_comparison.png'))
+            _plot_placement_search_comparison(
+                cg_results.get('placement_search'),
+                queue_results.get('placement_search'),
+                os.path.join(plot_dir, 'placement_search_comparison.png'),
+            )
+            if (cg_results.get('placement_search')
+                    and queue_results.get('placement_search')):
+                search_summary = {
+                    'candidate_order': [
+                        int(value) for value in config.possible_charger_positions
+                    ],
+                    'congestion_game': cg_results['placement_search'],
+                    'queue': queue_results['placement_search'],
+                }
+                atomic_write_json(
+                    os.path.join(experiment_dir, 'placement_search_summary.json'),
+                    search_summary,
+                )
+                trace_rows = []
+                for model, search in (
+                    ('congestion_game', cg_results['placement_search']),
+                    ('queue', queue_results['placement_search']),
+                ):
+                    for item in search.get('trace', []):
+                        trace_rows.append({'model': model, **item})
+                pd.DataFrame(trace_rows).to_csv(
+                    os.path.join(experiment_dir, 'placement_search_trace.csv'),
+                    index=False,
+                )
     elif (not config.pipeline.get("skip_queue_simulation", False)
           and queue_enabled and not QUEUE_SIM_AVAILABLE):
         raise RuntimeError(

@@ -37,6 +37,80 @@ def test_queue_sim_helpers():
     assert s1 != s3
 
 
+def test_placements_are_order_independent_and_deterministic():
+    from src.contracts import (
+        canonical_placement,
+        enumerate_placements,
+        single_swap_neighbors,
+    )
+
+    assert canonical_placement([49, 101]) == canonical_placement([101, 49])
+    assert enumerate_placements([101, 49, 20], 2) == [
+        (49, 101), (20, 101), (20, 49),
+    ]
+    assert single_swap_neighbors([20, 49], [101, 49, 20]) == [
+        (49, 101), (20, 101),
+    ]
+
+
+def test_paired_comparison_simulates_each_placement_once(monkeypatch, tmp_path):
+    import queue_sim.comparison as comparison
+    from src.contracts import enumerate_placements
+
+    data_path = tmp_path / 'cg.pkl'
+    ne_path = tmp_path / 'ne.pkl'
+    with data_path.open('wb') as handle:
+        pickle.dump({}, handle)
+    with ne_path.open('wb') as handle:
+        pickle.dump({}, handle)
+
+    calls = []
+
+    def fake_run(positions, *args, **kwargs):
+        placement = tuple(positions)
+        calls.append(placement)
+        return float(sum(placement))
+
+    monkeypatch.setattr(comparison, '_run_sim', fake_run)
+    combinations = enumerate_placements([101, 49, 20], 2)
+    result = comparison._comparison_rep((
+        0, str(data_path), str(ne_path), 16, 2, [101, 49, 20],
+        [], ('nodes', 'edges', 'od'), str(tmp_path), 250, 250, 250, 0,
+        10801, True, combinations, 42,
+    ))
+
+    assert len(calls) == len(set(calls)) == 6
+    assert result['greedy_positions'] == (20, 49)
+    assert result['unique_simulations'] == 6
+    assert result['cache_hits'] > 0
+
+
+def test_queue_search_uses_shared_candidate_order_and_mean_objectives():
+    from queue_sim.comparison import _build_queue_search_summary
+
+    values = {
+        (101,): 10.0, (49,): 20.0, (20,): 30.0,
+        (49, 101): 100.0, (20, 101): 90.0, (20, 49): 80.0,
+    }
+    paired = [
+        {
+            'placement_values': {key: value + offset for key, value in values.items()},
+            'placement_elapsed_seconds': {key: 1.0 for key in values},
+        }
+        for offset in (-1.0, 1.0)
+    ]
+    search = _build_queue_search_summary(
+        paired, [101, 49, 20], num_stations=2, single_swap=True,
+    )
+
+    assert [item['placement'] for item in search['trace'][:3]] == [
+        [101], [49], [20],
+    ]
+    assert search['greedy']['placement'] == [20, 101]
+    assert search['single_swap']['placement'] == [20, 49]
+    assert search['exhaustive']['placement'] == [20, 49]
+
+
 def test_cycle_assignment_is_explicitly_approximate_and_comparison_usable():
     from queue_sim.comparison import _assignment_is_usable
     from queue_sim.find_nash import _promote_cycle_result
