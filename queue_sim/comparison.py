@@ -259,6 +259,27 @@ def _build_queue_search_summary(
     }
 
 
+def _correlation_summary(cg_values, queue_values):
+    """Pearson and Spearman correlations for paired finite placements."""
+    x = np.asarray(cg_values, dtype=float)
+    y = np.asarray(queue_values, dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    x, y = x[finite], y[finite]
+    result = {
+        'paired_count': int(x.size),
+        'paired_placements': int(x.size),
+        'pearson': None,
+        'spearman': None,
+    }
+    if x.size < 2 or np.ptp(x) == 0 or np.ptp(y) == 0:
+        return result
+    result['pearson'] = float(np.corrcoef(x, y)[0, 1])
+    x_rank = pd.Series(x).rank(method='average').to_numpy()
+    y_rank = pd.Series(y).rank(method='average').to_numpy()
+    result['spearman'] = float(np.corrcoef(x_rank, y_rank)[0, 1])
+    return result
+
+
 def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_path,
                    network_name='canonical', artifact_dir=None, seed_manager=None):
     """Compare greedy and exhaustive placement using all OD/type demand."""
@@ -374,6 +395,41 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
         {'positions': list(combination), 'avg_travel_time': float(value)}
         for combination, value in zip(combinations_list, exhaustive_avg)
     ]
+    cg_objectives = {
+        canonical_placement(placement): float(value['objective_value'])
+        for placement, value in data.get('configurations', {}).items()
+        if len(canonical_placement(placement)) == int(num_stations)
+        and np.isfinite(float(value.get('objective_value', np.nan)))
+    }
+    queue_objectives = {
+        canonical_placement(value['positions']): float(value['avg_travel_time'])
+        for value in exhaustive_results
+    }
+    paired_placements = [
+        placement for placement in combinations_list
+        if placement in cg_objectives and placement in queue_objectives
+    ]
+    correlations = _correlation_summary(
+        [cg_objectives[value] for value in paired_placements],
+        [queue_objectives[value] for value in paired_placements],
+    )
+    correlations['placements'] = [list(value) for value in paired_placements]
+
+    queue_manifest_path = os.path.join(work_dir, 'queue_manifest.json')
+    ne_statistics = {}
+    if os.path.isfile(queue_manifest_path):
+        with open(queue_manifest_path) as handle:
+            queue_manifest = json.load(handle)
+        ne_statistics = {
+            'status_counts': queue_manifest.get('status_counts', {}),
+            'iteration_statistics': queue_manifest.get('iteration_statistics', {}),
+            'cycle_length_statistics': queue_manifest.get(
+                'cycle_length_statistics', {}
+            ),
+            'configuration_statuses': queue_manifest.get(
+                'configuration_statuses', {}
+            ),
+        }
 
     best_greedy = greedy_results[0]
     best_exhaustive = min(exhaustive_results, key=lambda value: value['avg_travel_time'])
@@ -408,6 +464,8 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
         'greedy_results': greedy_results,
         'exhaustive_results': exhaustive_results,
         'placement_search': search,
+        'ne_statistics': ne_statistics,
+        'cg_queue_correlations': correlations,
         'config': {
             'N': n_reps, 'K': k, 'num_stations': num_stations,
             'single_swap': q.get('single_swap', True),

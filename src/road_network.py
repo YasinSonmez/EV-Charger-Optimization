@@ -92,7 +92,12 @@ class RoadNet:
         self.stage_counts = dict(manifest.get("stage_counts") or {
             "loaded_artifact": {"nodes": len(nodes), "edges": len(edges)},
         })
-        self.stage_maps = {"loaded_artifact": self._snapshot_map()}
+        stage_maps_file = manifest.get("stage_maps_file")
+        if stage_maps_file and os.path.isfile(os.path.join(artifact_dir, stage_maps_file)):
+            with open(os.path.join(artifact_dir, stage_maps_file)) as handle:
+                self.stage_maps = json.load(handle)
+        else:
+            self.stage_maps = {"loaded_artifact": self._snapshot_map()}
         return manifest
 
     def _snapshot_map(self):

@@ -111,6 +111,38 @@ def test_queue_search_uses_shared_candidate_order_and_mean_objectives():
     assert search['exhaustive']['placement'] == [20, 49]
 
 
+def test_ne_summary_and_cross_model_correlations_are_reportable(tmp_path):
+    from queue_sim.comparison import _correlation_summary
+    from queue_sim.find_nash import _write_queue_manifest
+
+    assignments = {
+        '1': {'converged': True, 'status': 'ok', 'iterations': 3},
+        '2': {
+            'converged': False, 'status': 'approximate_cycle_state',
+            'iterations': 6, 'cycle_length': 2,
+            'termination_reason': 'assignment cycle detected at iteration 6',
+        },
+        '3': {
+            'converged': False, 'status': 'nonconverged', 'iterations': 10,
+            'failure_reason': 'iteration cap reached',
+        },
+    }
+    path = tmp_path / 'queue_manifest.json'
+    _write_queue_manifest(path, {'failed_configurations': {}}, assignments)
+    manifest = json.loads(path.read_text())
+
+    assert manifest['status_counts'] == {
+        'converged': 1, 'cycle': 1, 'nonconverged': 1, 'failed': 0,
+    }
+    assert manifest['iteration_statistics']['all']['median'] == 6.0
+    assert manifest['cycle_length_statistics']['median'] == 2.0
+
+    correlations = _correlation_summary([1, 2, 3, 4], [10, 20, 40, 30])
+    assert correlations['paired_count'] == 4
+    assert correlations['pearson'] == pytest.approx(0.8)
+    assert correlations['spearman'] == pytest.approx(0.8)
+
+
 def test_cycle_assignment_is_explicitly_approximate_and_comparison_usable():
     from queue_sim.comparison import _assignment_is_usable
     from queue_sim.find_nash import _promote_cycle_result

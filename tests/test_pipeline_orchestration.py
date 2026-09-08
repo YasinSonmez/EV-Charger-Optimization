@@ -27,6 +27,7 @@ class _FakeRoadNet:
                 "end_node_id": [1, 2, 3, 0],
                 "edge_key": ["a", "b", "c", "d"],
                 "length": [1.0] * 4,
+                "lanes": [1.0] * 4,
             }
         )
         self.stage_counts = {

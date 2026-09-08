@@ -27,11 +27,15 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.config import Config, NetworkConfig
+from src.plot_style import (
+    COLORS, apply_paper_style, clean_axis, save_publication_figure,
+)
 from src.contracts import (
     BPR_CALIBRATION_VERSION, SeedManager, TimingRecorder, stable_json,
 )
@@ -43,6 +47,8 @@ from src.run_state import (
 from src.sanity_checks import validate_experiment_outputs
 from src.model_fitter import TrafficModelFitter, convert_string_to_array, validate_bpr_fit_table
 from src.utils import outer_optimization
+
+apply_paper_style()
 
 try:
     from queue_sim import QUEUE_SIM_AVAILABLE, _QUEUE_SIM_ERROR
@@ -576,11 +582,7 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
 
 
 def _plot_objective_comparison(cg_results, queue_results, output_path):
-    """Plot CG vs Queue objectives for each charger placement as grouped bar chart.
-
-    Normalizes each model's objectives to its own best (min) so both models
-    are comparable on the same scale. Highlights the best placement for each.
-    """
+    """Plot paired placement objectives and cross-model agreement."""
     if not cg_results or not queue_results:
         return
 
@@ -591,72 +593,63 @@ def _plot_objective_comparison(cg_results, queue_results, output_path):
     ]
     q_results = queue_results.get('exhaustive_results', [])
 
-    cg_labels = [str(c['chargers']) for c in cg_configs]
-    cg_vals = [c['objective'] for c in cg_configs]
-    q_labels = [str(r['positions']) for r in q_results]
-    q_vals = [r['avg_travel_time'] for r in q_results if r['avg_travel_time'] != float('inf')]
-
-    if not cg_vals or not q_vals:
+    cg_map = {
+        tuple(sorted(c['chargers'])): float(c['objective']) for c in cg_configs
+    }
+    q_map = {
+        tuple(sorted(r['positions'])): float(r['avg_travel_time'])
+        for r in q_results if np.isfinite(r['avg_travel_time'])
+    }
+    placements = [value for value in cg_map if value in q_map]
+    if not placements:
         return
+    placements.sort(key=lambda value: cg_map[value])
+    cg = np.asarray([cg_map[value] for value in placements], dtype=float)
+    queue = np.asarray([q_map[value] for value in placements], dtype=float)
+    cg_norm, queue_norm = cg / np.min(cg), queue / np.min(queue)
+    labels = ['+'.join(map(str, value)) for value in placements]
+    x = np.arange(len(placements))
 
-    cg_min = min(cg_vals)
-    q_min = min(q_vals)
-    cg_norm = [v / cg_min for v in cg_vals]
-    q_norm = [v / q_min for v in q_vals if v != float('inf')]
-
-    def _placement_sort_key(label):
-        try:
-            values = tuple(int(value.strip()) for value in label.strip('[]').split(',') if value.strip())
-            return (len(values), values)
-        except (TypeError, ValueError):
-            return (999, (label,))
-
-    all_labels = sorted(set(cg_labels) | set(q_labels), key=_placement_sort_key)
-    cg_map = dict(zip(cg_labels, cg_norm))
-    q_map = {str(r['positions']): r['avg_travel_time'] / q_min for r in q_results if r['avg_travel_time'] != float('inf')}
-
-    # Do not encode an unavailable comparison as zero.  The CG stage also
-    # evaluates intermediate one-charger placements, while the queue
-    # comparison normally reports only target-size exhaustive placements.
-    # Missing bars are rendered as gaps and called out in the legend/title.
-    cg_bars = [cg_map.get(l, np.nan) for l in all_labels]
-    q_bars = [q_map.get(l, np.nan) for l in all_labels]
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-
-    # Left: normalized comparison
-    x = np.arange(len(all_labels))
-    width = 0.35
-    ax1.bar(x - width/2, cg_bars, width, label='Congestion Game', color='steelblue', alpha=0.8)
-    ax1.bar(x + width/2, q_bars, width, label='Queue Simulation', color='coral', alpha=0.8)
-    ax1.set_ylabel('Normalized objective (best = 1.0)')
-    missing_queue = sorted(set(all_labels) - set(q_labels))
-    title = 'CG vs Queue: Objective per Placement (Normalized)'
-    if missing_queue:
-        title += '\n(queue result unavailable for intermediate CG placements)'
-    ax1.set_title(title, fontsize=10)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.5, 4.2), constrained_layout=True)
+    for index in x:
+        ax1.plot(
+            [index, index], [cg_norm[index], queue_norm[index]],
+            color=COLORS['light'], linewidth=1.2, zorder=1,
+        )
+    ax1.scatter(x, cg_norm, color=COLORS['blue'], s=35, label='Congestion game', zorder=2)
+    ax1.scatter(x, queue_norm, color=COLORS['orange'], marker='s', s=32,
+                label='Queue simulation', zorder=2)
+    ax1.axhline(1.0, color=COLORS['mid'], linestyle=':', linewidth=0.9)
     ax1.set_xticks(x)
-    ax1.set_xticklabels(all_labels, rotation=45, ha='right')
-    ax1.legend()
-    ax1.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
+    ax1.set_xticklabels(labels, rotation=45, ha='right')
+    ax1.set_ylabel('Objective / model-specific minimum')
+    ax1.set_xlabel('Charger placement (ordered by CG objective)')
+    ax1.set_title('Relative objective by placement')
+    ax1.legend(loc='upper left')
+    clean_axis(ax1)
 
-    # Right: raw values (twin axis for different scales)
-    cg_raw = [cg_map.get(label, np.nan) * cg_min for label in all_labels]
-    ax2.bar(x - width/2, cg_raw, width, label='CG objective', color='steelblue', alpha=0.8)
-    ax2.set_ylabel('CG total delay', color='steelblue')
-    ax2.tick_params(axis='y', labelcolor='steelblue')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(all_labels, rotation=45, ha='right')
-    ax2.set_title('Raw Objectives (different scales)')
-
-    ax2b = ax2.twinx()
-    q_raw = [next((r['avg_travel_time'] for r in q_results if str(r['positions']) == l and r['avg_travel_time'] != float('inf')), np.nan) for l in all_labels]
-    ax2b.bar(x + width/2, q_raw, width, label='Queue avg TT', color='coral', alpha=0.8)
-    ax2b.set_ylabel('Queue avg travel time', color='coral')
-    ax2b.tick_params(axis='y', labelcolor='coral')
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    ax2.scatter(cg_norm, queue_norm, color=COLORS['purple'], s=42,
+                edgecolor='white', linewidth=0.5, zorder=2)
+    lo = min(np.min(cg_norm), np.min(queue_norm))
+    hi = max(np.max(cg_norm), np.max(queue_norm))
+    pad = max(0.01, 0.06 * (hi - lo))
+    ax2.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color=COLORS['mid'],
+             linestyle='--', linewidth=0.9, label='Equal relative objective')
+    for cx, qx, label in zip(cg_norm, queue_norm, labels):
+        ax2.annotate(label, (cx, qx), xytext=(4, 3), textcoords='offset points', fontsize=7)
+    corr = queue_results.get('cg_queue_correlations', {})
+    pearson, spearman = corr.get('pearson'), corr.get('spearman')
+    annotation = (
+        f"Pearson r = {pearson:.2f}\nSpearman ρ = {spearman:.2f}"
+        if pearson is not None and spearman is not None else 'Correlation undefined'
+    )
+    ax2.text(0.03, 0.97, annotation, transform=ax2.transAxes, va='top',
+             bbox={'facecolor': 'white', 'edgecolor': COLORS['light'], 'pad': 4})
+    ax2.set_xlabel('Normalized CG objective')
+    ax2.set_ylabel('Normalized queue objective')
+    ax2.set_title('Cross-model placement agreement')
+    clean_axis(ax2)
+    save_publication_figure(fig, output_path)
     plt.close(fig)
     print(f"Objective comparison plot saved to {output_path}")
 
@@ -666,11 +659,12 @@ def _plot_placement_search_comparison(cg_search, queue_search, output_path):
     if not cg_search or not queue_search:
         return
     phase_style = {
-        'greedy': ('tab:blue', 'o'),
-        'single_swap': ('tab:green', 's'),
-        'exhaustive': ('tab:orange', '^'),
+        'greedy': (COLORS['blue'], 'o'),
+        'single_swap': (COLORS['green'], 's'),
+        'exhaustive': (COLORS['orange'], '^'),
     }
-    fig, axes = plt.subplots(2, 1, figsize=(15, 11), constrained_layout=True)
+    fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.5))
+    model_results = {}
     for ax, title, search, ylabel in (
         (axes[0], 'Congestion-game placement search', cg_search, 'CG objective'),
         (axes[1], 'Queue placement search (paired replication mean)', queue_search,
@@ -679,45 +673,69 @@ def _plot_placement_search_comparison(cg_search, queue_search, output_path):
         trace = search.get('trace', [])
         x = np.arange(1, len(trace) + 1)
         y = np.asarray([item['objective'] for item in trace], dtype=float)
-        ax.plot(x, y, color='0.75', linewidth=1, zorder=1)
+        ax.plot(x, y, color=COLORS['light'], linewidth=0.9, alpha=0.9, zorder=1)
         for phase, (color, marker) in phase_style.items():
             indices = [i for i, item in enumerate(trace) if item['phase'] == phase]
             if indices:
                 ax.scatter(
                     x[indices], y[indices], color=color, marker=marker, s=55,
-                    label=phase.replace('_', ' ').title(), zorder=2,
+                    zorder=2,
                 )
         placement_to_point = {
             tuple(item['placement']): (index + 1, item['objective'])
             for index, item in enumerate(trace)
         }
-        choice_style = {
-            'greedy': ('G', 'tab:blue'),
-            'single_swap': ('S', 'tab:green'),
-            'exhaustive': ('E', 'tab:red'),
-        }
-        for method, (label, color) in choice_style.items():
+        for method in ('greedy', 'single_swap', 'exhaustive'):
             choice = search.get(method, {})
             point = placement_to_point.get(tuple(choice.get('placement', [])))
             if point:
                 ax.scatter(
-                    [point[0]], [point[1]], facecolors='none', edgecolors=color,
-                    linewidths=2.2, s=190, zorder=3,
+                    [point[0]], [point[1]], facecolors='none', edgecolors=COLORS['red'],
+                    linewidths=1.8, s=125, zorder=3,
                 )
-                ax.annotate(
-                    f"{label}: {choice['placement']}", point,
-                    xytext=(4, 8), textcoords='offset points', fontsize=8,
-                    color=color,
+            if choice:
+                model_results.setdefault(title.split(' placement')[0], []).append(
+                    f"{method.replace('_', ' ').title()} "
+                    f"{'+'.join(map(str, choice['placement']))} ({choice['objective']:.3g})"
                 )
-        labels = [str(item['placement']) for item in trace]
+        for index in range(1, len(trace)):
+            if trace[index]['phase'] != trace[index - 1]['phase']:
+                ax.axvline(index + 0.5, color=COLORS['light'], linewidth=0.8,
+                           linestyle='--', zorder=0)
+        labels = ['+'.join(map(str, item['placement'])) for item in trace]
         ax.set_xticks(x)
         ax.set_xticklabels(labels, rotation=50, ha='right', fontsize=8)
         ax.set_xlabel('Unique placement evaluation order')
         ax.set_ylabel(ylabel)
         ax.set_title(title)
-        ax.grid(axis='y', alpha=0.25)
-        ax.legend(loc='best', fontsize=8)
-    fig.savefig(output_path, dpi=160, bbox_inches='tight')
+        clean_axis(ax)
+    legend_handles = [
+        Line2D([0], [0], marker='o', color='w',
+               markerfacecolor=COLORS['blue'], markeredgecolor=COLORS['blue'],
+               markersize=8, label='Greedy'),
+        Line2D([0], [0], marker='s', color='w',
+               markerfacecolor=COLORS['green'], markeredgecolor=COLORS['green'],
+               markersize=8, label='Single swap'),
+        Line2D([0], [0], marker='^', color='w',
+               markerfacecolor=COLORS['orange'], markeredgecolor=COLORS['orange'],
+               markersize=8, label='Exhaustive'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='none',
+               markeredgecolor=COLORS['red'], markeredgewidth=1.8,
+               markersize=10, label='Chosen placement'),
+    ]
+    fig.legend(
+        handles=legend_handles, loc='lower center', bbox_to_anchor=(0.5, 0.10),
+        ncol=4, frameon=True, facecolor='white', edgecolor=COLORS['light'],
+    )
+    result_lines = [
+        f"{model}:  " + "   |   ".join(values)
+        for model, values in model_results.items()
+    ]
+    if result_lines:
+        fig.text(0.5, 0.02, "\n".join(result_lines), ha='center', va='top',
+                 fontsize=8, color=COLORS['dark'])
+    fig.subplots_adjust(bottom=0.24, top=0.93, hspace=0.55, right=0.98)
+    save_publication_figure(fig, output_path)
     plt.close(fig)
     print(f"Placement search comparison saved to {output_path}")
 
@@ -745,7 +763,7 @@ def _plot_pruning_phases(network_stages, output_path, node_count=None, edge_coun
     """
     has_maps = bool(stage_maps)
     if network_stages:
-        phases = sorted(network_stages.keys())
+        phases = list(network_stages.keys())
         nodes = [network_stages[p].get('nodes', 0) for p in phases]
         edges = [network_stages[p].get('edges', 0) for p in phases]
     else:
@@ -756,33 +774,51 @@ def _plot_pruning_phases(network_stages, output_path, node_count=None, edge_coun
         edges = [e]
 
     if has_maps:
-        map_phases = sorted(stage_maps.keys())
+        map_phases = list(stage_maps.keys())
         n_maps = len(map_phases)
-        ncols = min(n_maps, 3)
-        nrows = 2 + (n_maps + ncols - 1) // ncols
-        fig = plt.figure(figsize=(4 * ncols, 5 + 4 * (nrows - 2)))
-        ax_bar = fig.add_subplot(2, 1, 1)
+        if n_maps == 1:
+            ncols, map_rows = 1, 1
+            fig = plt.figure(figsize=(10.5, 4.5), constrained_layout=True)
+            grid = fig.add_gridspec(1, 2, width_ratios=[1.35, 1.0])
+            ax_bar = fig.add_subplot(grid[0, 0])
+        else:
+            ncols = min(n_maps, 3)
+            map_rows = (n_maps + ncols - 1) // ncols
+            fig = plt.figure(
+                figsize=(3.6 * ncols, 3.0 + 3.2 * map_rows),
+                constrained_layout=True,
+            )
+            grid = fig.add_gridspec(
+                1 + map_rows, ncols,
+                height_ratios=[1.0] + [1.25] * map_rows,
+            )
+            ax_bar = fig.add_subplot(grid[0, :])
     else:
         fig, ax_bar = plt.subplots(figsize=(10, 5))
 
     # Bar chart (always)
     x = np.arange(len(phases))
     w = 0.35
-    ax_bar.bar(x - w/2, nodes, w, color='#1a9850', label='Nodes')
-    ax_bar.bar(x + w/2, edges, w, color='#3288bd', label='Edges')
+    node_bars = ax_bar.bar(x - w/2, nodes, w, color=COLORS['blue'], label='Nodes')
+    edge_bars = ax_bar.bar(x + w/2, edges, w, color=COLORS['orange'], label='Directed edges')
     ax_bar.set_ylabel('Count')
     ax_bar.set_title('Network Cleaning Pipeline — Nodes & Edges per Phase')
     ax_bar.set_xticks(x)
     ax_bar.set_xticklabels(phases, rotation=30, ha='right', fontsize=8)
     ax_bar.legend()
-    for bar, val in zip(ax_bar.patches, nodes + edges):
-        ax_bar.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(nodes)*0.01,
+    clean_axis(ax_bar)
+    for bar, val in zip(list(node_bars) + list(edge_bars), nodes + edges):
+        ax_bar.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(edges)*0.01,
                     str(val), ha='center', va='bottom', fontsize=7)
 
     # Map grid (when available)
     if has_maps:
         for idx, phase in enumerate(map_phases):
-            ax = fig.add_subplot(nrows, ncols, ncols * 2 + idx + 1)
+            ax = (
+                fig.add_subplot(grid[0, 1])
+                if n_maps == 1
+                else fig.add_subplot(grid[1 + idx // ncols, idx % ncols])
+            )
             mp = stage_maps[phase]
             xs = [p[0] for p in mp['nodes_xy']]
             ys = [p[1] for p in mp['nodes_xy']]
@@ -796,29 +832,33 @@ def _plot_pruning_phases(network_stages, output_path, node_count=None, edge_coun
                 for coords in geoms:
                     if len(coords) >= 2:
                         ax.plot([c[0] for c in coords], [c[1] for c in coords],
-                                linewidth=0.3, color='gray', alpha=0.5, zorder=1)
+                                linewidth=1.15, color=COLORS['mid'], alpha=0.78, zorder=1)
             else:
                 for u, v in mp['edges_pairs']:
                     if u in pos_by_id and v in pos_by_id:
                         ax.plot([pos_by_id[u][0], pos_by_id[v][0]],
                                 [pos_by_id[u][1], pos_by_id[v][1]],
-                                linewidth=0.3, color='gray', alpha=0.5, zorder=1)
-            ax.scatter(xs, ys, s=3, c='#1a9850', alpha=0.8, zorder=2)
+                                linewidth=1.15, color=COLORS['mid'], alpha=0.78, zorder=1)
+            marker_size = max(10.0, min(28.0, 2200.0 / max(1, len(xs))))
+            ax.scatter(xs, ys, s=marker_size, c=COLORS['blue'], alpha=0.9,
+                       edgecolors='white', linewidths=0.5, zorder=2)
             ax.set_title(f"{phase}\nnodes={mp['_n']} edges={mp['_e']}",
                          fontsize=7)
             ax.set_aspect('equal', adjustable='datalim')
             ax.set_xticks([])
             ax.set_yticks([])
 
-        for idx in range(n_maps, ncols * (nrows - 2)):
-            fig.add_subplot(nrows, ncols, ncols * 2 + idx + 1).set_visible(False)
+        if n_maps > 1:
+            for idx in range(n_maps, ncols * map_rows):
+                fig.add_subplot(grid[1 + idx // ncols, idx % ncols]).set_visible(False)
 
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    if not has_maps:
+        fig.tight_layout()
+    save_publication_figure(fig, output_path)
     plt.close(fig)
 
 
-def _plot_bpr_fit_samples(pandas_df, output_path, n_random=20, n_worst=10, seed=0):
+def _plot_bpr_fit_samples(pandas_df, output_path, n_random=6, n_worst=6, seed=0):
     """Plot sample BPR fit diagnostics: random links + worst-R² links."""
     if pandas_df is None or 'R^2' not in pandas_df.columns:
         return
@@ -830,10 +870,10 @@ def _plot_bpr_fit_samples(pandas_df, output_path, n_random=20, n_worst=10, seed=
     worst = df.nsmallest(n_worst, 'R^2')
     sample = pd.concat([random_sample, worst])
     sample = sample.loc[~sample.index.duplicated(keep='first')]
-    n = min(len(sample), 30)
+    n = min(len(sample), 12)
 
-    rows = 5; cols = 6
-    fig, axes = plt.subplots(rows, cols, figsize=(18, 14))
+    rows = 3; cols = 4
+    fig, axes = plt.subplots(rows, cols, figsize=(11, 7.8))
     axes = axes.flatten()
     for i in range(rows * cols):
         if i < n:
@@ -846,12 +886,12 @@ def _plot_bpr_fit_samples(pandas_df, output_path, n_random=20, n_worst=10, seed=
                     if len(xv) > 0:
                         capacity = float(row.get('cap_fit', 1.0))
                         normalized_x = np.asarray(xv, dtype=float) / capacity
-                        ax.scatter(normalized_x, yv, s=7, alpha=0.75)
+                        ax.scatter(normalized_x, yv, s=15, color=COLORS['blue'], alpha=0.8)
                         zero = np.isclose(normalized_x, 0.0)
                         if zero.any():
                             ax.scatter(
                                 normalized_x[zero], np.asarray(yv)[zero], s=18,
-                                color='darkorange', marker='D', zorder=3,
+                                color=COLORS['orange'], marker='D', zorder=3,
                             )
                         a_fit = row.get('a_fit', np.nan)
                         fft_fit = row.get('fft_fit', np.nan)
@@ -860,10 +900,10 @@ def _plot_bpr_fit_samples(pandas_df, output_path, n_random=20, n_worst=10, seed=
                                 xs = np.linspace(min(normalized_x), max(normalized_x), 100)
                                 a, b, f = a_fit, row['b_fit'], fft_fit
                                 ys = f * (1 + a * xs**b)
-                                ax.plot(xs, ys, 'r-', linewidth=1, label='Full BPR fit')
+                                ax.plot(xs, ys, color=COLORS['red'], linewidth=1.3)
                             else:
                                 ax.axhline(
-                                    y=float(fft_fit), color='darkorange',
+                                    y=float(fft_fit), color=COLORS['orange'],
                                     linewidth=1, linestyle='--',
                                     label='Constant fit',
                                 )
@@ -873,20 +913,21 @@ def _plot_bpr_fit_samples(pandas_df, output_path, n_random=20, n_worst=10, seed=
             status = row.get('fit_status', 'unknown')
             ax.set_title(
                 f'Link {int(row["link_id"])} {status} R²={r2:.3f}',
-                fontsize=6,
+                fontsize=7,
             )
             ax.axvline(1.0, color='0.6', linestyle=':', linewidth=0.6)
             ax.set_xticks([0, 1, 2])
-            ax.tick_params(axis='both', labelsize=5)
+            ax.tick_params(axis='both', labelsize=7)
+            clean_axis(ax)
         else:
             ax.set_xticks([]); ax.set_yticks([])
     for i in range(n, rows*cols):
         axes[i].set_visible(False)
-    fig.suptitle('BPR Fit Diagnostics — Random + Worst-R² Links', fontsize=12, fontweight='bold')
+    fig.suptitle('BPR fit diagnostics: random and lowest-R² links', fontsize=12)
     fig.supxlabel('Offered cohort / capacity (orange diamond = zero-flow probe)', fontsize=9)
     fig.supylabel('Entry-wait-inclusive travel time (s)', fontsize=9)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    save_publication_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -919,23 +960,25 @@ def _plot_historical_bpr_comparison(pandas_df, output_path,
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     labels = ['fresh current network']
-    axes[0].bar(labels, [len(fresh)], color='steelblue', label='fresh')
+    axes[0].bar(labels, [len(fresh)], color=COLORS['blue'], label='fresh')
     if reference.size:
-        axes[0].bar(['historical reference'], [len(reference)], color='darkorange', label='reference')
+        axes[0].bar(['historical reference'], [len(reference)], color=COLORS['orange'], label='reference')
     axes[0].set_ylabel('links with fitted R²')
     axes[0].set_title('BPR coverage')
     axes[0].tick_params(axis='x', rotation=20)
     axes[0].legend(fontsize=8)
+    clean_axis(axes[0])
 
     bins = np.linspace(0, 1.01, 21)
     if reference.size:
-        axes[1].hist(reference, bins=bins, alpha=0.55, label=f'reference {reference_commit}')
+        axes[1].hist(reference, bins=bins, alpha=0.55, color=COLORS['orange'], label=f'reference {reference_commit}')
     if fresh.size:
-        axes[1].hist(fresh, bins=bins, alpha=0.55, label='fresh current network')
+        axes[1].hist(fresh, bins=bins, alpha=0.55, color=COLORS['blue'], label='fresh current network')
     axes[1].set_xlabel('R² (legacy-compatible field)')
     axes[1].set_ylabel('link count')
     axes[1].set_title('Historical-compatible fit quality')
     axes[1].legend(fontsize=8)
+    clean_axis(axes[1])
     fresh_status = pandas_df.get('fit_status', pd.Series(dtype=str)).value_counts().to_dict()
     fig.suptitle(
         'Historical BPR compatibility — status comparison\n'
@@ -943,26 +986,57 @@ def _plot_historical_bpr_comparison(pandas_df, output_path,
         fontsize=10,
     )
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    save_publication_figure(fig, output_path)
     plt.close(fig)
 
 
-def _plot_ne_convergence(convergence_data, output_path):
+def _plot_ne_convergence(convergence_data, output_path, queue_manifest=None):
     """Plot NE convergence curves: diff vs iteration per config."""
     if not convergence_data:
         return
-    fig, ax = plt.subplots(figsize=(10, 6))
+    statuses = (queue_manifest or {}).get('configuration_statuses', {})
+    status_colors = {
+        'converged': COLORS['green'], 'cycle': COLORS['orange'],
+        'nonconverged': COLORS['red'], 'failed': COLORS['red'],
+    }
+    fig, (ax, ax_hist) = plt.subplots(1, 2, figsize=(10.5, 4.1), constrained_layout=True)
+    shown = set()
     for config_str, diffs in convergence_data.items():
         if diffs:
-            ax.plot(range(len(diffs)), diffs, linewidth=1, alpha=0.7, label=config_str[:20])
-    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+            status = statuses.get(config_str, 'nonconverged')
+            label = status.title() if status not in shown else None
+            shown.add(status)
+            ax.plot(range(1, len(diffs) + 1), diffs, linewidth=1.1, alpha=0.72,
+                    marker='o', markersize=2.8,
+                    color=status_colors.get(status, COLORS['mid']), label=label)
+    alpha = float((queue_manifest or {}).get('alpha', 0.01))
+    ax.axhline(y=alpha, color=COLORS['dark'], linestyle='--', linewidth=0.9,
+               label=f'Tolerance ({alpha:g})')
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Relative route travel-time gap')
-    ax.set_title('NE Convergence — Better-Response Heuristic')
-    if len(convergence_data) <= 15:
-        ax.legend(fontsize=6, ncol=2)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    ax.set_title('Better-response trajectories')
+    ax.legend(loc='upper right')
+    maximum_iteration = max((len(value) for value in convergence_data.values()), default=1)
+    ax.set_xlim(0.5, maximum_iteration + 0.5)
+    if maximum_iteration <= 12:
+        ax.set_xticks(range(1, maximum_iteration + 1))
+    finite_gaps = [
+        float(value) for values in convergence_data.values() for value in values
+        if np.isfinite(value)
+    ]
+    ax.set_ylim(0, max(alpha * 1.5, max(finite_gaps, default=0.0) * 1.08, 1e-4))
+    clean_axis(ax)
+    iterations = [len(value) for value in convergence_data.values()]
+    bins = np.arange(0.5, max(iterations, default=1) + 1.5, 1)
+    ax_hist.hist(iterations, bins=bins, color=COLORS['blue'], alpha=0.85,
+                 edgecolor='white')
+    ax_hist.set_xlabel('Iterations completed')
+    ax_hist.set_ylabel('Configurations')
+    ax_hist.set_title('Iteration-count distribution')
+    if max(iterations, default=1) <= 12:
+        ax_hist.set_xticks(range(1, max(iterations, default=1) + 1))
+    clean_axis(ax_hist)
+    save_publication_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -974,7 +1048,8 @@ def _plot_timing_breakdown(timing, output_path):
     fig, ax = plt.subplots(figsize=(8, 4))
     names = list(steps.keys())
     values = list(steps.values())
-    colors = ['#1a9850', '#66bd63', '#3288bd', '#542788', '#d73027'][:len(names)]
+    palette = [COLORS['blue'], COLORS['green'], COLORS['orange'], COLORS['purple'], COLORS['red']]
+    colors = [palette[index % len(palette)] for index in range(len(names))]
     bars = ax.barh(names, values, color=colors)
     total = sum(values)
     for bar, val in zip(bars, values):
@@ -983,8 +1058,9 @@ def _plot_timing_breakdown(timing, output_path):
                 f'{val:.0f}s ({pct:.0f}%)', va='center', fontsize=8)
     ax.set_xlabel('Wall-clock time (s)')
     ax.set_title(f'Timing Breakdown (total: {total:.0f}s)')
+    clean_axis(ax, grid_axis='x')
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    save_publication_figure(fig, output_path)
     plt.close(fig)
 
 
@@ -1054,6 +1130,9 @@ def _generate_run_summary(experiment_dir, config, timing, cg_results, queue_resu
     lines.append("-" * 40)
     if queue_results:
         qc = queue_results.get('config', {})
+        ne_stats = queue_results.get('ne_statistics', {})
+        status_counts = ne_stats.get('status_counts', {})
+        iteration_stats = ne_stats.get('iteration_statistics', {}).get('all', {})
         greedy_label = (
             'Greedy + single swap' if qc.get('single_swap') else 'Greedy'
         )
@@ -1064,6 +1143,23 @@ def _generate_run_summary(experiment_dir, config, timing, cg_results, queue_resu
             lines.append(
                 "  WARNING: cycle states were retained as approximate assignments; "
                 "they are not verified Nash equilibria."
+            )
+        if status_counts:
+            lines.append(
+                "  NE statuses: "
+                + ", ".join(
+                    f"{name}={int(status_counts.get(name, 0))}"
+                    for name in ('converged', 'cycle', 'nonconverged', 'failed')
+                )
+            )
+        if iteration_stats.get('count'):
+            lines.append(
+                "  NE iterations: "
+                f"min={iteration_stats['min']:.0f}, "
+                f"median={iteration_stats['median']:.1f}, "
+                f"mean={iteration_stats['mean']:.1f}, "
+                f"p95={iteration_stats['p95']:.1f}, "
+                f"max={iteration_stats['max']:.0f}"
             )
         lines.append(f"  K-routes:   {qc.get('K', 'N/A')}")
         lines.append(f"  MC reps:    {qc.get('N', 'N/A')}")
@@ -1085,6 +1181,14 @@ def _generate_run_summary(experiment_dir, config, timing, cg_results, queue_resu
         cg_set = set(int(x) for x in cg_best) if cg_best is not None else set()
         agree = "YES" if cg_set == set(q_best) else "NO"
         lines.append(f"  CG-Queue agree:   {agree}")
+        correlations = queue_results.get('cg_queue_correlations', {})
+        if correlations.get('paired_count', correlations.get('n', 0)):
+            lines.append(
+                "  CG-Queue correlations: "
+                f"Pearson={correlations.get('pearson')}, "
+                f"Spearman={correlations.get('spearman')}, "
+                f"paired placements={correlations.get('paired_count', correlations.get('n'))}"
+            )
 
     lines.append("")
     lines.append("-" * 40)
@@ -1287,6 +1391,44 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
                 "been verified as Nash equilibria.",
                 "",
             ])
+        ne_stats = queue_results.get('ne_statistics', {})
+        status_counts = ne_stats.get('status_counts', {})
+        iteration_stats = ne_stats.get('iteration_statistics', {})
+        if status_counts:
+            total_ne = sum(int(value) for value in status_counts.values())
+            lines.extend([
+                "### NE termination statistics",
+                "",
+                "| Status | Configurations | Fraction | Median iterations | Mean | p95 | Maximum |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            ])
+            for status in ('converged', 'cycle', 'nonconverged', 'failed'):
+                count = int(status_counts.get(status, 0))
+                stats = iteration_stats.get(status, {})
+                fraction = count / total_ne if total_ne else 0.0
+                def _stat(name):
+                    value = stats.get(name)
+                    return "—" if value is None else f"{value:.1f}"
+                lines.append(
+                    f"| {status.replace('_', ' ').title()} | {count} | {fraction:.1%} | "
+                    f"{_stat('median')} | {_stat('mean')} | {_stat('p95')} | {_stat('max')} |"
+                )
+            all_stats = iteration_stats.get('all', {})
+            if all_stats.get('count'):
+                lines.append(
+                    f"| **All** | **{int(all_stats['count'])}** | **100.0%** | "
+                    f"**{all_stats['median']:.1f}** | **{all_stats['mean']:.1f}** | "
+                    f"**{all_stats['p95']:.1f}** | **{all_stats['max']:.1f}** |"
+                )
+            cycle_stats = ne_stats.get('cycle_length_statistics', {})
+            if cycle_stats.get('count'):
+                lines.extend([
+                    "",
+                    "For detected cycles, cycle length had "
+                    f"median `{cycle_stats['median']:.1f}`, p95 `{cycle_stats['p95']:.1f}`, "
+                    f"and maximum `{cycle_stats['max']:.1f}` iterations.",
+                ])
+            lines.append("")
         if queue_results.get('timing', {}).get('paired_placement_cache'):
             lines.extend([
                 "Greedy and exhaustive use the same canonical placement identity "
@@ -1356,7 +1498,7 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
             "",
             f"| Model | Best placement | Objective |",
             f"|---|---|---|",
-            f"| Congestion game | {cg_best} | {cg_results.get('best_objective', 'N/A'):.4f}" if isinstance(cg_results.get('best_objective'), (int, float)) else f"| Congestion game | {cg_best} | N/A |",
+            f"| Congestion game | {cg_best} | {cg_results.get('best_objective', 'N/A'):.4f} |" if isinstance(cg_results.get('best_objective'), (int, float)) else f"| Congestion game | {cg_best} | N/A |",
             f"| Queue {greedy_label.lower()} | {q_greedy} | {queue_results['best_greedy']['avg_travel_time']:.1f} |",
             f"| Queue exhaustive | {q_exhaustive} | {queue_results['best_exhaustive']['avg_travel_time']:.1f} |",
             "",
@@ -1365,6 +1507,31 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
         q_best_set = set(q_exhaustive)
         match = "YES" if cg_best_set == q_best_set else "NO"
         lines.append(f"CG and queue agree on optimal placement: **{match}**")
+        correlations = queue_results.get('cg_queue_correlations', {})
+        paired_count = correlations.get('paired_count', correlations.get('n', 0))
+        if paired_count:
+            pearson = correlations.get('pearson')
+            spearman = correlations.get('spearman')
+            pearson_text = "undefined" if pearson is None else f"{pearson:.3f}"
+            spearman_text = "undefined" if spearman is None else f"{spearman:.3f}"
+            lines.extend([
+                "",
+                "### Placement-objective association",
+                "",
+                f"Across `{paired_count}` identical final-size placements:",
+                "",
+                f"- Pearson correlation: `{pearson_text}`",
+                f"- Spearman rank correlation: `{spearman_text}`",
+                "",
+                "These correlations compare model rankings over the same charger sets; "
+                "they do not establish equality of the differently scaled objectives.",
+            ])
+            if queue_results.get('uses_approximate_ne'):
+                lines.extend([
+                    "Because at least one queue assignment is a retained cycle state, "
+                    "the correlations are descriptive of the current approximations, not "
+                    "correlations between verified Nash-equilibrium outcomes.",
+                ])
 
     lines.extend([
         "",
@@ -1378,10 +1545,11 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
         f"| `config_*/flow_heatmap.png` | Per-config CG flow heatmaps |",
         f"| `config_*/reconstruction/` | Per-config route reconstruction analysis |",
         f"| `plots/pruning_phases.png` | Network cleaning: nodes/edges per phase + map grid |",
+        f"| `plots/generated_scenario_comparison.png` | Scenario: plain vs OSM HOT vs Positron panels (only when tile fetch succeeds) |",
         f"| `plots/ne_convergence.png` | NE convergence: diff vs iteration per config |",
         f"| `plots/timing_breakdown.png` | Pipeline step durations |",
         f"| `plots/bpr_fit_samples.png` | BPR fit diagnostics (random + worst-R² links) |",
-        f"| `plots/objective_comparison.png` | CG vs Queue normalized objective bar chart |",
+        f"| `plots/objective_comparison.png` | Paired CG–Queue objectives and Pearson/Spearman association |",
         f"| `plots/placement_search_comparison.png` | Ordered greedy, one-swap, and exhaustive search outcomes |",
         f"| `placement_search_summary.json` | Algorithm choices, candidate order, and phase timings |",
         f"| `placement_search_trace.csv` | Machine-readable placement evaluation sequence |",
@@ -1532,7 +1700,7 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
 
     scenario_metadata = None
     if config.scenario_generation.get("enabled", False):
-        from src.scenario_generation import generate_scenario, plot_scenario
+        from src.scenario_generation import generate_scenario, plot_scenario, plot_scenario_comparison
         generated = generate_scenario(
             shared_road_net,
             config.scenario_generation,
@@ -1574,6 +1742,11 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
     if scenario_metadata is not None:
         plot_scenario(
             shared_road_net, generated, os.path.join(plot_dir, "generated_scenario.png")
+        )
+        # 3-panel plain/HOT/Positron figure; skipped when tiles unavailable.
+        plot_scenario_comparison(
+            shared_road_net, generated,
+            os.path.join(plot_dir, "generated_scenario_comparison.png"),
         )
     atomic_write_json(os.path.join(experiment_dir, "status.json"), {
         "status": "running", "stage": "bpr", "config_digest": digest,
@@ -1649,15 +1822,6 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
         print(f"BPR fit diagnostics saved to {bpr_fit_plot}")
     except Exception as exc:
         raise RuntimeError(f'Failed to create required BPR fit diagnostics: {exc}') from exc
-
-    try:
-        _plot_historical_bpr_comparison(
-            pandas_df,
-            os.path.join(plot_dir, 'bpr_historical_comparison.png'),
-            reference_commit=bpr_config.get('historical_reference_commit', '37eab33'),
-        )
-    except Exception as exc:
-        print(f"Optional historical BPR comparison plot skipped: {exc}")
 
     # Step 2: Congestion-game equilibrium
     if not config.pipeline.get("skip_cg_optimization", False):
@@ -1786,7 +1950,11 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
         if convergence_data:
             _save_convergence_csv(convergence_data, os.path.join(experiment_dir, 'queue', 'ne_convergence.csv'))
             print(f"Convergence data saved to {experiment_dir}/queue/ne_convergence.csv")
-            _plot_ne_convergence(convergence_data, os.path.join(plot_dir, 'ne_convergence.png'))
+            _plot_ne_convergence(
+                convergence_data,
+                os.path.join(plot_dir, 'ne_convergence.png'),
+                queue_manifest,
+            )
 
         print("\n" + "=" * 80)
         print("STEP 4: Queue-Based Greedy vs Exhaustive Comparison")

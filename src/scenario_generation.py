@@ -10,7 +10,11 @@ from typing import Any
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrowPatch
 from matplotlib.collections import LineCollection
+from src.plot_style import COLORS, apply_paper_style, save_publication_figure, try_add_basemap
+
+apply_paper_style()
 import networkx as nx
 import numpy as np
 from shapely.geometry import LineString, Point
@@ -576,45 +580,211 @@ def generate_scenario(
     return GeneratedScenario(candidates, od_demand, metadata)
 
 
-def plot_scenario(road_net, scenario: GeneratedScenario, output_path: str) -> None:
-    graph = _canonical_graph(road_net)
+def _scenario_layers(graph, scenario: GeneratedScenario) -> dict:
+    """Precompute everything panel painters need so routes solve only once."""
     segments = []
     for source, target in graph.edges():
         a, b = graph.nodes[source], graph.nodes[target]
         segments.append([(a["lon"], a["lat"]), (b["lon"], b["lat"])])
-    fig, ax = plt.subplots(figsize=(9, 9))
-    if segments:
-        ax.add_collection(LineCollection(segments, colors="#7d8b99", linewidths=0.55, alpha=0.65))
-    candidates = scenario.candidate_node_ids
-    ax.scatter(
-        [graph.nodes[node]["lon"] for node in candidates],
-        [graph.nodes[node]["lat"] for node in candidates],
-        marker="*", s=110, color="#159447", edgecolors="black", label="charger candidates", zorder=4,
-    )
+    node_ids = list(graph.nodes)
+    od_routes = []
     for record in scenario.metadata["od_pairs"]:
         origin, destination = record["origin"], record["destination"]
         route = nx.shortest_path(graph, origin, destination, weight="travel_time")
-        route_segments = [
-            [(graph.nodes[a]["lon"], graph.nodes[a]["lat"]),
-             (graph.nodes[b]["lon"], graph.nodes[b]["lat"])]
-            for a, b in zip(route[:-1], route[1:])
-        ]
-        ax.add_collection(LineCollection(route_segments, colors="#d62728", linewidths=2.0, alpha=0.85))
-        ax.scatter([graph.nodes[origin]["lon"]], [graph.nodes[origin]["lat"]], marker="o", s=75,
-                   color="#1f77b4", edgecolors="black", label="OD origin", zorder=5)
-        ax.scatter([graph.nodes[destination]["lon"]], [graph.nodes[destination]["lat"]], marker="s", s=75,
-                   color="#ff7f0e", edgecolors="black", label="OD destination", zorder=5)
+        od_routes.append({
+            "origin": origin,
+            "destination": destination,
+            "segments": [
+                [(graph.nodes[a]["lon"], graph.nodes[a]["lat"]),
+                 (graph.nodes[b]["lon"], graph.nodes[b]["lat"])]
+                for a, b in zip(route[:-1], route[1:])
+            ],
+            "hops": list(zip(route[:-1], route[1:])),
+        })
+    return {
+        "segments": segments,
+        "node_ids": node_ids,
+        "edge_list": list(graph.edges()),
+        "candidates": list(scenario.candidate_node_ids),
+        "od_routes": od_routes,
+    }
+
+
+def _draw_scenario_panel(ax, graph, layers: dict, *, mapped: bool) -> None:
+    """Paint network, candidates, and OD routes onto one axes.
+
+    ``mapped=False`` uses the plain-background palette; ``mapped=True``
+    uses the high-contrast palette for tile backgrounds.
+    """
+    link_color = "#1F3A5F" if mapped else COLORS["mid"]
+    link_width = 1.6 if mapped else 1.05
+    link_alpha = 0.9 if mapped else 0.78
+    if layers["segments"]:
+        ax.add_collection(LineCollection(
+            layers["segments"], colors=link_color,
+            linewidths=link_width, alpha=link_alpha,
+        ))
+    node_ids = layers["node_ids"]
+    # Black in every panel so the shared legend stays truthful.
+    ax.scatter(
+        [graph.nodes[node]["lon"] for node in node_ids],
+        [graph.nodes[node]["lat"] for node in node_ids],
+        s=max(12.0, min(36.0, 1600.0 / max(1, len(node_ids)))),
+        color="black",
+        edgecolors="white", linewidths=0.8,
+        label="network nodes", zorder=2,
+    )
+    edge_list = layers["edge_list"]
+    arrow_step = max(1, len(edge_list) // 28)
+    for edge_index, (source, target) in enumerate(edge_list):
+        if edge_index % arrow_step:
+            continue
+        source_data, target_data = graph.nodes[source], graph.nodes[target]
+        ax.add_patch(FancyArrowPatch(
+            (source_data["lon"], source_data["lat"]),
+            (target_data["lon"], target_data["lat"]),
+            arrowstyle="-|>", mutation_scale=7, linewidth=0.65,
+            color="#1F3A5F" if mapped else COLORS["dark"],
+            alpha=0.85 if mapped else 0.62, zorder=3,
+            shrinkA=3, shrinkB=3,
+        ))
+    candidates = layers["candidates"]
+    ax.scatter(
+        [graph.nodes[node]["lon"] for node in candidates],
+        [graph.nodes[node]["lat"] for node in candidates],
+        marker="*", s=160 if mapped else 125,
+        color=COLORS["green"],
+        edgecolors="white", linewidths=1.0 if mapped else 0.8,
+        label="charger candidates", zorder=4,
+    )
+    for rank, node in enumerate(candidates, start=1):
+        ax.annotate(
+            f"C{rank}", (graph.nodes[node]["lon"], graph.nodes[node]["lat"]),
+            xytext=(5, 5), textcoords="offset points", fontsize=7,
+            color=COLORS["dark"],
+            bbox={"facecolor": "white", "edgecolor": "none",
+                  "alpha": 1.0 if mapped else 0.75, "pad": 1},
+        )
+    for od_index, route in enumerate(layers["od_routes"], start=1):
+        origin, destination = route["origin"], route["destination"]
+        ax.add_collection(LineCollection(
+            route["segments"], colors=COLORS["red"], linewidths=2.8, alpha=0.92,
+        ))
+        for route_source, route_target in route["hops"]:
+            source_data, target_data = graph.nodes[route_source], graph.nodes[route_target]
+            ax.add_patch(FancyArrowPatch(
+                (source_data["lon"], source_data["lat"]),
+                (target_data["lon"], target_data["lat"]),
+                arrowstyle="-|>", mutation_scale=8, linewidth=1.0,
+                color=COLORS["red"], alpha=0.82, zorder=4,
+                shrinkA=5, shrinkB=5,
+            ))
+        ax.scatter([graph.nodes[origin]["lon"]], [graph.nodes[origin]["lat"]], marker="o",
+                   s=110 if mapped else 75,
+                   color=COLORS["blue"], edgecolors="white",
+                   linewidths=1.0 if mapped else 0.8,
+                   label="OD origin", zorder=5)
+        ax.scatter([graph.nodes[destination]["lon"]], [graph.nodes[destination]["lat"]],
+                   marker="s", s=110 if mapped else 75,
+                   color=COLORS["orange"], edgecolors="white",
+                   linewidths=1.0 if mapped else 0.8,
+                   label="OD destination", zorder=5)
+        for node, text_label, offset, color in (
+            (origin, f"O{od_index}", (5, 5), COLORS["blue"]),
+            (destination, f"D{od_index}", (5, -12), COLORS["orange"]),
+        ):
+            ax.annotate(
+                text_label, (graph.nodes[node]["lon"], graph.nodes[node]["lat"]),
+                xytext=offset, textcoords="offset points", fontsize=7,
+                color=color,
+                bbox={"facecolor": "white", "edgecolor": "none",
+                      "alpha": 1.0, "pad": 1} if mapped else None,
+            )
+
+
+def _scenario_limits(graph, node_ids):
+    x_values = [graph.nodes[node]["lon"] for node in node_ids]
+    y_values = [graph.nodes[node]["lat"] for node in node_ids]
+    x_pad = max(1e-5, (max(x_values) - min(x_values)) * 0.04)
+    y_pad = max(1e-5, (max(y_values) - min(y_values)) * 0.04)
+    return ((min(x_values) - x_pad, max(x_values) + x_pad),
+            (min(y_values) - y_pad, max(y_values) + y_pad))
+
+
+def plot_scenario(road_net, scenario: GeneratedScenario, output_path: str) -> None:
+    """Plain-background scenario figure (unchanged single-panel output)."""
+    graph = _canonical_graph(road_net)
+    layers = _scenario_layers(graph, scenario)
+    fig, ax = plt.subplots(figsize=(8.4, 6.8))
+    _draw_scenario_panel(ax, graph, layers, mapped=False)
     handles, labels = ax.get_legend_handles_labels()
     unique = dict(zip(labels, handles))
-    ax.legend(unique.values(), unique.keys(), loc="best")
-    ax.autoscale()
+    ax.legend(
+        unique.values(), unique.keys(), loc="upper left",
+        bbox_to_anchor=(1.01, 1.0), borderaxespad=0,
+        frameon=True, facecolor="white", edgecolor=COLORS["light"],
+    )
+    x_limits, y_limits = _scenario_limits(graph, layers["node_ids"])
+    ax.set_xlim(x_limits)
+    ax.set_ylim(y_limits)
     ax.set_aspect("equal")
     ax.set_title(
         f"Generated scenario: N={graph.number_of_nodes():,}, E={graph.number_of_edges():,}, "
-        f"candidates={len(candidates)}"
+        f"candidates={len(layers['candidates'])}"
     )
-    ax.set_xlabel("longitude")
-    ax.set_ylabel("latitude")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    save_publication_figure(fig, output_path)
     plt.close(fig)
+
+
+def plot_scenario_comparison(road_net, scenario: GeneratedScenario, output_path: str) -> bool:
+    """One figure, three panels: plain | OSM HOT tiles | Positron tiles.
+
+    Returns True when at least one tile panel succeeded (file written);
+    otherwise nothing is written and False is returned so callers can skip
+    the optional artifact on offline machines.
+    """
+    graph = _canonical_graph(road_net)
+    layers = _scenario_layers(graph, scenario)
+    x_limits, y_limits = _scenario_limits(graph, layers["node_ids"])
+    panels = (("Plain background", None), ("OpenStreetMap HOT", "hot"),
+              ("Esri World Imagery", "satellite"))
+    fig, axes = plt.subplots(1, 3, figsize=(17, 6.2))
+    tiled_ok = False
+    for ax, (title, source) in zip(axes, panels):
+        mapped = source is not None
+        _draw_scenario_panel(ax, graph, layers, mapped=mapped)
+        ax.set_xlim(x_limits)
+        ax.set_ylim(y_limits)
+        if mapped and try_add_basemap(ax, source=source):
+            ax.set_xlim(x_limits)
+            ax.set_ylim(y_limits)
+            tiled_ok = True
+        ax.set_aspect("equal")
+        ax.set_title(title)
+        ax.set_xlabel("Longitude")
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+    if not tiled_ok:
+        plt.close(fig)
+        print("Scenario comparison skipped: no tile background available")
+        return False
+    axes[0].set_ylabel("Latitude")
+    handles, labels = axes[0].get_legend_handles_labels()
+    unique = dict(zip(labels, handles))
+    fig.legend(
+        unique.values(), unique.keys(), loc="lower center", ncol=4,
+        frameon=True, facecolor="white", edgecolor=COLORS["light"],
+    )
+    fig.suptitle(
+        f"Generated scenario: N={graph.number_of_nodes():,}, "
+        f"E={graph.number_of_edges():,}, candidates={len(layers['candidates'])}"
+    )
+    fig.subplots_adjust(bottom=0.14, top=0.88, wspace=0.12)
+    save_publication_figure(fig, output_path)
+    plt.close(fig)
+    return True

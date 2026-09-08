@@ -19,6 +19,10 @@ import numpy as np
 import pandas as pd
 import osmnx as ox
 
+from src.plot_style import COLORS, apply_paper_style, clean_axis, save_publication_figure
+
+apply_paper_style()
+
 from src.config import NetworkConfig
 from src.graph_cache import get_graph
 from src.network_pruning import (
@@ -64,29 +68,39 @@ def _edge_segments(graph):
 def _draw_graph(ax, graph, title, node_size=1.5, removed_nodes=None):
     segments = _edge_segments(graph)
     if segments:
-        ax.add_collection(LineCollection(segments, colors="#6f7782", linewidths=0.35, alpha=0.65))
+        ax.add_collection(LineCollection(
+            segments, colors=COLORS["mid"], linewidths=0.5, alpha=0.72,
+        ))
     if graph.nodes:
         points = np.asarray([[data["x"], data["y"]] for _, data in graph.nodes(data=True)])
-        ax.scatter(points[:, 0], points[:, 1], s=node_size, c="#16884a", alpha=0.8, zorder=2)
+        adaptive_size = max(node_size, min(8.0, 700.0 / max(1, len(points))))
+        ax.scatter(
+            points[:, 0], points[:, 1], s=adaptive_size,
+            c=COLORS["blue"], alpha=0.86, edgecolors="white",
+            linewidths=0.12, zorder=2,
+        )
     if removed_nodes:
         points = np.asarray([
             [removed_nodes[node]["x"], removed_nodes[node]["y"]]
             for node in removed_nodes
         ])
         if len(points):
-            ax.scatter(points[:, 0], points[:, 1], s=max(node_size, 2), c="#d95f02",
-                       alpha=0.6, zorder=3, label="removed")
+            ax.scatter(
+                points[:, 0], points[:, 1], s=max(node_size, 8),
+                c=COLORS["red"], marker="x", linewidths=0.7,
+                alpha=0.75, zorder=3, label="removed from SCC",
+            )
             ax.legend(loc="lower right", fontsize=7)
     ax.autoscale()
     ax.set_aspect("equal", adjustable="datalim")
-    ax.set_title(f"{title}\nN={len(graph):,}, E={graph.number_of_edges():,}", fontsize=9)
+    ax.set_title(f"{title}\nN={len(graph):,}, E={graph.number_of_edges():,}")
     ax.set_xticks([])
     ax.set_yticks([])
 
 
 def _save_figure(fig, path):
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
+    save_publication_figure(fig, path)
     plt.close(fig)
 
 
@@ -121,27 +135,33 @@ def _plot_close_diagnostics(reference, summary, profile, recovered, radii, outpu
     ].sort_values("radius_m")
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    axes[0].hist(np.clip(nearest, 0, 200), bins=40, color="#3288bd", alpha=0.85)
-    axes[0].axvline(10, color="black", linestyle="--", linewidth=1)
-    axes[0].axvline(20, color="black", linestyle=":", linewidth=1)
+    axes[0].hist(np.clip(nearest, 0, 200), bins=40, color=COLORS["blue"],
+                 alpha=0.88, edgecolor="white")
+    axes[0].axvline(10, color=COLORS["red"], linestyle="--", linewidth=1)
+    axes[0].axvline(20, color=COLORS["dark"], linestyle=":", linewidth=1)
     axes[0].set_xlabel("Nearest-node distance (m; clipped at 200)")
     axes[0].set_ylabel("Nodes")
     axes[0].set_title("Topology-only nearest neighbors")
+    clean_axis(axes[0])
 
-    axes[1].plot(subset["radius_m"], subset["nodes"], marker="o", label="nodes")
-    axes[1].plot(subset["radius_m"], subset["largest_scc_nodes"], marker="s", label="largest SCC")
+    axes[1].plot(subset["radius_m"], subset["nodes"], marker="o",
+                 color=COLORS["blue"], label="nodes")
+    axes[1].plot(subset["radius_m"], subset["largest_scc_nodes"], marker="s",
+                 color=COLORS["orange"], label="largest SCC")
     axes[1].set_xlabel("Consolidation radius (m)")
     axes[1].set_ylabel("Count")
     axes[1].set_title("Coarsening and directed retention")
     axes[1].legend()
+    clean_axis(axes[1])
 
     axes[2].plot(subset["radius_m"], subset["unconnected_close_pairs_le_20m"],
-                 marker="o", label="unconnected pairs ≤20m")
+                 marker="o", color=COLORS["red"], label="unconnected pairs ≤20m")
     axes[2].plot(subset["radius_m"], subset["largest_cluster_size"],
-                 marker="s", label="largest cluster size")
+                 marker="s", color=COLORS["green"], label="largest cluster size")
     axes[2].set_xlabel("Consolidation radius (m)")
     axes[2].set_title("Residual proximity and cluster size")
     axes[2].legend()
+    clean_axis(axes[2])
     fig.suptitle(f"Close-node diagnostics: {profile.replace('_', ' ')}", fontsize=14)
     _save_figure(fig, output_path)
 

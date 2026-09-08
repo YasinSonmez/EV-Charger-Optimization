@@ -14,11 +14,14 @@ import resource
 
 from src.traffic_optimizer import Network
 from src.run_state import available_cpus
+from src.plot_style import COLORS, apply_paper_style, clean_axis, save_publication_figure
 from src.contracts import (
     canonical_placement,
     enumerate_placements,
     single_swap_neighbors,
 )
+
+apply_paper_style()
 
 
 def _cg_placement_worker(job):
@@ -58,7 +61,7 @@ def save_flow_heatmap(grid, output_path, title, use_cvxpy=True, flows=None, flow
     """Save a flow heatmap for a single configuration without displaying it"""
     # Create a figure and suppress display
     plt.ioff()  # Turn off interactive mode
-    fig, ax = plt.subplots(figsize=(12, 10))
+    fig, ax = plt.subplots(figsize=(7.5, 7.0))
     
     # Get flow data
     if flows is None:
@@ -92,11 +95,13 @@ def save_flow_heatmap(grid, output_path, title, use_cvxpy=True, flows=None, flow
     gdf = gpd.GeoDataFrame(edges_df, geometry="geometry")
 
     # Setup the coloring and sizing
-    max_linewidth = 10
-    min_linewidth = 1
-    cmap = "plasma"
-    norm = mcolors.Normalize(vmin=gdf["flow"].min(), vmax=gdf["flow"].max())
-    linewidths = min_linewidth + (gdf["flow"] - gdf["flow"].min()) / max(1e-6, gdf["flow"].max() - gdf["flow"].min()) * (max_linewidth - min_linewidth)
+    max_linewidth = 4.0
+    min_linewidth = 0.45
+    cmap = "viridis"
+    vmax = max(1e-6, float(gdf["flow"].max()))
+    norm = mcolors.Normalize(vmin=0.0, vmax=vmax)
+    scaled_flow = np.sqrt(np.clip(gdf["flow"].to_numpy(dtype=float) / vmax, 0, 1))
+    linewidths = min_linewidth + scaled_flow * (max_linewidth - min_linewidth)
     sm = ScalarMappable(norm=norm, cmap=cmap)
     gdf["color"] = gdf["flow"].apply(lambda f: sm.to_rgba(f))
     
@@ -111,26 +116,16 @@ def save_flow_heatmap(grid, output_path, title, use_cvxpy=True, flows=None, flow
         if is_low_flow:
             # Make low flow links very transparent (alpha=0.2)
             color_rgba = list(color)
-            color_rgba[3] = 0.2  # Set alpha to 0.2
-            ax.plot(x, y, color=color_rgba, linewidth=min_linewidth, linestyle='--')
+            color_rgba[3] = 0.3
+            ax.plot(x, y, color=color_rgba, linewidth=min_linewidth)
         else:
-            # Plot normal flow links
-            ax.plot(x, y, color=color, linewidth=lw)
-            
-            # Add direction arrow only for links with flow above threshold
-            if len(x) >= 2:
-                try:
-                    mid_idx = len(x) // 2 - 1
-                    ax.annotate(
-                        '', xy=(x[mid_idx + 1], y[mid_idx + 1]),
-                        xytext=(x[mid_idx], y[mid_idx]),
-                        arrowprops=dict(arrowstyle="->", color=color, lw=lw)
-                    )
-                except IndexError:
-                    continue  # skip problematic geometries
+            ax.plot(x, y, color=color, linewidth=lw, solid_capstyle='round')
 
     # Plot all nodes as black circles
-    ax.scatter(grid.net.nodes["lon"], grid.net.nodes["lat"], color="black", s=10, zorder=3, label="Node")
+    node_size = max(8.0, min(20.0, 1200.0 / max(1, len(grid.net.nodes))))
+    ax.scatter(grid.net.nodes["lon"], grid.net.nodes["lat"], color=COLORS['light'],
+               s=node_size, edgecolors='white', linewidths=0.4, zorder=3,
+               label="Network nodes")
 
     # Plot OD nodes with demand annotation
     if hasattr(grid, 'od_pairs'):
@@ -143,30 +138,41 @@ def save_flow_heatmap(grid, output_path, title, use_cvxpy=True, flows=None, flow
             demand_no_charging = grid.b[2 * i]
             demand_charging = grid.b[2 * i + 1]
 
-            ax.scatter(o_lon, o_lat, c='blue', s=100, edgecolors='black', label='Origin' if i == 0 else "", zorder=4)
-            ax.text(o_lon, o_lat + 0.0002, f"O{i}: {demand_no_charging:.0f}/{demand_charging:.0f}",
-                    fontsize=9, ha='center', color='blue', zorder=5)
+            ax.scatter(o_lon, o_lat, c=COLORS['blue'], s=70, edgecolors='white',
+                       linewidths=0.8, label='Origin' if i == 0 else "", zorder=4)
+            ax.annotate(f"O{i}: {demand_no_charging:.0f}/{demand_charging:.0f}",
+                        (o_lon, o_lat), xytext=(5, 6), textcoords='offset points',
+                        fontsize=8, color=COLORS['blue'], zorder=5)
 
-            ax.scatter(d_lon, d_lat, c='red', s=100, edgecolors='black', label='Destination' if i == 0 else "", zorder=4)
-            ax.text(d_lon, d_lat - 0.0002, f"D{i}: {demand_no_charging:.0f}/{demand_charging:.0f}",
-                    fontsize=9, ha='center', color='red', zorder=5)
+            ax.scatter(d_lon, d_lat, c=COLORS['orange'], s=70, marker='s',
+                       edgecolors='white', linewidths=0.8,
+                       label='Destination' if i == 0 else "", zorder=4)
+            ax.annotate(f"D{i}: {demand_no_charging:.0f}/{demand_charging:.0f}",
+                        (d_lon, d_lat), xytext=(5, -12), textcoords='offset points',
+                        fontsize=8, color=COLORS['orange'], zorder=5)
+
+    for index, charger_id in enumerate(canonical_placement(grid.chargers), start=1):
+        ax.scatter(grid.net.nodes.at[charger_id, "lon"], grid.net.nodes.at[charger_id, "lat"],
+                   marker='*', s=125, color=COLORS['green'], edgecolors='white',
+                   linewidths=0.8, label='Selected charger' if index == 1 else "", zorder=6)
 
     # Final plot elements
-    ax.set_title(title, fontsize=16)
+    ax.set_title(title, fontsize=10)
     ax.set_axis_off()
 
     # Add colorbar
     sm.set_array(gdf["flow"])
     cbar = fig.colorbar(sm, ax=ax, orientation='vertical')
-    cbar.set_label("Link Flow", fontsize=12)
+    cbar.set_label("Equilibrium link flow")
 
     # Add legend if needed
     handles, labels = ax.get_legend_handles_labels()
     if handles:
-        ax.legend(loc='lower left', fontsize=10)
+        ax.legend(loc='upper left', frameon=True, facecolor='white',
+                  edgecolor=COLORS['light'])
 
     # Save the figure
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    save_publication_figure(fig, output_path)
     plt.close(fig)
     return True
 
@@ -297,7 +303,7 @@ def save_charger_flow_heatmaps(grid, output_folder, base_filename, use_cvxpy=Tru
     n_rows = (n_plots + n_cols - 1) // n_cols
     
     plt.ioff()  # Turn off interactive mode
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6*n_cols, 5*n_rows))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.2*n_cols, 3.8*n_rows))
     
     # Handle the case where axes is a 1D array or even a single axis
     if n_plots == 1:
@@ -345,7 +351,7 @@ def save_charger_flow_heatmaps(grid, output_folder, base_filename, use_cvxpy=Tru
                               global_min_flow, global_max_flow, flow_threshold=flow_threshold)
     
     # Add a note about the threshold in the figure title
-    fig.suptitle(f"Flow Heatmaps (flows < {flow_threshold} shown as dashed lines)", fontsize=14)
+    fig.suptitle(f"Flow decomposition (links below {flow_threshold:g} shown faintly)")
     
     # Adjust the layout and save
     plt.tight_layout(rect=[0, 0, 1, 0.97])  # Make room for the suptitle
@@ -353,7 +359,7 @@ def save_charger_flow_heatmaps(grid, output_folder, base_filename, use_cvxpy=Tru
     # Save the figure
     os.makedirs(output_folder, exist_ok=True)
     output_path = os.path.join(output_folder, f"{base_filename}_charger_flows.png")
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    save_publication_figure(fig, output_path)
     plt.close(fig)
     
     return True
@@ -394,9 +400,9 @@ def _plot_flow_on_axis(grid, ax, title, flows, min_flow=None, max_flow=None, flo
     gdf = gpd.GeoDataFrame(edges_df, geometry="geometry")
 
     # Setup the coloring and sizing
-    max_linewidth = 8
-    min_linewidth = 1
-    cmap = "plasma"
+    max_linewidth = 4.0
+    min_linewidth = 0.45
+    cmap = "viridis"
     
     # Use provided min/max flow values for consistent colormaps if provided
     if min_flow is None:
@@ -418,28 +424,16 @@ def _plot_flow_on_axis(grid, ax, title, flows, min_flow=None, max_flow=None, flo
         
         # Handle low flow links differently
         if is_low_flow:
-            # Make low flow links very transparent (alpha=0.2)
+            # Keep unused links visible as quiet network context.
             color_rgba = list(color)
-            color_rgba[3] = 0.2  # Set alpha to 0.2
-            ax.plot(x, y, color=color_rgba, linewidth=min_linewidth, linestyle='--')
+            color_rgba[3] = 0.24
+            ax.plot(x, y, color=color_rgba, linewidth=min_linewidth)
         else:
-            # Plot normal flow links
-            ax.plot(x, y, color=color, linewidth=lw)
-            
-            # Add direction arrow only for links with flow above threshold
-            if len(x) >= 2:
-                try:
-                    mid_idx = len(x) // 2 - 1
-                    ax.annotate(
-                        '', xy=(x[mid_idx + 1], y[mid_idx + 1]),
-                        xytext=(x[mid_idx], y[mid_idx]),
-                        arrowprops=dict(arrowstyle="->", color=color, lw=min(lw, 3))
-                    )
-                except IndexError:
-                    continue  # skip problematic geometries
+            ax.plot(x, y, color=color, linewidth=lw, solid_capstyle='round')
 
-    # Plot all nodes as black circles
-    ax.scatter(grid.net.nodes["lon"], grid.net.nodes["lat"], color="black", s=5, zorder=3)
+    node_size = max(1.5, min(5.0, 450.0 / max(1, len(grid.net.nodes))))
+    ax.scatter(grid.net.nodes["lon"], grid.net.nodes["lat"], color=COLORS['light'],
+               s=node_size, edgecolors='white', linewidths=0.1, zorder=3)
 
     # Plot OD nodes with demand annotation
     if hasattr(grid, 'od_pairs'):
@@ -452,35 +446,38 @@ def _plot_flow_on_axis(grid, ax, title, flows, min_flow=None, max_flow=None, flo
             demand_no_charging = grid.b[2 * i]
             demand_charging = grid.b[2 * i + 1]
 
-            ax.scatter(o_lon, o_lat, c='blue', s=80, edgecolors='black', label='Origin' if i == 0 else "", zorder=4)
-            ax.text(o_lon, o_lat + 0.0002, f"O{i}: {demand_no_charging:.0f}/{demand_charging:.0f}",
-                    fontsize=9, ha='center', color='blue', zorder=5)
+            ax.scatter(o_lon, o_lat, c=COLORS['blue'], s=60, edgecolors='white',
+                       linewidths=0.7, label='Origin' if i == 0 else "", zorder=4)
+            ax.annotate(f"O{i}", (o_lon, o_lat), xytext=(4, 4),
+                        textcoords='offset points', fontsize=7, color=COLORS['blue'])
 
-            ax.scatter(d_lon, d_lat, c='red', s=80, edgecolors='black', label='Destination' if i == 0 else "", zorder=4)
-            ax.text(d_lon, d_lat - 0.0002, f"D{i}: {demand_no_charging:.0f}/{demand_charging:.0f}",
-                    fontsize=9, ha='center', color='red', zorder=5)
+            ax.scatter(d_lon, d_lat, c=COLORS['orange'], marker='s', s=60,
+                       edgecolors='white', linewidths=0.7,
+                       label='Destination' if i == 0 else "", zorder=4)
+            ax.annotate(f"D{i}", (d_lon, d_lat), xytext=(4, -10),
+                        textcoords='offset points', fontsize=7, color=COLORS['orange'])
 
     # Plot charger nodes as special markers
-    for charger_id in grid.chargers:
+    for charger_index, charger_id in enumerate(grid.chargers):
         charger_lon = grid.net.nodes.at[charger_id, "lon"]
         charger_lat = grid.net.nodes.at[charger_id, "lat"]
-        ax.scatter(charger_lon, charger_lat, c='green', s=80, edgecolors='black', marker='*', zorder=5)
-        # Add label for charger
-        ax.text(charger_lon, charger_lat + 0.0002, f"C{charger_id}", 
-                fontsize=9, ha='center', color='green', zorder=5, fontweight='bold')
+        ax.scatter(charger_lon, charger_lat, c=COLORS['green'], s=100,
+                   edgecolors='white', linewidths=0.7, marker='*', zorder=5)
+        ax.annotate(f"C{charger_id}", (charger_lon, charger_lat), xytext=(4, 4),
+                    textcoords='offset points', fontsize=7, color=COLORS['green'])
 
     # Final plot elements
-    ax.set_title(title, fontsize=12)
+    ax.set_title(title)
     ax.set_axis_off()
 
     # Add colorbar
     sm.set_array(gdf["flow"])
     cbar = plt.colorbar(sm, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
-    cbar.set_label("Link Flow", fontsize=10)
+    cbar.set_label("Equilibrium link flow")
     
-    # Add a note about the threshold
-    ax.text(0.01, 0.01, f"Links with flow < {flow_threshold} shown as dashed lines",
-            transform=ax.transAxes, fontsize=8, ha='left', va='bottom')
+    ax.text(0.01, 0.01, f"Flow < {flow_threshold:g} shown faintly",
+            transform=ax.transAxes, fontsize=7, color=COLORS['mid'],
+            ha='left', va='bottom')
 
 def save_all_flow_heatmaps(grids, config, results_folder, time_history=None):
     """Generate and save flow heatmaps for all configurations in the results folder"""
@@ -996,51 +993,54 @@ def plot_travel_time_objectives(grids, time_history, phases, filename='1', singl
     exhaustive_result = grids[exhaustive_idx].travel_time_obj
 
     charger_names = [str(grid.chargers) for grid in grids]
-    colors = ['tab:purple', 'tab:green', 'tab:red', 'tab:gray', 'tab:blue']
+    colors = [COLORS['blue'], COLORS['green'], COLORS['orange'],
+              COLORS['purple'], COLORS['red']]
 
     # Create a 1x2 grid of subplots
-    fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), constrained_layout=True)
 
     # Plot computation time history
     ax = axes[0]
-    ax.plot(range(1, len(time_history)+1), time_history, marker='o')
-    ax.set_xlabel('Charger Combinations')
-    ax.set_ylabel('Cumulative Computation Time (s)')
+    ax.plot(range(1, len(time_history)+1), time_history, marker='o', markersize=3,
+            color=COLORS['blue'])
+    ax.set_xlabel('Placement evaluation')
+    ax.set_ylabel('Cumulative wall time (s)')
+    ax.set_title('Search computation time')
     
     # Add vertical lines for phase boundaries
     for i, (label, vertical_line_pos_i) in enumerate(phases.items()):
         ax.axvline(x=vertical_line_pos_i+1, label=label, linestyle='--', c=colors[i])
     
-    ax.legend(loc='upper left')
+    ax.legend(loc='upper left', fontsize=7)
     ax.set_xticks(range(1, len(charger_names)+1))
     ax.set_xticklabels(charger_names, rotation=45, ha='right')
-    ax.grid(True)
+    clean_axis(ax)
 
     # Plot travel time objectives
     ax = axes[1]
     for j, grid_j in enumerate(grids):
-        ax.scatter(j + 1, grid_j.travel_time_obj, c='tab:blue', s=50)
+        ax.scatter(j + 1, grid_j.travel_time_obj, c=COLORS['blue'], s=28)
         
         if j == greedy_idx:
-            ax.scatter(j + 1, greedy_result, marker='D', s=100, c='tab:gray', label='Greedy Min')
+            ax.scatter(j + 1, greedy_result, marker='D', s=65, c=COLORS['dark'], label='Greedy minimum')
         if single_swap and j == single_swap_idx:
-            ax.scatter(j + 1, single_swap_result, marker='s', s=100, c='tab:green', label='Greedy + Single Swap Min')
+            ax.scatter(j + 1, single_swap_result, marker='s', s=65, c=COLORS['green'], label='Single-swap minimum')
         if j == exhaustive_idx:
-            ax.scatter(j + 1, exhaustive_result, marker='*', s=200, c='tab:red', label='Exhaustive Min')
+            ax.scatter(j + 1, exhaustive_result, marker='*', s=105, c=COLORS['orange'], label='Exhaustive minimum')
 
     # Add vertical lines for phase boundaries
     for i, (label, vertical_line_pos_i) in enumerate(phases.items()):
         ax.axvline(x=vertical_line_pos_i+1, label=label, linestyle='--', c=colors[i])
 
-    ax.set_xlabel('Charger Combinations')
-    ax.set_ylabel('Travel Time Objective')
-    ax.legend(loc='upper right')
+    ax.set_xlabel('Placement evaluation')
+    ax.set_ylabel('CG objective')
+    ax.set_title('Placement objective')
+    ax.legend(loc='upper right', fontsize=7)
     ax.set_xticks(range(1, len(charger_names)+1))
     ax.set_xticklabels(charger_names, rotation=45, ha='right')
-    ax.grid(True)
+    clean_axis(ax)
 
-    plt.tight_layout()
-    plt.savefig(filename + '.png', dpi=300, bbox_inches='tight')
+    save_publication_figure(fig, filename + '.png')
     plt.close()
 
 
@@ -1293,8 +1293,8 @@ def analyze_route_reconstruction(network, link_flows_dict, k_values=[1, 2, 4, 8,
         os.makedirs(save_dir, exist_ok=True)
         
         # Create metrics plot
-        fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-        axes = axes.flatten()
+        fig, axes = plt.subplots(1, 5, figsize=(13, 2.8), constrained_layout=True)
+        axes = np.atleast_1d(axes).flatten()
         
         metrics = ['coverage', 'mae', 'rmse', 'max_diff', 'correlation']
         titles = ['Flow Coverage (%)', 'Mean Absolute Error', 'Root Mean Square Error', 
@@ -1305,22 +1305,23 @@ def analyze_route_reconstruction(network, link_flows_dict, k_values=[1, 2, 4, 8,
             y = [k_metrics[k][metric] for k in k_values if k in k_metrics]
             k_vals = [k for k in k_values if k in k_metrics]
             if k_vals:  # Only plot if we have data
-                ax.plot(k_vals, y, 'o-', linewidth=2)
+                ax.plot(k_vals, y, 'o-', linewidth=1.4, markersize=4,
+                        color=COLORS['blue'])
                 ax.set_xlabel('Number of Routes (k)')
                 ax.set_ylabel(title)
-                ax.grid(True)
+                ax.set_title(title)
+                clean_axis(ax)
         
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, 'k_routes_analysis.png'), dpi=300, bbox_inches='tight')
-        plt.close()
+        save_publication_figure(fig, os.path.join(save_dir, 'k_routes_analysis.png'))
+        plt.close(fig)
 
         # Create flow visualizations in a single figure
         n_plots = len(k_metrics) + 1  # +1 for original flows
-        n_cols = 4  # We want 4 columns
+        n_cols = min(3, n_plots)
         n_rows = (n_plots + n_cols - 1) // n_cols
         
         plt.ioff()  # Turn off interactive mode
-        fig = plt.figure(figsize=(20, 5*n_rows))
+        fig = plt.figure(figsize=(4.2*n_cols, 3.8*n_rows))
         
         # Plot original flows
         ax = plt.subplot(n_rows, n_cols, 1)
@@ -1347,9 +1348,11 @@ def analyze_route_reconstruction(network, link_flows_dict, k_values=[1, 2, 4, 8,
                              f'k={k}\nCoverage={metrics["coverage"]:.1f}%\nMAE={metrics["mae"]:.3f}', 
                              flows)
         
+        for idx in range(n_plots + 1, n_rows * n_cols + 1):
+            plt.subplot(n_rows, n_cols, idx).set_visible(False)
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, 'flow_reconstructions.png'), dpi=300, bbox_inches='tight')
-        plt.close()
+        save_publication_figure(fig, os.path.join(save_dir, 'flow_reconstructions.png'))
+        plt.close(fig)
 
     return {'k_metrics': k_metrics}
 

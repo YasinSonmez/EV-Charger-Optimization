@@ -29,6 +29,23 @@ from src.run_state import available_cpus
 CYCLE_APPROXIMATION_STATUS = 'approximate_cycle_state'
 
 
+def _numeric_summary(values):
+    """Return JSON-safe descriptive statistics for a short numeric sequence."""
+    values = np.asarray(list(values), dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {'count': 0, 'min': None, 'median': None, 'mean': None,
+                'p95': None, 'max': None}
+    return {
+        'count': int(values.size),
+        'min': float(np.min(values)),
+        'median': float(np.median(values)),
+        'mean': float(np.mean(values)),
+        'p95': float(np.percentile(values, 95)),
+        'max': float(np.max(values)),
+    }
+
+
 def _is_cycle_termination(result):
     """Return whether a saved result terminated by repeating an assignment."""
     if not isinstance(result, dict):
@@ -69,6 +86,29 @@ def _write_queue_manifest(path, manifest, assignments):
         for key, value in assignments.items()
         if value.get('status') == 'nonconverged'
     }
+    statuses = {
+        key: (
+            'converged' if value.get('converged', False)
+            else 'cycle' if value.get('status') == CYCLE_APPROXIMATION_STATUS
+            else 'failed' if value.get('status') == 'failed'
+            else 'nonconverged'
+        )
+        for key, value in assignments.items()
+    }
+    status_counts = {
+        status: sum(value == status for value in statuses.values())
+        for status in ('converged', 'cycle', 'nonconverged', 'failed')
+    }
+    iteration_statistics = {
+        'all': _numeric_summary(
+            value.get('iterations', 0) for value in assignments.values()
+        )
+    }
+    for status in status_counts:
+        iteration_statistics[status] = _numeric_summary(
+            assignments[key].get('iterations', 0)
+            for key, value in statuses.items() if value == status
+        )
     manifest.update({
         'approximate_configurations': approximate,
         'nonconverged_configurations': nonconverged,
@@ -77,6 +117,14 @@ def _write_queue_manifest(path, manifest, assignments):
             for value in assignments.values()
         ),
         'uses_approximate_cycle_states': bool(approximate),
+        'configuration_statuses': statuses,
+        'status_counts': status_counts,
+        'iteration_statistics': iteration_statistics,
+        'cycle_length_statistics': _numeric_summary(
+            value.get('cycle_length')
+            for value in assignments.values()
+            if value.get('cycle_length') is not None
+        ),
         'exact_ne_eligible': (
             not approximate
             and not nonconverged
