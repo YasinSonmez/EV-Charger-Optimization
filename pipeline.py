@@ -995,27 +995,29 @@ def _plot_ne_convergence(convergence_data, output_path, queue_manifest=None):
     if not convergence_data:
         return
     statuses = (queue_manifest or {}).get('configuration_statuses', {})
-    status_colors = {
-        'converged': COLORS['green'], 'cycle': COLORS['orange'],
-        'nonconverged': COLORS['red'], 'failed': COLORS['red'],
+    palette = [COLORS['blue'], COLORS['orange'], COLORS['green'],
+               COLORS['red'], COLORS['purple'], COLORS['sky'],
+               COLORS['dark']]
+    status_linestyle = {
+        'converged': '-', 'cycle': '--',
+        'nonconverged': ':', 'failed': '-.',
     }
     fig, (ax, ax_hist) = plt.subplots(1, 2, figsize=(10.5, 4.1), constrained_layout=True)
-    shown = set()
-    for config_str, diffs in convergence_data.items():
+    for index, (config_str, diffs) in enumerate(convergence_data.items()):
         if diffs:
             status = statuses.get(config_str, 'nonconverged')
-            label = status.title() if status not in shown else None
-            shown.add(status)
-            ax.plot(range(1, len(diffs) + 1), diffs, linewidth=1.1, alpha=0.72,
+            ax.plot(range(1, len(diffs) + 1), diffs, linewidth=1.1, alpha=0.8,
                     marker='o', markersize=2.8,
-                    color=status_colors.get(status, COLORS['mid']), label=label)
+                    color=palette[index % len(palette)],
+                    linestyle=status_linestyle.get(status, '-'),
+                    label=f"{config_str} ({status})")
     alpha = float((queue_manifest or {}).get('alpha', 0.01))
     ax.axhline(y=alpha, color=COLORS['dark'], linestyle='--', linewidth=0.9,
                label=f'Tolerance ({alpha:g})')
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Relative route travel-time gap')
     ax.set_title('Better-response trajectories')
-    ax.legend(loc='upper right')
+    ax.legend(loc='upper right', fontsize=7)
     maximum_iteration = max((len(value) for value in convergence_data.values()), default=1)
     ax.set_xlim(0.5, maximum_iteration + 0.5)
     if maximum_iteration <= 12:

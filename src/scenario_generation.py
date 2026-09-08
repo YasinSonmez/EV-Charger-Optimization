@@ -634,20 +634,28 @@ def _draw_scenario_panel(ax, graph, layers: dict, *, mapped: bool) -> None:
         edgecolors="white", linewidths=0.8,
         label="network nodes", zorder=2,
     )
-    edge_list = layers["edge_list"]
-    arrow_step = max(1, len(edge_list) // 28)
-    for edge_index, (source, target) in enumerate(edge_list):
-        if edge_index % arrow_step:
+    # Direction arrows only on one-way links to avoid clutter: a link with
+    # no arrow is bidirectional (both directed edges exist in the graph).
+    link_arrow_color = "#1F3A5F" if mapped else COLORS["dark"]
+    seen = set()
+    for source, target in layers["edge_list"]:
+        if (source, target) in seen or graph.has_edge(target, source):
+            seen.add((source, target))
             continue
+        seen.add((source, target))
         source_data, target_data = graph.nodes[source], graph.nodes[target]
         ax.add_patch(FancyArrowPatch(
             (source_data["lon"], source_data["lat"]),
             (target_data["lon"], target_data["lat"]),
             arrowstyle="-|>", mutation_scale=7, linewidth=0.65,
-            color="#1F3A5F" if mapped else COLORS["dark"],
+            color=link_arrow_color,
             alpha=0.85 if mapped else 0.62, zorder=3,
             shrinkA=3, shrinkB=3,
         ))
+    ax.plot([], [], color=link_arrow_color, linewidth=1.6,
+            marker=r'$\rightarrow$', markersize=9, label="one-way link")
+    ax.plot([], [], color=link_arrow_color, linewidth=1.6,
+            label="two-way link")
     candidates = layers["candidates"]
     ax.scatter(
         [graph.nodes[node]["lon"] for node in candidates],
