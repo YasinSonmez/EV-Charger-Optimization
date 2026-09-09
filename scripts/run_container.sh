@@ -145,8 +145,13 @@ else
     manifest_dir="$(cd "$(dirname "$manifest")" && pwd)"
     manifest_abs="$manifest_dir/$(basename "$manifest")"
     [[ -f "$manifest_abs" ]] || { echo "Manifest not found: $manifest_abs" >&2; exit 2; }
-    mounts+=("$manifest_dir:/suite:ro")
-    command_args=("$suite_program" --manifest "/suite/$(basename "$manifest_abs")" --results-root /results "${suite_flags[@]}")
+    if [[ "$mode" == "workspace" && "$manifest_abs" == "$workspace"/* ]]; then
+        manifest_relative="${manifest_abs#"$workspace"/}"
+        command_args=("$suite_program" --manifest "/workspace/$manifest_relative" --results-root /results "${suite_flags[@]}")
+    else
+        mounts+=("$manifest_dir:/suite:ro")
+        command_args=("$suite_program" --manifest "/suite/$(basename "$manifest_abs")" --results-root /results "${suite_flags[@]}")
+    fi
     if [[ -n "$index" ]]; then
         command_args+=(--index "$index")
     fi

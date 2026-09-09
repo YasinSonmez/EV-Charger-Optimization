@@ -56,7 +56,7 @@
   "route_analysis": {
     "analyze_top_k_routes": true,
     "k_values": [
-      16
+      1
     ],
     "run_parameter_sweep": false
   },
@@ -66,23 +66,28 @@
     "ALPHA": 0.01,
     "NUM_ITERS": 20,
     "MAX_NE_ITERATIONS": 300,
-    "N": 20,
-    "WORKERS": null,
+    "N": 50,
+    "WORKERS": 55,
     "single_swap": true,
     "SIMULATION_HORIZON": 10801,
     "ENT_CAPACITY": 250,
     "CHARGING_CAPACITY": 250,
     "EXIT_CAPACITY": 250,
     "COST": 0,
-    "failure_policy": "fail_fast"
+    "failure_policy": "fail_fast",
+    "route_source": "independent_network_routes",
+    "balanced_charger_routes": true,
+    "initialization": "uniform",
+    "initialization_seed": 42,
+    "seed": 42
   },
   "pipeline": {
     "random_seed": 42,
-    "parallel_workers": null,
+    "parallel_workers": 55,
     "skip_bpr_fitting": false,
     "skip_cg_optimization": false,
     "skip_queue_simulation": false,
-    "cg_fit_policy": "validated_only",
+    "cg_fit_policy": "allow_degraded",
     "bpr_generation": {
       "mode": "capacity_fraction_strict",
       "num_samples": 9,
@@ -95,13 +100,14 @@
       "simulation_horizon": 10801,
       "failure_policy": "fail_fast",
       "allow_proxy": false,
-      "require_full_fit": true,
-      "fit_validation": "full",
+      "require_full_fit": false,
+      "fit_validation": "parameter_complete",
       "fallback_policy": "none",
       "fixed_references": true,
       "min_r2": 0.75,
       "fit_screening": "none",
-      "accept_low_r2": false,
+      "accept_low_r2": true,
+      "seed": 42,
       "save_fit_plots": false,
       "force_regenerate": false,
       "resume": true

@@ -22,6 +22,7 @@ import time
 import pickle
 import platform
 import hashlib
+import shutil
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -509,6 +510,16 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
                     bpr_manifest = json.load(handle)
             except (OSError, ValueError):
                 bpr_manifest = {}
+        r2_values = pd.to_numeric(
+            pandas_df.get('R^2', pd.Series(dtype=float)), errors='coerce'
+        ).dropna()
+        r2_summary = {
+            'count': int(len(r2_values)),
+            'min': float(r2_values.min()) if len(r2_values) else None,
+            'median': float(r2_values.median()) if len(r2_values) else None,
+            'p95': float(r2_values.quantile(.95)) if len(r2_values) else None,
+            'max': float(r2_values.max()) if len(r2_values) else None,
+        }
         bpr_manifest.update({
             'network_hash': network_manifest['network_hash'],
             'bpr_mode': bpr_mode,
@@ -566,6 +577,10 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
             'source_data': data_path,
             'source_cache': cache_path,
             'fit_status_counts': pandas_df.get('fit_status', pd.Series(dtype=str)).value_counts().to_dict(),
+            'r2_summary': r2_summary,
+            'below_configured_r2_count': int(
+                (r2_values < float(bpr_config.get('min_r2', 0.0))).sum()
+            ),
             'observation_source_counts': pandas_df.get(
                 'observation_source', pd.Series(dtype=str)
             ).value_counts().to_dict(),
@@ -1430,6 +1445,17 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
                     f"median `{cycle_stats['median']:.1f}`, p95 `{cycle_stats['p95']:.1f}`, "
                     f"and maximum `{cycle_stats['max']:.1f}` iterations.",
                 ])
+            final_gap_stats = ne_stats.get('final_gap_statistics', {})
+            minimum_gap_stats = ne_stats.get('minimum_gap_statistics', {})
+            if final_gap_stats.get('count'):
+                lines.extend([
+                    "",
+                    "Final relative gaps had median "
+                    f"`{final_gap_stats['median']:.4f}`, p95 "
+                    f"`{final_gap_stats['p95']:.4f}`, and maximum "
+                    f"`{final_gap_stats['max']:.4f}`. Median minimum attained gap was "
+                    f"`{minimum_gap_stats.get('median', float('nan')):.4f}`.",
+                ])
             lines.append("")
         if queue_results.get('timing', {}).get('paired_placement_cache'):
             lines.extend([
@@ -1481,6 +1507,21 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
                 f"- Unique queue simulations: {queue_results['timing']['unique_simulations']}",
                 f"- Avoided duplicate simulations: {queue_results['timing']['placement_cache_hits']}",
             ])
+        baselines = queue_results.get('reviewer_baselines', {})
+        if baselines:
+            lines.extend(["", "### Reviewer-facing placement baselines", ""])
+            for model, methods in baselines.items():
+                lines.extend([
+                    f"**{model.replace('_', ' ').title()}**", "",
+                    "| Method | Placement | Objective | Regret from exhaustive |",
+                    "|---|---|---:|---:|",
+                ])
+                for method, outcome in methods.items():
+                    lines.append(
+                        f"| {method.replace('_', ' ').title()} | {outcome.get('placement')} | "
+                        f"{outcome['objective']:.4f} | {outcome['regret_pct']:.2f}% |"
+                    )
+                lines.append("")
     elif not QUEUE_SIM_AVAILABLE:
         lines.extend([
             "",
@@ -1524,6 +1565,9 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
                 "",
                 f"- Pearson correlation: `{pearson_text}`",
                 f"- Spearman rank correlation: `{spearman_text}`",
+                f"- Top-1 agreement: `{correlations.get('top_1_agreement')}`",
+                f"- Top-3 overlap: `{correlations.get('top_3_overlap_count')}`/"
+                f"`{correlations.get('top_3_denominator')}`",
                 "",
                 "These correlations compare model rankings over the same charger sets; "
                 "they do not establish equality of the differently scaled objectives.",
@@ -1632,7 +1676,9 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
     hw_types = rf.get('highway_types') if rf.get('enabled', True) else None
     from src.road_network import RoadNet
     shared_road_net = RoadNet('pipeline')
-    input_artifact_dir = config.pipeline.get('artifact_dir')
+    input_artifact_dir = (
+        config.pipeline.get('artifact_dir') or os.environ.get('EVOPT_NETWORK_ARTIFACT')
+    )
     input_network_manifest = None
     if input_artifact_dir:
         input_network_manifest = shared_road_net.load_artifact(input_artifact_dir)
@@ -1652,10 +1698,17 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
     network_stages = shared_road_net.stage_counts
     network_stage_maps = shared_road_net.stage_maps
     capacity_per_lane = float(bpr_config.get('capacity_per_lane', 1900.0))
-    shared_road_net.edges['capacity'] = (
-        pd.to_numeric(shared_road_net.edges['lanes'], errors='raise')
-        * capacity_per_lane
+    requested_capacity = (
+        pd.to_numeric(shared_road_net.edges['lanes'], errors='raise') * capacity_per_lane
     )
+    if input_artifact_dir and 'capacity' in shared_road_net.edges:
+        existing_capacity = pd.to_numeric(shared_road_net.edges['capacity'], errors='raise')
+        if not np.allclose(existing_capacity, requested_capacity, rtol=0, atol=1e-9):
+            raise ValueError(
+                'Shared network capacity convention is incompatible with this configuration'
+            )
+    else:
+        shared_road_net.edges['capacity'] = requested_capacity
     network_node_count = len(shared_road_net.nodes)
     network_edge_count = len(shared_road_net.edges)
     expected_nodes = config.network.get('expected_nodes')
@@ -1679,9 +1732,13 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
     timing_recorder.add('network_cleaning', timing['network_cleaning'], nodes=network_node_count, edges=network_edge_count)
 
     network_artifact_dir = os.path.join(experiment_dir, 'network')
-    network_manifest = shared_road_net.export_artifact(
-        network_artifact_dir,
-        source={
+    if input_artifact_dir:
+        shutil.copytree(input_artifact_dir, network_artifact_dir, dirs_exist_ok=True)
+        _, _, network_manifest = load_network_artifact(network_artifact_dir)
+    else:
+        network_manifest = shared_road_net.export_artifact(
+            network_artifact_dir,
+            source={
             'input_artifact': input_artifact_dir,
             'input_network_hash': (
                 input_network_manifest.get('network_hash')
@@ -1695,8 +1752,8 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
             'prune_dead_ends': rf.get('prune_dead_ends', False),
             'capacity_per_directional_lane_vph': capacity_per_lane,
             'random_seed': seed_manager.seed,
-        },
-    )
+            },
+        )
     with open(os.path.join(experiment_dir, 'network_manifest.json'), 'w') as handle:
         json.dump(network_manifest, handle, indent=2, default=str)
 
@@ -1769,6 +1826,22 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
     os.makedirs(bpr_dir, exist_ok=True)
     bpr_data_path = os.path.join(bpr_dir, 'traffic_data.csv')
     bpr_cache_path = os.path.join(bpr_dir, 'cached_results.pkl')
+    bpr_input_dir = (
+        bpr_config.get('input_artifact_dir') or os.environ.get('EVOPT_BPR_ARTIFACT')
+    )
+    if bpr_input_dir:
+        for filename in ('bpr_manifest.json', 'cached_results.pkl', 'traffic_data.csv'):
+            source_path = os.path.join(bpr_input_dir, filename)
+            if os.path.isfile(source_path):
+                shutil.copy2(source_path, os.path.join(bpr_dir, filename))
+        if not os.path.isfile(os.path.join(bpr_dir, 'bpr_manifest.json')):
+            raise FileNotFoundError(f'Shared BPR manifest is missing from {bpr_input_dir}')
+        if not (os.path.isfile(bpr_cache_path) or os.path.isfile(bpr_data_path)):
+            raise FileNotFoundError(f'Shared BPR fit/data is missing from {bpr_input_dir}')
+    bpr_seed = bpr_config.get('seed')
+    bpr_seed_manager = SeedManager(
+        seed_manager.seed if bpr_seed is None else int(bpr_seed)
+    )
     # Fall back to original cache ONLY when no topology changes
     if not os.path.exists(bpr_cache_path) and not os.path.exists(bpr_data_path):
         # Read-only compatibility with old project caches. They are accepted
@@ -1793,7 +1866,7 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
             artifact_dir=network_artifact_dir,
             n_links=network_edge_count,
             work_dir=bpr_dir,
-            seed_manager=seed_manager,
+            seed_manager=bpr_seed_manager,
         )
         timing['bpr_fitting'] = time.time() - t0
         timing_recorder.add('bpr_fitting', timing['bpr_fitting'], links=network_edge_count)
@@ -1810,7 +1883,7 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
             artifact_dir=network_artifact_dir,
             n_links=network_edge_count,
             work_dir=bpr_dir,
-            seed_manager=seed_manager,
+            seed_manager=bpr_seed_manager,
             allow_generate=False,
         )
         timing['bpr_fitting'] = time.time() - t0
@@ -2036,6 +2109,9 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
         'parallel_workers_available': available_cpus(),
         'network_hash': network_hash,
         'network_artifact': os.path.relpath(network_artifact_dir, experiment_dir),
+        'shared_network_input': input_artifact_dir,
+        'shared_bpr_input': bpr_input_dir,
+        'bpr_seed': bpr_seed_manager.seed,
         'config_path': os.path.abspath(config_path),
         'python': sys.version,
         'platform': platform.platform(),

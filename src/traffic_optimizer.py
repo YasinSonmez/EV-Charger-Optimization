@@ -1383,7 +1383,9 @@ class Network(RoadNet):
         self._save_individual_flow_contributions()
         return self.charger_flow_contributions 
 
-    def reconstruct_route_flows(self, link_flows_dict, paths_per_od=9, paths_per_oc_cd=4, use_od_constraints=True, use_charger_constraints=True):
+    def reconstruct_route_flows(self, link_flows_dict, paths_per_od=9, paths_per_oc_cd=4,
+                                use_od_constraints=True, use_charger_constraints=True,
+                                include_zero_flows=False):
         """
         Reconstructs route flows from link flows using CVXPY optimization.
         
@@ -1588,7 +1590,7 @@ class Network(RoadNet):
             nc_indices = [i for i, info in enumerate(route_info) 
                          if info[0] == od_pair and info[1] == 'non_charging']
             for idx in nc_indices:
-                if route_flows.value[idx] > 1e-6:  # Filter out near-zero flows
+                if include_zero_flows or route_flows.value[idx] > 1e-6:
                     result[od_pair]['non_charging'].append({
                         'path': all_routes[idx],
                         'link_ids': self._path_to_link_ids(all_routes[idx]),
@@ -1603,7 +1605,7 @@ class Network(RoadNet):
                     
                     charger_routes = []
                     for idx in charger_indices:
-                        if route_flows.value[idx] > 1e-6:  # Filter out near-zero flows
+                        if include_zero_flows or route_flows.value[idx] > 1e-6:
                             # Get the path and add the self-link
                             path = list(all_routes[idx])
                             # Find where the charger appears in the path

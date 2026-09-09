@@ -1,0 +1,26 @@
+{
+  "name": "rebuttal-sensitivity-suite",
+  "base_config": "sensitivity_base.json",
+  "experiments": [
+    {"id": "sensitivity_base"},
+    {"id": "budget_6_3", "overrides": {"scenario_generation.num_chargers": 3}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "budget_6_4", "overrides": {"scenario_generation.num_chargers": 4}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "budget_7_2", "overrides": {"scenario_generation.candidate_count": 7}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "budget_7_3", "overrides": {"scenario_generation.candidate_count": 7, "scenario_generation.num_chargers": 3}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "budget_7_4", "overrides": {"scenario_generation.candidate_count": 7, "scenario_generation.num_chargers": 4}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "demand_090", "overrides": {"scenario_generation.demand": {"F1": 30, "F2": 60}}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "demand_270", "overrides": {"scenario_generation.demand": {"F1": 90, "F2": 180}}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "f2_share_1_3", "overrides": {"scenario_generation.demand": {"F1": 120, "F2": 60}}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "f2_share_1_2", "overrides": {"scenario_generation.demand": {"F1": 90, "F2": 90}}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "od_count_2", "overrides": {"scenario_generation.od_pair_count": 2, "scenario_generation.demand_is_total": true}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "routes_k08", "overrides": {"queue_simulation.K": 8}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "routes_k32", "overrides": {"queue_simulation.K": 32}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "route_source_cg", "overrides": {"queue_simulation.route_source": "cg_recovered_top_k", "route_analysis.k_values": [16]}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "init_shortest", "overrides": {"queue_simulation.initialization": "free_flow_shortest"}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "init_random", "overrides": {"queue_simulation.initialization": "seeded_random"}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "ne_reps_10", "overrides": {"queue_simulation.NUM_ITERS": 10}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "ne_reps_50", "overrides": {"queue_simulation.NUM_ITERS": 50}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "queue_seed_43", "overrides": {"queue_simulation.seed": 43}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"},
+    {"id": "queue_seed_44", "overrides": {"queue_simulation.seed": 44}, "reuse_network_from": "sensitivity_base", "reuse_bpr_from": "sensitivity_base"}
+  ]
+}

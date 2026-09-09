@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=evopt-scale
-#SBATCH --array=0-2
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=55
 #SBATCH --mem=64G
-#SBATCH --time=72:00:00
+#SBATCH --time=12:00:00
 #SBATCH --signal=B:USR1@300
-#SBATCH --output=slurm_logs/%x-%A_%a.out
-#SBATCH --error=slurm_logs/%x-%A_%a.err
+#SBATCH --output=slurm_logs/%x-%j.out
+#SBATCH --error=slurm_logs/%x-%j.err
 
 set -euo pipefail
 
@@ -16,6 +15,7 @@ set -euo pipefail
 : "${EVOPT_CACHE_DIR:?Set EVOPT_CACHE_DIR to persistent OSM cache storage}"
 
 SUITE_MANIFEST="${SUITE_MANIFEST:-configs/rebuttal/suite.json}"
+SUITE_INDEX="${SUITE_INDEX:?Set SUITE_INDEX for the chained suite job}"
 EVOPT_EXECUTION_MODE="${EVOPT_EXECUTION_MODE:-workspace}"
 mkdir -p "$EVOPT_RESULTS_DIR" "$EVOPT_CACHE_DIR"
 
@@ -45,7 +45,7 @@ trap checkpoint_and_exit USR1 TERM
     --results "$EVOPT_RESULTS_DIR" \
     --cache "$EVOPT_CACHE_DIR" \
     --cpus "$SLURM_CPUS_PER_TASK" \
-    --index "$SLURM_ARRAY_TASK_ID" \
+    --index "$SUITE_INDEX" \
     --resume &
 child=$!
 set +e

@@ -22,6 +22,13 @@ QUEUE_DEFAULTS = {
     "N": 750,
     "single_swap": True,
     "failure_policy": "fail_fast",
+    # Legacy runs keep CG-recovered, flow-proportional route assignments.
+    # Final rebuttal manifests opt in to the balanced route contract.
+    "route_source": "cg_recovered_top_k",
+    "balanced_charger_routes": False,
+    "initialization": "cg_proportional",
+    "initialization_seed": 42,
+    "seed": None,
 }
 
 NETWORK_DEFAULTS = {
@@ -98,6 +105,10 @@ PIPELINE_DEFAULTS = {
         "min_samples": 2,
         "active_link_ids": None,
         "resume": True,
+        # None inherits pipeline.random_seed.  Sensitivity runs set this to a
+        # fixed value so queue-seed changes cannot alter calibration.
+        "seed": None,
+        "input_artifact_dir": None,
     },
     "artifact_dir": None,
 }
@@ -321,6 +332,7 @@ class Config:
         if (
             getattr(self, "_explicit_queue_config", False)
             and route_k_values
+            and q.get("route_source") == "cg_recovered_top_k"
             and int(q["K"]) not in {int(value) for value in route_k_values}
         ):
             raise ValueError(
@@ -328,6 +340,33 @@ class Config:
             )
         if q.get("failure_policy") not in {"fail_fast", "record", "inf"}:
             raise ValueError("queue_simulation.failure_policy must be fail_fast, record, or inf")
+        if q.get("route_source") not in {
+            "cg_recovered_top_k", "independent_network_routes"
+        }:
+            raise ValueError(
+                "queue_simulation.route_source must be cg_recovered_top_k or "
+                "independent_network_routes"
+            )
+        if q.get("initialization") not in {
+            "cg_proportional", "uniform", "free_flow_shortest", "seeded_random"
+        }:
+            raise ValueError(
+                "queue_simulation.initialization must be cg_proportional, uniform, "
+                "free_flow_shortest, or seeded_random"
+            )
+        if (
+            q.get("route_source") == "independent_network_routes"
+            and q.get("initialization") == "cg_proportional"
+        ):
+            raise ValueError(
+                "queue_simulation.initialization cg_proportional requires CG-recovered "
+                "route flows; independent routes carry no flows. Use uniform, "
+                "free_flow_shortest, or seeded_random with independent_network_routes"
+            )
+        if q.get("balanced_charger_routes") and int(q["K"]) < self.num_chargers:
+            raise ValueError(
+                "queue_simulation.K must be at least num_chargers when balanced routes are enabled"
+            )
         bpr = self.pipeline.get("bpr_generation", {})
         if bpr.get("mode") not in {"historical_artifact_compatible", "capacity_fraction_strict"}:
             raise ValueError(
@@ -442,9 +481,9 @@ class Config:
                     "historical_artifact_compatible mode requires fixed_references=false"
                 )
         elif bpr.get("mode") == "capacity_fraction_strict":
-            if bpr.get("fit_validation") not in {"full", None}:
+            if bpr.get("fit_validation") not in {"full", "parameter_complete", None}:
                 raise ValueError(
-                    "capacity_fraction_strict mode requires fit_validation=full"
+                    "capacity_fraction_strict fit_validation must be full or parameter_complete"
                 )
         if bpr.get("fit_workers") is not None and int(bpr["fit_workers"]) < 1:
             raise ValueError("pipeline.bpr_generation.fit_workers must be >= 1")

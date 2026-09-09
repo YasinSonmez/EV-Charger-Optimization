@@ -1183,10 +1183,31 @@ def analyze_route_reconstruction(network, link_flows_dict, k_values=[1, 2, 4, 8,
         paths_per_od=max_k,
         paths_per_oc_cd=max_k,
         use_od_constraints=True,
-        use_charger_constraints=True
+        use_charger_constraints=True,
+        include_zero_flows=True,
     )
     
     if reconstruction_result is not None:
+        route_pool = []
+        pool_route_id = 0
+        for od_pair, flows in reconstruction_result.items():
+            for route_data in flows['non_charging']:
+                route_pool.append({
+                    'route_id': pool_route_id, 'flow': float(route_data['flow']),
+                    'links': route_data['path'], 'link_ids': route_data['link_ids'],
+                    'type': 'non_charging', 'origin': od_pair[0],
+                    'destination': od_pair[1], 'charger': None,
+                })
+                pool_route_id += 1
+            for charger, charger_routes in flows['charging'].items():
+                for route_data in charger_routes:
+                    route_pool.append({
+                        'route_id': pool_route_id, 'flow': float(route_data['flow']),
+                        'links': route_data['path'], 'link_ids': route_data['link_ids'],
+                        'type': 'charging', 'origin': od_pair[0],
+                        'destination': od_pair[1], 'charger': int(charger),
+                    })
+                    pool_route_id += 1
         # Convert reconstruction result to flat list of routes with flows
         routes_with_flows = []
         route_id = 0
@@ -1354,7 +1375,7 @@ def analyze_route_reconstruction(network, link_flows_dict, k_values=[1, 2, 4, 8,
         save_publication_figure(fig, os.path.join(save_dir, 'flow_reconstructions.png'))
         plt.close(fig)
 
-    return {'k_metrics': k_metrics}
+    return {'k_metrics': k_metrics, 'route_pool': route_pool if reconstruction_result is not None else []}
 
 def analyze_path_parameters(network, link_flows_dict, 
                           paths_per_od_values=[5, 10, 15, 20, 25, 30],

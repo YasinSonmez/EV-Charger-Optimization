@@ -7,11 +7,13 @@ import os
 import pickle
 import random
 import time
+import hashlib
 import warnings
 from multiprocessing import Pool
 
 import numpy as np
 import pandas as pd
+import networkx as nx
 
 warnings.filterwarnings('ignore')
 
@@ -280,6 +282,65 @@ def _correlation_summary(cg_values, queue_values):
     return result
 
 
+def _reviewer_baselines(config, experiment_dir, artifact_dir, cg_objectives,
+                        queue_objectives, cg_search, queue_search):
+    """Extract placement baselines from the already evaluated universe."""
+    candidates = tuple(int(value) for value in config.possible_charger_positions)
+    count = int(config.num_chargers)
+    resolved_path = os.path.join(experiment_dir, 'resolved_config.json')
+    metadata = {}
+    if os.path.isfile(resolved_path):
+        with open(resolved_path) as handle:
+            metadata = json.load(handle).get('generated_scenario') or {}
+    detour = {
+        int(item['node_id']): float(item.get('minimum_detour_ratio', float('inf')))
+        for item in metadata.get('candidates', [])
+    }
+    minimum_detour = canonical_placement(sorted(
+        candidates, key=lambda node: (detour.get(node, float('inf')), node)
+    )[:count])
+
+    _, edges, _ = load_network_artifact(artifact_dir)
+    graph = nx.DiGraph()
+    for row in edges.itertuples():
+        weight = float(getattr(row, 'travel_time', getattr(row, 'length', 1.0)))
+        old = graph.get_edge_data(int(row.start_node_id), int(row.end_node_id))
+        if old is None or weight < old['weight']:
+            graph.add_edge(int(row.start_node_id), int(row.end_node_id), weight=weight)
+    centrality = nx.betweenness_centrality(graph, weight='weight', normalized=True)
+    betweenness = canonical_placement(sorted(
+        candidates, key=lambda node: (-centrality.get(node, 0.0), node)
+    )[:count])
+
+    def summarize(objectives, model_search):
+        optimum = min(objectives.values())
+        placements = {
+            'greedy': canonical_placement(model_search['greedy']['placement']),
+            'single_swap': canonical_placement(model_search['single_swap']['placement']),
+            'exhaustive': min(objectives, key=objectives.get),
+            'minimum_detour': minimum_detour,
+            'weighted_betweenness': betweenness,
+        }
+        output = {}
+        for method, placement in placements.items():
+            objective = float(objectives[placement])
+            output[method] = {
+                'placement': list(placement), 'objective': objective,
+                'regret_pct': 100.0 * (objective - optimum) / optimum,
+            }
+        random_objective = float(np.mean(list(objectives.values())))
+        output['uniform_random_expectation'] = {
+            'placement': None, 'objective': random_objective,
+            'regret_pct': 100.0 * (random_objective - optimum) / optimum,
+        }
+        return output
+
+    return {
+        'congestion_game': summarize(cg_objectives, cg_search),
+        'queue': summarize(queue_objectives, queue_search),
+    }
+
+
 def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_path,
                    network_name='canonical', artifact_dir=None, seed_manager=None):
     """Compare greedy and exhaustive placement using all OD/type demand."""
@@ -322,6 +383,20 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
             f'Queue assignments use network hashes {sorted(ne_hashes)}, '
             f'but the requested artifact is {network_manifest["network_hash"]}'
         )
+    queue_manifest_path = os.path.join(work_dir, 'queue_manifest.json')
+    with open(queue_manifest_path) as handle:
+        queue_manifest = json.load(handle)
+    with open(input_paths[2], 'rb') as handle:
+        actual_od_checksum = hashlib.sha256(handle.read()).hexdigest()
+    if queue_manifest.get('canonical_od_checksum') != actual_od_checksum:
+        raise ValueError('Canonical OD schedule checksum changed after NE assignment')
+    identities = {
+        json.dumps(value.get('queue_identity'), sort_keys=True)
+        for value in ne.values() if isinstance(value, dict)
+    }
+    expected_identity = json.dumps(queue_manifest.get('queue_identity'), sort_keys=True)
+    if identities != {expected_identity}:
+        raise ValueError('Queue assignment identity does not match queue manifest')
     invalid = {
         key: value.get('status', 'invalid')
         for key, value in ne.items()
@@ -343,7 +418,8 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
             'These are approximations, not verified Nash equilibria.'
         )
     demand_classes = normalize_od_demand(data['run_configuration']['od_demand'])
-    seed = seed_manager.seed if seed_manager is not None else config.pipeline.get('random_seed', 0)
+    pipeline_seed = seed_manager.seed if seed_manager is not None else config.pipeline.get('random_seed', 0)
+    seed = int(q.get('seed') if q.get('seed') is not None else pipeline_seed)
     num_stations = config.num_chargers
     possible_positions = config.possible_charger_positions
     combinations_list = enumerate_placements(possible_positions, num_stations)
@@ -414,8 +490,23 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
         [queue_objectives[value] for value in paired_placements],
     )
     correlations['placements'] = [list(value) for value in paired_placements]
+    cg_ranked = sorted(paired_placements, key=lambda value: (cg_objectives[value], value))
+    queue_ranked = sorted(paired_placements, key=lambda value: (queue_objectives[value], value))
+    top_count = min(3, len(paired_placements))
+    correlations.update({
+        'top_1_agreement': bool(cg_ranked and queue_ranked and cg_ranked[0] == queue_ranked[0]),
+        'top_3_overlap_count': len(set(cg_ranked[:top_count]) & set(queue_ranked[:top_count])),
+        'top_3_denominator': top_count,
+    })
+    cg_search = data.get('placement_search', {})
+    reviewer_baselines = (
+        _reviewer_baselines(
+            config, experiment_dir, artifact_dir, cg_objectives,
+            queue_objectives, cg_search, search,
+        )
+        if cg_search else {}
+    )
 
-    queue_manifest_path = os.path.join(work_dir, 'queue_manifest.json')
     ne_statistics = {}
     if os.path.isfile(queue_manifest_path):
         with open(queue_manifest_path) as handle:
@@ -426,6 +517,8 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
             'cycle_length_statistics': queue_manifest.get(
                 'cycle_length_statistics', {}
             ),
+            'final_gap_statistics': queue_manifest.get('final_gap_statistics', {}),
+            'minimum_gap_statistics': queue_manifest.get('minimum_gap_statistics', {}),
             'configuration_statuses': queue_manifest.get(
                 'configuration_statuses', {}
             ),
@@ -466,6 +559,8 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
         'placement_search': search,
         'ne_statistics': ne_statistics,
         'cg_queue_correlations': correlations,
+        'reviewer_baselines': reviewer_baselines,
+        'reviewer_baselines': reviewer_baselines,
         'config': {
             'N': n_reps, 'K': k, 'num_stations': num_stations,
             'single_swap': q.get('single_swap', True),

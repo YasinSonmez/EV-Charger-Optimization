@@ -79,6 +79,26 @@ def test_scenario_generation_is_deterministic_and_feasible():
     assert list(first.od_demand.values()) == [[2, 3]]
 
 
+def test_multi_od_total_demand_is_split_not_duplicated():
+    nodes = pd.DataFrame({
+        "node_id": list(range(8)), "lon": [float(i % 4) for i in range(8)],
+        "lat": [float(i // 4) for i in range(8)],
+    })
+    edges = pd.DataFrame({
+        "link_id": list(range(16)),
+        "start_node_id": list(range(8)) * 2,
+        "end_node_id": (list(range(1, 8)) + [0]) + ([7] + list(range(7))),
+        "length": [100.0] * 16, "travel_time": [10.0] * 16,
+        "type": ["secondary"] * 16,
+    })
+    scenario = generate_scenario(SimpleNamespace(nodes=nodes, edges=edges), {
+        "candidate_count": 2, "od_pair_count": 2, "boundary_pool_size": 8,
+        "demand": {"F1": 60, "F2": 120}, "demand_is_total": True,
+    })
+    assert sum(value[0] for value in scenario.od_demand.values()) == 60
+    assert sum(value[1] for value in scenario.od_demand.values()) == 120
+
+
 def test_od_corridor_candidates_respect_detour_limit_for_multiple_ods():
     nodes = pd.DataFrame({
         "node_id": list(range(12)),

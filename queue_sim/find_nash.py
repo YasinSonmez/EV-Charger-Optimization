@@ -7,6 +7,7 @@ import pickle
 import time
 import warnings
 import json
+import hashlib
 from multiprocessing import Pool
 
 import numpy as np
@@ -24,6 +25,11 @@ from src.contracts import (
 )
 from src.network_artifact import load_network_artifact
 from src.run_state import available_cpus
+from queue_sim.route_library import (
+    balanced_charger_routes,
+    independent_flow_data,
+    initialize_counts,
+)
 
 
 CYCLE_APPROXIMATION_STATUS = 'approximate_cycle_state'
@@ -125,6 +131,12 @@ def _write_queue_manifest(path, manifest, assignments):
             for value in assignments.values()
             if value.get('cycle_length') is not None
         ),
+        'final_gap_statistics': _numeric_summary(
+            value.get('final_gap') for value in assignments.values()
+        ),
+        'minimum_gap_statistics': _numeric_summary(
+            value.get('minimum_gap') for value in assignments.values()
+        ),
         'exact_ne_eligible': (
             not approximate
             and not nonconverged
@@ -136,7 +148,8 @@ def _write_queue_manifest(path, manifest, assignments):
 
 
 def _reuse_saved_cycle_assignments(
-    work_dir, network_hash, expected_count, departure_window_seconds=0
+    work_dir, network_hash, expected_count, departure_window_seconds=0,
+    expected_identity=None,
 ):
     """Reuse terminal queue artifacts, promoting legacy cycle failures safely."""
     ne_path = os.path.join(work_dir, 'NE_path_assignments.pkl')
@@ -152,6 +165,8 @@ def _reuse_saved_cycle_assignments(
     if manifest.get('network_hash') != network_hash:
         return None
     if int(manifest.get('departure_window_seconds', 0)) != int(departure_window_seconds):
+        return None
+    if expected_identity is not None and manifest.get('queue_identity') != expected_identity:
         return None
     for value in assignments.values():
         if not isinstance(value, dict) or value.get('status') == 'failed':
@@ -207,37 +222,54 @@ def _od_key(value):
     return tuple(int(x) for x in value)
 
 
-def _prune_flow_data(data, charger_locs_tuple, k):
+def _route_record(route, od, route_index):
+    if route['type'] == 'non_charging':
+        return {
+            'route_id': route.get('route_id', f'{od[0]}_{od[1]}_F1_none_{route_index}'),
+            'path': route['links'], 'link_ids': route.get('link_ids', []),
+            'flow': route['flow'], 'station node': None,
+        }
+    path, link_ids = _collapse_path_and_links(route['links'], route.get('link_ids', []))
+    return {
+        'route_id': route.get('route_id', f"{od[0]}_{od[1]}_F2_{route.get('charger')}_{route_index}"),
+        'path': path, 'link_ids': link_ids, 'flow': route['flow'],
+        'station node': int(route['charger']),
+        'station_cost': route.get('station_cost', 0.0),
+    }
+
+
+def _prune_flow_data(data, charger_locs_tuple, k, balanced=False):
     """Extract route-flow records for every OD pair in one CG result."""
     flow_data = {}
     config = data['configurations'][charger_locs_tuple]
-    metrics = config['reconstruction_results']['k_metrics'][k]
-    for route_index, route in enumerate(metrics['routes']):
+    reconstruction = config['reconstruction_results']
+    routes = (
+        reconstruction.get('route_pool', [])
+        if balanced else reconstruction['k_metrics'][k]['routes']
+    )
+    grouped_routes = {}
+    for route_index, route in enumerate(routes):
         od = (int(route['origin']), int(route['destination']))
         group = flow_data.setdefault(od, {'no charging type': [], 'charging type': []})
+        record = _route_record(route, od, route_index)
         if route['type'] == 'non_charging':
-            group['no charging type'].append({
-                'route_id': route.get('route_id', f'{od[0]}_{od[1]}_F1_none_{route_index}'),
-                'path': route['links'],
-                'link_ids': route.get('link_ids', []),
-                'flow': route['flow'],
-                'station node': None,
-            })
+            group['no charging type'].append(record)
         else:
-            path, link_ids = _collapse_path_and_links(
-                route['links'], route.get('link_ids', [])
+            grouped_routes.setdefault((od, int(route['charger'])), []).append(record)
+    if balanced:
+        for od, group in flow_data.items():
+            group['no charging type'] = sorted(
+                group['no charging type'],
+                key=lambda route: (-float(route.get('flow', 0.0)), str(route['route_id'])),
+            )[:int(k)]
+            by_charger = {
+                charger: grouped_routes.get((od, charger), [])
+                for charger in charger_locs_tuple
+            }
+            group['charging type'] = balanced_charger_routes(
+                by_charger, int(k),
+                rank_key=lambda route: (-float(route.get('flow', 0.0)), str(route['route_id'])),
             )
-            group['charging type'].append({
-                'route_id': route.get(
-                    'route_id',
-                    f"{od[0]}_{od[1]}_F2_{route.get('charger')}_{route_index}",
-                ),
-                'path': path,
-                'link_ids': link_ids,
-                'flow': route['flow'],
-                'station node': route.get('charger'),
-                'station_cost': route.get('station_cost', 0.0),
-            })
     return flow_data
 
 
@@ -602,7 +634,8 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
     demand_classes = normalize_od_demand(data['run_configuration']['od_demand'])
     if artifact_dir is None:
         raise ValueError('A canonical network artifact is required for queue simulation')
-    seed = seed_manager.seed if seed_manager is not None else config.pipeline.get('random_seed', 0)
+    pipeline_seed = seed_manager.seed if seed_manager is not None else config.pipeline.get('random_seed', 0)
+    seed = int(q.get('seed') if q.get('seed') is not None else pipeline_seed)
     bpr_config = config.pipeline.get('bpr_generation', {})
     departure_window_hours = (
         float(bpr_config.get('calibration_window_hours', 0.1))
@@ -616,6 +649,8 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
         artifact_dir, work_dir, demand_classes,
         departure_window_hours=departure_window_hours, seed=seed,
     )
+    with open(od_path, 'rb') as handle:
+        canonical_od_checksum = hashlib.sha256(handle.read()).hexdigest()
     with open(os.path.join(work_dir, 'network_manifest.json'), 'w') as handle:
         json.dump(manifest, handle, indent=2)
 
@@ -624,10 +659,23 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
         {canonical_placement(value) for value in data['configurations']},
         key=lambda value: (len(value), value),
     )
+    queue_identity = {
+        'network_hash': manifest['network_hash'],
+        'K': int(q['K']),
+        'route_source': q.get('route_source', 'cg_recovered_top_k'),
+        'balanced_charger_routes': bool(q.get('balanced_charger_routes', False)),
+        'initialization': q.get('initialization', 'cg_proportional'),
+        'initialization_seed': int(q.get('initialization_seed', 42)),
+        'simulator_seed': seed,
+        'demand': [vars(record) for record in demand_classes],
+        'departure_window_seconds': departure_window_seconds,
+        'canonical_od_checksum': canonical_od_checksum,
+    }
     if resume:
         reused = _reuse_saved_cycle_assignments(
             work_dir, manifest['network_hash'], len(configs),
             departure_window_seconds,
+            queue_identity,
         )
         if reused is not None:
             ne_path, reused_assignments = reused
@@ -651,6 +699,10 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
         ((record.origin, record.destination), record.vehicle_type): record.demand
         for record in demand_classes
     }
+    _, artifact_edges, _ = load_network_artifact(artifact_dir)
+    initialization = q.get('initialization', 'cg_proportional')
+    initialization_seed = SeedManager(int(q.get('initialization_seed', 42)))
+    independent_route_cache = {}
 
     states = {}
     resume_path = q.get('resume_from')
@@ -664,18 +716,37 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
     for charger_locs in configs:
         charger_locs_tuple = canonical_placement(charger_locs)
         loc_str = ','.join(map(str, charger_locs_tuple))
-        flow_data = _prune_flow_data(data, charger_locs_tuple, q['K'])
+        if q.get('route_source') == 'independent_network_routes':
+            flow_data = independent_flow_data(
+                artifact_edges, demand_classes, charger_locs_tuple, q['K'],
+                cache=independent_route_cache,
+            )
+        else:
+            flow_data = _prune_flow_data(
+                data, charger_locs_tuple, q['K'],
+                balanced=bool(q.get('balanced_charger_routes', False)),
+            )
         assignments_no = {}
         assignments_ch = {}
         for od, group in flow_data.items():
-            assignments_no[od] = _rounded_counts(
-                group['no charging type'],
-                demand_by_od_type.get((od, 'F1'), 0),
-            )
-            assignments_ch[od] = _rounded_counts(
-                group['charging type'],
-                demand_by_od_type.get((od, 'F2'), 0),
-            )
+            if initialization == 'cg_proportional':
+                assignments_no[od] = _rounded_counts(
+                    group['no charging type'], demand_by_od_type.get((od, 'F1'), 0)
+                )
+                assignments_ch[od] = _rounded_counts(
+                    group['charging type'], demand_by_od_type.get((od, 'F2'), 0)
+                )
+            else:
+                assignments_no[od] = initialize_counts(
+                    group['no charging type'], demand_by_od_type.get((od, 'F1'), 0),
+                    initialization, initialization_seed,
+                    seed_key=(*charger_locs_tuple, *od, 'F1'),
+                )
+                assignments_ch[od] = initialize_counts(
+                    group['charging type'], demand_by_od_type.get((od, 'F2'), 0),
+                    initialization, initialization_seed,
+                    seed_key=(*charger_locs_tuple, *od, 'F2'),
+                )
         states[loc_str] = {
             'charger_locs': charger_locs_tuple,
             'flow_data': flow_data,
@@ -877,6 +948,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             'converged': state['converged'],
             'iterations': iterations_completed,
             'final_gap': final_gap,
+            'minimum_gap': min(state['history']) if state['history'] else final_gap,
             'route_metrics': state['final_details'],
             'flow_data': state['flow_data'],
             'iteration_timings': state['iteration_timings'],
@@ -909,6 +981,8 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             ],
             'network_hash': manifest['network_hash'],
             'departure_window_seconds': departure_window_seconds,
+            'queue_identity': queue_identity,
+            'canonical_od_checksum': canonical_od_checksum,
         }
         if state['status'] == CYCLE_APPROXIMATION_STATUS:
             _promote_cycle_result(
@@ -944,6 +1018,12 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
         'parallel_granularity': 'configuration_iteration_replication',
         'replications_per_iteration': int(num_iters),
         'departure_window_seconds': departure_window_seconds,
+        'queue_identity': queue_identity,
+        'route_source': q.get('route_source', 'cg_recovered_top_k'),
+        'balanced_charger_routes': bool(q.get('balanced_charger_routes', False)),
+        'initialization': initialization,
+        'simulator_seed': seed,
+        'canonical_od_checksum': canonical_od_checksum,
         'resumed_configurations': sorted(
             loc_str for loc_str, state in states.items()
             if state.get('resumed_complete')

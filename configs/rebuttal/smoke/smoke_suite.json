@@ -1,0 +1,16 @@
+{
+  "name": "rebuttal-smoke-suite",
+  "base_config": "smoke_base.json",
+  "experiments": [
+    {"id": "smoke_base"},
+    {"id": "smoke_cg_routes",
+     "overrides": {
+       "queue_simulation.route_source": "cg_recovered_top_k",
+       "queue_simulation.initialization": "seeded_random",
+       "pipeline.artifact_dir": null,
+       "pipeline.bpr_generation.input_artifact_dir": null
+     },
+     "reuse_network_from": "smoke_base",
+     "reuse_bpr_from": "smoke_base"}
+  ]
+}

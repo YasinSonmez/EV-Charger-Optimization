@@ -1,13 +1,8 @@
 {
-  "name": "secondary-plus-scale-1000",
-  "coordinates": [
-    38.93961,
-    38.87439,
-    -76.99507,
-    -77.07893
-  ],
+  "name": "smoke_base",
+  "coordinates": [38.910578, 38.903422, -77.032620, -77.041379],
   "network": {
-    "expected_nodes": 1000,
+    "expected_nodes": 49,
     "node_tolerance_fraction": 0.1,
     "cache_policy": "reuse"
   },
@@ -15,14 +10,8 @@
     "enabled": true,
     "road_profile": "secondary_plus",
     "highway_types": [
-      "motorway",
-      "trunk",
-      "primary",
-      "secondary",
-      "motorway_link",
-      "trunk_link",
-      "primary_link",
-      "secondary_link"
+      "motorway", "trunk", "primary", "secondary",
+      "motorway_link", "trunk_link", "primary_link", "secondary_link"
     ],
     "merge_chains": true,
     "prune_dead_ends": false,
@@ -30,7 +19,7 @@
   },
   "scenario_generation": {
     "enabled": true,
-    "candidate_count": 5,
+    "candidate_count": 3,
     "num_chargers": 2,
     "candidate_strategy": "od_detour_ranked",
     "candidate_min_detour_percent": 5,
@@ -39,11 +28,8 @@
     "interchange_merge_diameter_m": 250,
     "od_pair_count": 1,
     "od_strategy": "boundary_max_separation",
-    "boundary_pool_size": 64,
-    "demand": {
-      "F1": 60,
-      "F2": 120
-    },
+    "boundary_pool_size": 32,
+    "demand": {"F1": 2, "F2": 4},
     "seed": 42
   },
   "max_iter": 1000,
@@ -55,19 +41,17 @@
   "charger_self_link_length": 100,
   "route_analysis": {
     "analyze_top_k_routes": true,
-    "k_values": [
-      1
-    ],
+    "k_values": [8],
     "run_parameter_sweep": false
   },
   "queue_simulation": {
     "enabled": true,
-    "K": 16,
+    "K": 8,
     "ALPHA": 0.01,
-    "NUM_ITERS": 20,
-    "MAX_NE_ITERATIONS": 300,
-    "N": 20,
-    "WORKERS": 55,
+    "NUM_ITERS": 10,
+    "MAX_NE_ITERATIONS": 60,
+    "N": 5,
+    "WORKERS": null,
     "single_swap": true,
     "SIMULATION_HORIZON": 10801,
     "ENT_CAPACITY": 250,
@@ -83,34 +67,35 @@
   },
   "pipeline": {
     "random_seed": 42,
-    "parallel_workers": 55,
+    "parallel_workers": null,
     "skip_bpr_fitting": false,
     "skip_cg_optimization": false,
     "skip_queue_simulation": false,
-    "cg_fit_policy": "allow_degraded",
+    "cg_fit_policy": "validated_only",
+    "artifact_dir": "analysis/paper_plot_sanity/secondary-plus-sanity-visuals-2758b6c909bd/network",
     "bpr_generation": {
       "mode": "capacity_fraction_strict",
       "num_samples": 9,
       "flow_fractions": [0, 0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2],
-      "capacity_source": "artifact",
-      "capacity_per_lane": 1000,
+      "capacity_source": "simulator",
+      "capacity_per_lane": 1900,
       "calibration_window_hours": 0.1,
       "route_mode": "link_probe",
       "missing_context_policy": "fail_fast",
       "simulation_horizon": 10801,
       "failure_policy": "fail_fast",
       "allow_proxy": false,
-      "require_full_fit": false,
-      "fit_validation": "parameter_complete",
+      "require_full_fit": true,
+      "fit_validation": "full",
       "fallback_policy": "none",
       "fixed_references": true,
       "min_r2": 0.75,
       "fit_screening": "none",
-      "accept_low_r2": true,
-      "seed": 42,
+      "accept_low_r2": false,
       "save_fit_plots": false,
       "force_regenerate": false,
-      "resume": true
+      "resume": true,
+      "input_artifact_dir": "analysis/paper_plot_sanity/secondary-plus-sanity-visuals-2758b6c909bd/bpr"
     }
   }
 }

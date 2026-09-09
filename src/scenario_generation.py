@@ -522,12 +522,21 @@ def generate_scenario(
         raise ValueError(f"unsupported candidate strategy: {strategy}")
     candidates = [int(node) for node in candidates]
     demand = settings.get("demand", {})
-    od_demand = {
-        f"{int(origin)},{int(destination)}": [
-            int(demand.get("F1", 0)), int(demand.get("F2", 0))
-        ]
-        for origin, destination in od_pairs
-    }
+    if settings.get("demand_is_total", False):
+        totals = [int(demand.get("F1", 0)), int(demand.get("F2", 0))]
+        od_demand = {}
+        for index, (origin, destination) in enumerate(od_pairs):
+            od_demand[f"{int(origin)},{int(destination)}"] = [
+                total // len(od_pairs) + int(index < total % len(od_pairs))
+                for total in totals
+            ]
+    else:
+        od_demand = {
+            f"{int(origin)},{int(destination)}": [
+                int(demand.get("F1", 0)), int(demand.get("F2", 0))
+            ]
+            for origin, destination in od_pairs
+        }
     metadata = {
         "strategy": {
             "candidates": strategy,

@@ -50,3 +50,8 @@ config_old.json
 fitter_results.csv
 traffic_inputs_*
 traffic_outputs/
+
+# Generated experiment outputs under analysis/ (keep the scripts and configs)
+analysis/paper_plot_sanity/
+analysis/smoke/
+slurm_results/

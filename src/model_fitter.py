@@ -675,7 +675,9 @@ def validate_bpr_fit_table(df, expected_link_ids=None, require_full_fit=False,
         | ~np.isfinite(numeric['cap_fit'])
         | ~np.isfinite(numeric['fft_fit'])
         | (numeric['cap_fit'] <= 0)
-        | (numeric['fft_fit'] < 0)
+        | (numeric['fft_fit'] <= 0)
+        | (numeric['a_fit'] < 0)
+        | (numeric['b_fit'] < 0)
     )
     statuses = (
         df['fit_status']
