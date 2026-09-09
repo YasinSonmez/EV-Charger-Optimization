@@ -124,3 +124,28 @@ def test_initialization_preserves_demand_and_seed():
     second = initialize_counts(routes, 100, "seeded_random", SeedManager(42), (1, 2))
     assert first == second
     assert sum(first) == 100
+
+
+def test_charging_route_search_deepens_past_destination_blocked_legs():
+    """A charger whose K shortest origin legs all pass through the destination
+    must still receive feasible routes after the search deepens."""
+    link_id = 0
+    edges = []
+    for node in range(1, 20):
+        edges.extend([
+            {"link_id": link_id, "start_node_id": 0, "end_node_id": node, "travel_time": 0.5},
+            {"link_id": link_id + 1, "start_node_id": node, "end_node_id": 5, "travel_time": 0.5},
+        ])
+        link_id += 2
+    edges.extend([
+        {"link_id": link_id, "start_node_id": 5, "end_node_id": 21, "travel_time": 1.0},
+        {"link_id": link_id + 1, "start_node_id": 0, "end_node_id": 21, "travel_time": 5.0},
+        {"link_id": link_id + 2, "start_node_id": 21, "end_node_id": 5, "travel_time": 1.0},
+    ])
+    demand = [DemandClass("0_5_F1", 0, 5, "F1", 4), DemandClass("0_5_F2", 0, 5, "F2", 4)]
+    result = independent_flow_data(pd.DataFrame(edges), demand, (21,), 4)
+    group = result[(0, 5)]
+    assert len(group["charging type"]) >= 1
+    assert all(route["station node"] == 21 for route in group["charging type"])
+    assert all(route["path"].count(5) == 1 for route in group["charging type"])
+    assert all(21 in route["path"] for route in group["charging type"])

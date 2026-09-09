@@ -51,6 +51,48 @@ def _shortest_paths(graph, origin, destination, limit):
         return []
 
 
+def _feasible_charging_candidates(graph, cache, od, charger, total_k, per_charger_need):
+    """Enumerate simple O-charger-D paths, deepening the leg search as needed.
+
+    The `total_k` shortest paths per leg can all pass through the opposite OD
+    endpoint, which would wrongly report zero feasible charging routes for
+    sparse candidates. The per-leg limit therefore escalates until the
+    charger can fill its balanced quota or both leg enumerations are
+    exhausted, with a bounded cap for cost control.
+    """
+    limit = max(int(total_k), 1)
+    cap = 8 * max(int(total_k), 1)
+    seen = set()
+    candidates = []
+    while True:
+        first_key = ("paths", od[0], charger, limit)
+        second_key = ("paths", charger, od[1], limit)
+        if first_key not in cache:
+            cache[first_key] = _shortest_paths(graph, od[0], charger, limit)
+        if second_key not in cache:
+            cache[second_key] = _shortest_paths(graph, charger, od[1], limit)
+        first, second = cache[first_key], cache[second_key]
+        for left in first:
+            for right in second:
+                path = tuple(int(value) for value in left + right[1:])
+                if len(path) != len(set(path)) or path in seen:
+                    continue
+                seen.add(path)
+                candidates.append(_path_record(
+                    graph, path, od=od, vehicle_type="F2",
+                    charger=charger, rank=len(candidates),
+                ))
+        if len(candidates) >= per_charger_need or limit >= cap:
+            break
+        if len(first) < limit and len(second) < limit:
+            break
+        grown = min(limit * 4, cap)
+        if grown <= limit:
+            break
+        limit = grown
+    return candidates
+
+
 def balanced_charger_routes(routes_by_charger, total_k, rank_key):
     """Select up to K F2 routes, keeping charger counts as even as supply allows.
 
@@ -107,8 +149,6 @@ def independent_flow_data(edges, demand_classes, chargers, k, cache=None):
     od_pairs = sorted({(int(record.origin), int(record.destination)) for record in demand_classes})
     chargers = tuple(sorted(int(value) for value in chargers))
     output = {}
-    # K leg paths give at least K combinations per charger in ordinary cases.
-    leg_limit = max(int(k), 1)
     for od in od_pairs:
         non_key = ("records", "F1", od, int(k))
         if non_key not in cache:
@@ -119,24 +159,14 @@ def independent_flow_data(edges, demand_classes, chargers, k, cache=None):
         non_charging = [dict(route) for route in cache[non_key]]
         if not non_charging:
             raise ValueError(f"No feasible non-charging route for OD {od}")
+        per_charger_need = -(-int(k) // max(len(chargers), 1))
         by_charger = {}
         for charger in chargers:
-            record_key = ("records", "F2", od, charger, leg_limit)
+            record_key = ("records", "F2", od, charger, per_charger_need)
             if record_key not in cache:
-                first = paths(od[0], charger, leg_limit)
-                second = paths(charger, od[1], leg_limit)
-                candidates, seen = [], set()
-                for left in first:
-                    for right in second:
-                        path = tuple(int(value) for value in left + right[1:])
-                        if len(path) != len(set(path)) or path in seen:
-                            continue
-                        seen.add(path)
-                        candidates.append(_path_record(
-                            graph, path, od=od, vehicle_type="F2",
-                            charger=charger, rank=len(candidates),
-                        ))
-                cache[record_key] = candidates
+                cache[record_key] = _feasible_charging_candidates(
+                    graph, cache, od, charger, int(k), per_charger_need,
+                )
             by_charger[charger] = [dict(route) for route in cache[record_key]]
         charging = balanced_charger_routes(
             by_charger, int(k),
