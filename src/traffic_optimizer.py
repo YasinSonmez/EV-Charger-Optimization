@@ -1105,52 +1105,83 @@ class Network(RoadNet):
         print(f"Solve time: {prob.solver_stats.solve_time} seconds")
         print(f"Iterations: {prob.solver_stats.num_iters}")
 
-        demand_scale = max(1.0, float(total_network_demand))
-        residual_tolerance = 1e-6 * demand_scale
-        violations = []
-        for constraint in constraints:
-            try:
-                violation = np.asarray(constraint.violation(), dtype=float)
-                if violation.size:
-                    violations.append(float(np.nanmax(np.abs(violation))))
-            except (ValueError, TypeError):
-                violations.append(float('inf'))
-        maximum_constraint_residual = max(violations, default=0.0)
-        minimum_flow = float(np.nanmin(x_total.value)) if x_total.value is not None else float('-inf')
-        recomputed_objective = (
-            float(self._compute_objective(x_total.value, x_hat.value))
-            if x_total.value is not None and x_hat.value is not None else float('inf')
-        )
-        reported_objective = float(prob.value) if prob.value is not None else float('inf')
-        objective_error = abs(recomputed_objective - reported_objective)
-        objective_tolerance = 1e-6 * max(1.0, abs(reported_objective))
-        checks_passed = bool(
-            np.isfinite(reported_objective)
-            and np.isfinite(recomputed_objective)
-            and np.isfinite(maximum_constraint_residual)
-            and maximum_constraint_residual <= residual_tolerance
-            and minimum_flow >= -residual_tolerance
-            and objective_error <= objective_tolerance
-        )
-        self.solver_metadata.update({
-            'iterations': int(prob.solver_stats.num_iters or 0),
-            'solve_time_seconds': float(prob.solver_stats.solve_time or 0.0),
-            'wall_time_seconds': time.perf_counter() - solve_wall_started,
-            'cpu_time_seconds': time.process_time() - solve_cpu_started,
-            'constraint_residual': maximum_constraint_residual,
-            'constraint_tolerance': residual_tolerance,
-            'minimum_link_flow': minimum_flow,
-            'reported_objective': reported_objective,
-            'recomputed_objective': recomputed_objective,
-            'objective_recompute_error': objective_error,
-            'objective_recompute_tolerance': objective_tolerance,
-            'validation_passed': checks_passed,
-        })
-        if not checks_passed:
-            self.best_objective_value = float('inf')
-            self.travel_time_obj = float('inf')
-            self.solver_metadata['status'] = 'validation_failed'
-            return None
+        def _validate_solution():
+            demand_scale = max(1.0, float(total_network_demand))
+            residual_tolerance = 1e-6 * demand_scale
+            violations = []
+            for constraint in constraints:
+                try:
+                    violation = np.asarray(constraint.violation(), dtype=float)
+                    if violation.size:
+                        violations.append(float(np.nanmax(np.abs(violation))))
+                except (ValueError, TypeError):
+                    violations.append(float('inf'))
+            maximum_constraint_residual = max(violations, default=0.0)
+            minimum_flow = (
+                float(np.nanmin(x_total.value))
+                if x_total.value is not None else float('-inf')
+            )
+            recomputed_objective = (
+                float(self._compute_objective(x_total.value, x_hat.value))
+                if x_total.value is not None and x_hat.value is not None
+                else float('inf')
+            )
+            reported_objective = float(prob.value) if prob.value is not None else float('inf')
+            objective_error = abs(recomputed_objective - reported_objective)
+            objective_tolerance = 1e-6 * max(1.0, abs(reported_objective))
+            passed = bool(
+                np.isfinite(reported_objective)
+                and np.isfinite(recomputed_objective)
+                and np.isfinite(maximum_constraint_residual)
+                and maximum_constraint_residual <= residual_tolerance
+                and minimum_flow >= -residual_tolerance
+                and objective_error <= objective_tolerance
+            )
+            self.solver_metadata.update({
+                'iterations': int(prob.solver_stats.num_iters or 0),
+                'solve_time_seconds': float(prob.solver_stats.solve_time or 0.0),
+                'wall_time_seconds': time.perf_counter() - solve_wall_started,
+                'cpu_time_seconds': time.process_time() - solve_cpu_started,
+                'constraint_residual': maximum_constraint_residual,
+                'constraint_tolerance': residual_tolerance,
+                'minimum_link_flow': minimum_flow,
+                'reported_objective': reported_objective,
+                'recomputed_objective': recomputed_objective,
+                'objective_recompute_error': objective_error,
+                'objective_recompute_tolerance': objective_tolerance,
+                'validation_passed': passed,
+            })
+            return passed
+
+        if not _validate_solution():
+            # A strict solve can still leave a marginal unscaled residual that
+            # misses the gate (e.g. 1.85e-4 vs 1.8e-4). Re-solve once with
+            # tightened tolerances instead of failing the placement outright;
+            # the gate itself is never relaxed.
+            print("Post-solve validation failed; retrying with tightened solver tolerances...")
+            selected_solver = self.solver_metadata.get('selected')
+            retry_ok = False
+            if selected_solver == 'CLARABEL':
+                retry_params = {
+                    'tol_gap_abs': 1e-9, 'tol_gap_rel': 1e-9,
+                    'tol_feas': 1e-9, 'max_iter': 2000,
+                }
+                retry_ok = self._retry_solve_after_validation_failure(
+                    prob, 'CLARABEL', retry_params, _validate_solution,
+                )
+            elif selected_solver == 'SCS':
+                retry_ok = self._retry_solve_after_validation_failure(
+                    prob, 'SCS', {'eps': 1e-6, 'max_iters': 200000},
+                    _validate_solution,
+                )
+            else:
+                print(f"No tightened retry defined for solver {selected_solver}")
+            if not retry_ok:
+                self.best_objective_value = float('inf')
+                self.travel_time_obj = float('inf')
+                self.solver_metadata['status'] = 'validation_failed'
+                return None
+            print("Validation passed after tightened retry.")
 
         # If prob.value is None or NaN, compute it manually using our method
         if prob.value is None or np.isnan(prob.value):
@@ -1176,6 +1207,31 @@ class Network(RoadNet):
         
         print("Structured CVXPY optimization complete.")
         return self.best_objective_value
+
+    def _retry_solve_after_validation_failure(self, prob, solver, params, validate_solution):
+        """Re-solve once with tightened tolerances after a failed validation gate.
+
+        Returns whether the re-solve produced an optimal status whose
+        re-validation passes. The validation gate itself is never relaxed.
+        """
+        try:
+            print(f"Retrying with tightened tolerances: {solver} {params}")
+            prob.solve(solver=solver, verbose=True, **params)
+        except Exception as exc:
+            print(f"Tightened retry failed with exception: {exc}")
+            self.solver_metadata['attempts'].append({
+                'solver': solver, 'options': params,
+                'status': 'error', 'stage': 'validation_retry', 'error': str(exc),
+            })
+            return False
+        self.solver_metadata['attempts'].append({
+            'solver': solver, 'options': params,
+            'status': prob.status, 'stage': 'validation_retry',
+        })
+        if prob.status not in ["optimal", "optimal_inaccurate"]:
+            print(f"Tightened retry returned status: {prob.status}")
+            return False
+        return bool(validate_solution())
 
     def _generate_warm_start_values(self, od_pairs, q_total, N, n_s, S):
         """Generate warm start values for CVXPY optimization using shortest paths"""
