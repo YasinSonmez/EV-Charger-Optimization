@@ -85,6 +85,38 @@ def test_paired_comparison_simulates_each_placement_once(monkeypatch, tmp_path):
     assert result['cache_hits'] > 0
 
 
+def test_each_replication_covers_all_intermediate_placements(monkeypatch, tmp_path):
+    import queue_sim.comparison as comparison
+    from src.contracts import enumerate_placements
+
+    data_path = tmp_path / 'cg.pkl'
+    ne_path = tmp_path / 'ne.pkl'
+    with data_path.open('wb') as handle:
+        pickle.dump({}, handle)
+    with ne_path.open('wb') as handle:
+        pickle.dump({}, handle)
+
+    calls = []
+    monkeypatch.setattr(
+        comparison, '_run_sim',
+        lambda positions, *args, **kwargs: calls.append(tuple(positions)) or float(sum(positions)),
+    )
+    candidates = [1, 2, 3, 4]
+    result = comparison._comparison_rep((
+        0, str(data_path), str(ne_path), 16, 3, candidates,
+        [], ('nodes', 'edges', 'od'), str(tmp_path), 250, 250, 250, 0,
+        10801, True, enumerate_placements(candidates, 3), 42,
+    ))
+
+    expected = {
+        placement
+        for size in range(1, 4)
+        for placement in enumerate_placements(candidates, size)
+    }
+    assert set(calls) == expected
+    assert len(calls) == result['unique_simulations'] == 14
+
+
 def test_queue_search_uses_shared_candidate_order_and_mean_objectives():
     from queue_sim.comparison import _build_queue_search_summary
 

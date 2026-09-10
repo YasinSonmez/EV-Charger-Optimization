@@ -724,13 +724,18 @@ def outer_optimization(coordinates, num_chargers=None, possible_charger_position
     # Step 3: Full Search on All Possible Charger Combinations (if enabled)
     if calculate_on_all_possible_positions:
         exhaustive = []
-        for chargers_i in enumerate_placements(possible_charger_positions, num_chargers):
-            if chargers_i in chargers_set:
-                continue
-            chargers_set.add(chargers_i)
-            exhaustive.append(chargers_i)
+        for placement_size in range(1, int(num_chargers) + 1):
+            for chargers_i in enumerate_placements(
+                    possible_charger_positions, placement_size):
+                if chargers_i in chargers_set:
+                    continue
+                chargers_set.add(chargers_i)
+                exhaustive.append(chargers_i)
         for grid_i in evaluate_placements(exhaustive, 'exhaustive'):
-            if grid_i.travel_time_obj < best_travel_time:
+            if (
+                len(canonical_placement(grid_i.chargers)) == int(num_chargers)
+                and grid_i.travel_time_obj < best_travel_time
+            ):
                 best_travel_time = grid_i.travel_time_obj
                 best_charger = canonical_placement(grid_i.chargers)
                 best_grid = grid_i

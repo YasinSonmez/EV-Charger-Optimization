@@ -96,14 +96,7 @@ def _feasible_charging_candidates(graph, cache, od, charger, total_k, per_charge
 
 
 def balanced_charger_routes(routes_by_charger, total_k, rank_key):
-    """Select up to K F2 routes, keeping charger counts as even as supply allows.
-
-    Slots are assigned one at a time to the least-loaded charger with a
-    remaining candidate; ties use the lowest-ranked next route, then charger
-    id. With sufficient supply each charger receives floor/ceil(K/C) routes.
-    Chargers with fewer feasible routes are capped, and other chargers fill
-    the remaining slots. Fails only when no charger has a feasible route.
-    """
+    """Select K F2 routes with deterministic floor/ceil charger quotas."""
     chargers = sorted(int(value) for value in routes_by_charger)
     if not chargers:
         raise ValueError("Cannot allocate charging routes without installed chargers")
@@ -112,27 +105,32 @@ def balanced_charger_routes(routes_by_charger, total_k, rank_key):
         charger: sorted(routes_by_charger[charger], key=rank_key)
         for charger in chargers
     }
-    if all(not routes for routes in ordered.values()):
-        raise ValueError("No feasible charging routes through any installed charger")
-    quotas = {charger: 0 for charger in chargers}
-    allocated = 0
-    while allocated < total_k:
-        eligible = [
-            charger for charger in chargers
-            if len(ordered[charger]) > quotas[charger]
-        ]
-        if not eligible:
-            break
-        charger = min(
-            eligible,
-            key=lambda value: (
-                quotas[value],
-                rank_key(ordered[value][quotas[value]]),
-                value,
-            ),
+    base_quota, remainder = divmod(total_k, len(chargers))
+    insufficient = {
+        charger: len(ordered[charger]) for charger in chargers
+        if len(ordered[charger]) < base_quota
+    }
+    if insufficient:
+        raise ValueError(
+            f'Insufficient feasible charging routes for balanced quota '
+            f'{base_quota}: {insufficient}'
         )
+    quotas = {charger: base_quota for charger in chargers}
+    eligible = [
+        charger for charger in chargers
+        if len(ordered[charger]) > base_quota
+    ]
+    if len(eligible) < remainder:
+        raise ValueError(
+            f'Insufficient feasible charging routes for {remainder} remainder slots'
+        )
+    for charger in sorted(
+        eligible,
+        key=lambda value: (
+            rank_key(ordered[value][base_quota]), value,
+        ),
+    )[:remainder]:
         quotas[charger] += 1
-        allocated += 1
     return [route for charger in chargers for route in ordered[charger][:quotas[charger]]]
 
 

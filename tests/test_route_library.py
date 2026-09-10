@@ -62,23 +62,20 @@ def test_balanced_quota_uses_next_best_route_for_remainder():
     assert counts == {10: 2, 20: 3, 30: 2}
 
 
-def test_balanced_quota_caps_scarce_chargers_without_failing():
+def test_balanced_quota_rejects_a_charger_below_its_floor():
     routes = {
         10: [{"score": 1}],
         20: [{"score": 1}, {"score": 2}, {"score": 3}, {"score": 4}, {"score": 5}],
     }
-    selected = balanced_charger_routes(routes, 4, lambda route: route["score"])
-    counts = {charger: sum(route in selected for route in candidates)
-              for charger, candidates in routes.items()}
-    assert counts == {10: 1, 20: 3}
-    assert len(selected) == 4
+    with pytest.raises(ValueError, match="balanced quota 2"):
+        balanced_charger_routes(routes, 4, lambda route: route["score"])
 
 
-def test_balanced_quota_fails_only_when_no_charger_has_routes():
-    with pytest.raises(ValueError, match="No feasible charging routes"):
+def test_balanced_quota_requires_routes_for_every_charger():
+    with pytest.raises(ValueError, match="balanced quota 2"):
         balanced_charger_routes({10: [], 20: []}, 4, lambda route: 0)
-    single = balanced_charger_routes({10: [{"score": 1}], 20: []}, 2, lambda route: 0)
-    assert len(single) == 1
+    with pytest.raises(ValueError, match="balanced quota 1"):
+        balanced_charger_routes({10: [{"score": 1}], 20: []}, 2, lambda route: 0)
 
 
 def test_independent_routes_are_balanced_for_multiple_ods():

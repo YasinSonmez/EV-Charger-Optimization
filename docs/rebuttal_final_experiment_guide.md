@@ -4,12 +4,12 @@ The final design deliberately separates computational scaling from scientific se
 
 ## Suite definitions
 
-- `configs/rebuttal/final/scaling_suite.json` runs the complete secondary+ pipeline on the approximately 100-, 500-, and 1,000-node DC windows. It uses 5 candidates, 2 chargers, K=16, independent routes, balanced charger quotas, uniform initialization, 20 queue replications per better-response iteration, and a 300-iteration cap with cycle detection.
+- `configs/rebuttal/final/scaling_suite.json` runs the complete secondary+ pipeline on the approximately 100-, 500-, and 1,000-node DC windows. It uses 5 candidates, 2 chargers, K=16, CG-recovered routes, balanced charger quotas, CG-proportional initialization, 20 queue replications per better-response iteration, and a 300-iteration cap with cycle detection.
 - `configs/rebuttal/final/sensitivity_suite.json` expands to exactly 20 jobs on one 100-node network. The baseline runs first. Every subsequent job changes one factor and reuses the baseline network and BPR calibration after validating their exact hashes and calibration identity.
 
 The sensitivity factors are demand, F2 share, OD count, candidate/charger budget, K, route source, initialization, NE replication count, and queue seed. There is no alpha sweep; alpha remains the 1% equilibrium criterion. The BPR seed remains 42 when the queue seed changes.
 
-Independent F2 route sets contain up to K routes in total. Slots are assigned one at a time to the least-loaded charger with a remaining candidate; ties use the lowest-ranked next route, then charger id. With sufficient supply each charger receives `floor/ceil(K/C)` routes, so counts differ by at most one; chargers with fewer feasible routes are capped and other chargers fill the remaining slots. The CG-recovered sensitivity job applies the same rule, ranking routes within each charger by recovered flow.
+F2 route sets contain K routes in total. Every installed charger must supply its `floor(K/C)` base quota; remainder slots go to chargers with the best next route, with deterministic ties. CG-recovered routes are ranked by recovered flow. The independent-route sensitivity job uses the same balanced quotas and ranks by free-flow time.
 
 ## Local validation and execution
 

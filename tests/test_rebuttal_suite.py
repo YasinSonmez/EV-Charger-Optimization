@@ -22,6 +22,10 @@ def test_final_suite_sizes_and_fixed_alpha(tmp_path):
         "sensitivity_base", "budget_6_3", "budget_6_4",
         "budget_7_2", "budget_7_3", "budget_7_4",
     ]
+    assert "route_source_independent" in {job["id"] for job in sensitivity}
+    assert "init_uniform" in {job["id"] for job in sensitivity}
+    assert "route_source_cg" not in {job["id"] for job in sensitivity}
+    assert "init_shortest" not in {job["id"] for job in sensitivity}
     assert all(Config.from_dict(job["raw"]).queue_simulation["ALPHA"] == 0.01
                for job in sensitivity)
 
@@ -51,3 +55,17 @@ def test_balanced_route_settings_are_enabled_in_final_jobs(tmp_path):
         queue = Config.from_dict(job["raw"]).queue_simulation
         assert queue["balanced_charger_routes"] is True
         assert queue["K"] >= Config.from_dict(job["raw"]).num_chargers
+
+
+def test_primary_jobs_use_paper_route_source_and_initialization(tmp_path):
+    _, scaling = load_manifest(
+        ROOT / "configs/rebuttal/final/scaling_suite.json", tmp_path / "scaling"
+    )
+    _, sensitivity = load_manifest(
+        ROOT / "configs/rebuttal/final/sensitivity_suite.json", tmp_path / "sensitivity"
+    )
+    primary = scaling + [job for job in sensitivity if job["id"] == "sensitivity_base"]
+    for job in primary:
+        queue = Config.from_dict(job["raw"]).queue_simulation
+        assert queue["route_source"] == "cg_recovered_top_k"
+        assert queue["initialization"] == "cg_proportional"

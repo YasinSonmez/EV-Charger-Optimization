@@ -21,6 +21,7 @@ from src.contracts import (
     DemandClass,
     SeedManager,
     canonical_placement,
+    enumerate_placements,
     normalize_od_demand,
 )
 from src.network_artifact import load_network_artifact
@@ -603,6 +604,33 @@ def _assignment_signature(assignments_no, assignments_ch):
     return tuple(values)
 
 
+def _expanded_queue_configs(config, data):
+    """Placements the queue stage must evaluate for one experiment.
+
+    Queue-side greedy search can choose a different intermediate placement
+    than CG greedy search, so both stages must cover every size through the
+    requested charger count.
+    """
+    expected = {
+        placement
+        for size in range(1, int(config.num_chargers) + 1)
+        for placement in enumerate_placements(config.possible_charger_positions, size)
+    }
+    cg_universe = {
+        canonical_placement(value) for value in data['configurations']
+    }
+    if config.queue_simulation.get(
+        'route_source', 'cg_recovered_top_k'
+    ) == 'cg_recovered_top_k':
+        missing = sorted(expected - cg_universe, key=lambda value: (len(value), value))
+        if missing:
+            raise ValueError(
+                'CG results do not cover the queue placement universe; '
+                f'missing placements: {missing}'
+            )
+    return sorted(expected, key=lambda value: (len(value), value))
+
+
 def find_nash_assignments(config, experiment_dir, all_opt_results_path,
                           network_name='canonical', artifact_dir=None,
                           seed_manager=None, resume=False):
@@ -655,10 +683,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
         json.dump(manifest, handle, indent=2)
 
     input_paths = (nodes_path, edges_path, od_path)
-    configs = sorted(
-        {canonical_placement(value) for value in data['configurations']},
-        key=lambda value: (len(value), value),
-    )
+    configs = _expanded_queue_configs(config, data)
     queue_identity = {
         'network_hash': manifest['network_hash'],
         'K': int(q['K']),

@@ -39,6 +39,7 @@ from src.plot_style import (
 )
 from src.contracts import (
     BPR_CALIBRATION_VERSION, SeedManager, TimingRecorder, stable_json,
+    canonical_placement, enumerate_placements,
 )
 from src.network_artifact import load_network_artifact
 from src.run_state import (
@@ -1905,29 +1906,75 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
         print("=" * 80)
         t0 = time.time()
         od_demand = config.get_od_demand_tuples()
-        grids, time_history, experiment_dir = outer_optimization(
-            coordinates=config.coordinates,
-            num_chargers=config.num_chargers,
-            possible_charger_positions=config.possible_charger_positions,
-            calculate_on_all_possible_positions=config.calculate_on_all_possible_positions,
-            parameter_fit_results=pandas_df,
-            max_iter=config.max_iter,
-            use_derivatives=config.use_derivatives,
-            single_swap=config.single_swap,
-            use_cvxpy=config.use_cvxpy,
-            od_demand=od_demand,
-            plot_info=config.plot_info,
-            config_filepath=config_path,
-            output_dir=experiment_dir,
-            road_net=shared_road_net,
-            charger_self_link_length=config.charger_self_link_length,
-            cg_fit_policy=config.pipeline.get('cg_fit_policy', 'allow_degraded'),
-            parallel_workers=(
-                config.pipeline.get('parallel_workers') or available_cpus()
-            ),
-            checkpoint_dir=os.path.join(experiment_dir, 'cg_checkpoints'),
-            resume=resume,
-        )
+        all_opt_path = os.path.join(experiment_dir, 'all_optimization_results.pkl')
+        grids = None
+        if resume and config.calculate_on_all_possible_positions and os.path.isfile(all_opt_path):
+            try:
+                with open(all_opt_path, 'rb') as handle:
+                    saved_optimization = pickle.load(handle)
+                expected = {
+                    placement
+                    for size in range(1, int(config.num_chargers) + 1)
+                    for placement in enumerate_placements(
+                        config.possible_charger_positions, size
+                    )
+                }
+                saved = {
+                    canonical_placement(value)
+                    for value in saved_optimization.get('configurations', {})
+                }
+                route_ready = all(
+                    saved_optimization['configurations'][placement]
+                    .get('reconstruction_results', {}).get('route_pool')
+                    for placement in expected
+                )
+                if saved_optimization.get('network_hash') != network_hash:
+                    raise ValueError('network hash mismatch')
+                if saved != expected:
+                    raise ValueError('placement universe mismatch')
+                if config.queue_simulation.get('route_source') == 'cg_recovered_top_k' and not route_ready:
+                    raise ValueError('recovered route pool is incomplete')
+                grids = []
+                for placement in sorted(expected, key=lambda value: (len(value), value)):
+                    label = '-'.join(str(value) for value in placement)
+                    checkpoint = os.path.join(
+                        experiment_dir, 'cg_checkpoints', f'placement_{label}.pkl'
+                    )
+                    with open(checkpoint, 'rb') as handle:
+                        grid, _elapsed = pickle.load(handle)
+                    grids.append(grid)
+                time_history = []
+                print(
+                    f'Reusing complete CG and route-recovery artifacts for '
+                    f'{len(grids)} placements.'
+                )
+            except (OSError, KeyError, TypeError, ValueError, pickle.UnpicklingError) as exc:
+                print(f'Existing CG artifact is not reusable ({exc}); rebuilding it.')
+                grids = None
+        if grids is None:
+            grids, time_history, experiment_dir = outer_optimization(
+                coordinates=config.coordinates,
+                num_chargers=config.num_chargers,
+                possible_charger_positions=config.possible_charger_positions,
+                calculate_on_all_possible_positions=config.calculate_on_all_possible_positions,
+                parameter_fit_results=pandas_df,
+                max_iter=config.max_iter,
+                use_derivatives=config.use_derivatives,
+                single_swap=config.single_swap,
+                use_cvxpy=config.use_cvxpy,
+                od_demand=od_demand,
+                plot_info=config.plot_info,
+                config_filepath=config_path,
+                output_dir=experiment_dir,
+                road_net=shared_road_net,
+                charger_self_link_length=config.charger_self_link_length,
+                cg_fit_policy=config.pipeline.get('cg_fit_policy', 'allow_degraded'),
+                parallel_workers=(
+                    config.pipeline.get('parallel_workers') or available_cpus()
+                ),
+                checkpoint_dir=os.path.join(experiment_dir, 'cg_checkpoints'),
+                resume=resume,
+            )
         if not grids or not any(np.isfinite(float(grid.travel_time_obj)) for grid in grids):
             raise RuntimeError(
                 'Congestion-game optimization produced no finite placement objective; '
@@ -1942,7 +1989,6 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
         if not target_grids:
             raise RuntimeError('CG optimization produced no target-size placement')
         best_grid = min(target_grids, key=lambda grid: grid.travel_time_obj)
-        all_opt_path = os.path.join(experiment_dir, 'all_optimization_results.pkl')
         with open(all_opt_path, 'rb') as handle:
             optimization_data = pickle.load(handle)
         cg_search = optimization_data.get('placement_search', {})

@@ -108,6 +108,14 @@ def _comparison_rep(args):
         cache_elapsed[placement] = time.perf_counter() - started
         return cache[placement]
 
+    # Every replication must observe the same placement universe. Previously
+    # each replication followed its own noisy greedy prefix, leaving some
+    # intermediate placements without all paired observations and causing the
+    # mean-search summary to fail after simulation had already completed.
+    for size in range(1, int(num_stations) + 1):
+        for placement in enumerate_placements(possible_positions, size):
+            evaluate(placement)
+
     best_positions = []
     best_time = float('inf')
     remaining = list(ordered_unique_positions(possible_positions))
@@ -423,9 +431,11 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
     num_stations = config.num_chargers
     possible_positions = config.possible_charger_positions
     combinations_list = enumerate_placements(possible_positions, num_stations)
-    required_placements = set(combinations_list) | set(
-        enumerate_placements(possible_positions, 1)
-    )
+    required_placements = {
+        placement
+        for size in range(1, int(num_stations) + 1)
+        for placement in enumerate_placements(possible_positions, size)
+    }
     cg_placements = {
         canonical_placement(value) for value in data.get('configurations', {})
     }

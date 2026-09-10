@@ -32,7 +32,7 @@
   "plot_info": false,
   "calculate_on_all_possible_positions": true,
   "charger_self_link_length": 100,
-  "route_analysis": {"analyze_top_k_routes": true, "k_values": [1], "run_parameter_sweep": false},
+  "route_analysis": {"analyze_top_k_routes": true, "k_values": [16], "run_parameter_sweep": false},
   "queue_simulation": {
     "enabled": true,
     "K": 16,
@@ -48,9 +48,9 @@
     "EXIT_CAPACITY": 250,
     "COST": 0,
     "failure_policy": "fail_fast",
-    "route_source": "independent_network_routes",
+    "route_source": "cg_recovered_top_k",
     "balanced_charger_routes": true,
-    "initialization": "uniform",
+    "initialization": "cg_proportional",
     "initialization_seed": 42,
     "seed": 42
   },

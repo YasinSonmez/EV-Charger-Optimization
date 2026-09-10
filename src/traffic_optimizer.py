@@ -1491,18 +1491,24 @@ class Network(RoadNet):
                 
                 for charger in self.chargers:
                     # Generate OC routes
-                    oc_paths = list(islice(nx.shortest_simple_paths(
-                        self.DiGraph,
-                        self.net.nid_to_osmid_dict[o],
-                        self.net.nid_to_osmid_dict[charger],
-                        weight='length'), paths_per_oc_cd))
+                    try:
+                        oc_paths = list(islice(nx.shortest_simple_paths(
+                            self.DiGraph,
+                            self.net.nid_to_osmid_dict[o],
+                            self.net.nid_to_osmid_dict[charger],
+                            weight='length'), paths_per_oc_cd))
+                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                        oc_paths = []
                     
                     # Generate CD routes
-                    cd_paths = list(islice(nx.shortest_simple_paths(
-                        self.DiGraph,
-                        self.net.nid_to_osmid_dict[charger],
-                        self.net.nid_to_osmid_dict[d],
-                        weight='length'), paths_per_oc_cd))
+                    try:
+                        cd_paths = list(islice(nx.shortest_simple_paths(
+                            self.DiGraph,
+                            self.net.nid_to_osmid_dict[charger],
+                            self.net.nid_to_osmid_dict[d],
+                            weight='length'), paths_per_oc_cd))
+                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                        cd_paths = []
                     
                     # Combine OC and CD paths
                     charging_routes = []
@@ -1581,18 +1587,39 @@ class Network(RoadNet):
                         constraints.append(cp.sum(route_flows[charging_routes]) == self.od_demand[od_pair][1])  # Type 2 demand
         
         if use_charger_constraints and hasattr(self, 'chargers') and self.chargers is not None:
-            # Individual charger flow constraints
-            for charger in self.chargers:
-                charger_routes = [i for i, info in enumerate(route_info) 
-                                if info[1] == 'charging' and info[2] == charger]
-                if charger_routes:
-                    # Get the charging flow for this charger from link_flows_dict
-                    charger_flow = 0
-                    for link_data in link_flows_dict.values():
-                        charging_flows = link_data.get('charging_flows', {})
-                        charger_flow += charging_flows.get(charger, charging_flows.get(str(charger), 0))
-                    if charger_flow > 0:
-                        pass
+            if not hasattr(self, 'q_c_values'):
+                raise ValueError(
+                    'CG charger demand splits are required for constrained route recovery'
+                )
+            # Preserve the CG demand assigned to each charger for every OD.
+            # Summing a charger's contribution over road links would count the
+            # same vehicles once per traversed link and is not throughput.
+            for od_index, od_pair in enumerate(od_pairs):
+                for charger_index, charger in enumerate(self.chargers):
+                    key = (od_index, 2, charger_index)
+                    if key not in self.q_c_values:
+                        raise ValueError(
+                            f'Missing CG charger demand split for OD {od_pair}, '
+                            f'charger {int(charger)}'
+                        )
+                    charger_demand = max(
+                        0.0, float(np.asarray(self.q_c_values[key]).item())
+                    )
+                    charger_routes = [
+                        i for i, info in enumerate(route_info)
+                        if info[0] == od_pair and info[1] == 'charging'
+                        and info[2] == charger
+                    ]
+                    if not charger_routes:
+                        if charger_demand > 1e-8:
+                            raise ValueError(
+                                f'No feasible recovered route for OD {od_pair}, '
+                                f'charger {int(charger)}, CG flow {charger_demand:.6g}'
+                            )
+                        continue
+                    constraints.append(
+                        cp.sum(route_flows[charger_routes]) == charger_demand
+                    )
         
         # Objective: minimize L2 norm between reconstructed and target link flows
         objective = cp.Minimize(cp.sum_squares(link_flows - target_link_flows))
