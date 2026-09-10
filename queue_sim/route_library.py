@@ -52,13 +52,15 @@ def _shortest_paths(graph, origin, destination, limit):
 
 
 def _feasible_charging_candidates(graph, cache, od, charger, total_k, per_charger_need):
-    """Enumerate simple O-charger-D paths, deepening the leg search as needed.
+    """Enumerate charging routes as concatenations of simple O-C and C-D legs.
 
-    The `total_k` shortest paths per leg can all pass through the opposite OD
-    endpoint, which would wrongly report zero feasible charging routes for
-    sparse candidates. The per-leg limit therefore escalates until the
-    charger can fill its balanced quota or both leg enumerations are
-    exhausted, with a bounded cap for cost control.
+    This matches the congestion-game route semantics: each leg is a simple
+    path, but the concatenation may revisit earlier nodes (e.g. pass through
+    the destination before charging). Demanding a fully simple concatenation
+    would be stricter than the CG model and can wrongly report zero feasible
+    routes when every short O-C leg passes through the destination. The
+    per-leg search still escalates when one leg alone cannot supply enough
+    candidates, with a bounded cap for cost control.
     """
     limit = max(int(total_k), 1)
     cap = 8 * max(int(total_k), 1)
@@ -75,7 +77,7 @@ def _feasible_charging_candidates(graph, cache, od, charger, total_k, per_charge
         for left in first:
             for right in second:
                 path = tuple(int(value) for value in left + right[1:])
-                if len(path) != len(set(path)) or path in seen:
+                if path in seen:
                     continue
                 seen.add(path)
                 candidates.append(_path_record(
