@@ -1014,7 +1014,7 @@ def plot_travel_time_objectives(grids, time_history, phases, filename='1', singl
     
     # Add vertical lines for phase boundaries
     for i, (label, vertical_line_pos_i) in enumerate(phases.items()):
-        ax.axvline(x=vertical_line_pos_i+1, label=label, linestyle='--', c=colors[i])
+        ax.axvline(x=vertical_line_pos_i+1, label=label, linestyle='--', c=colors[i % len(colors)])
     
     ax.legend(loc='upper left', fontsize=7)
     ax.set_xticks(range(1, len(charger_names)+1))
@@ -1035,7 +1035,7 @@ def plot_travel_time_objectives(grids, time_history, phases, filename='1', singl
 
     # Add vertical lines for phase boundaries
     for i, (label, vertical_line_pos_i) in enumerate(phases.items()):
-        ax.axvline(x=vertical_line_pos_i+1, label=label, linestyle='--', c=colors[i])
+        ax.axvline(x=vertical_line_pos_i+1, label=label, linestyle='--', c=colors[i % len(colors)])
 
     ax.set_xlabel('Placement evaluation')
     ax.set_ylabel('CG objective')
