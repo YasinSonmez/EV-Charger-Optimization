@@ -6,7 +6,7 @@ usage() {
     cat <<'EOF'
 Usage:
   scripts/run_container.sh --image IMAGE --config CONFIG [options]
-  scripts/run_container.sh --image IMAGE --manifest MANIFEST [--index N] [options]
+  scripts/run_container.sh --image IMAGE --manifest MANIFEST [--index N | --start-index N] [options]
 
 Options:
   --engine auto|docker|apptainer  Runtime to use (default: auto)
@@ -17,6 +17,9 @@ Options:
   --cache DIR                    Host OSM cache directory
   --cpus N                       CPU limit and worker count advertised to pipeline
   --resume                       Resume the deterministic run directory
+  --index N                      Run only zero-based suite entry N
+  --start-index N                Run zero-based suite entry N through the end
+  --continue-on-failure          Record failures and continue to later suite entries
   --network-only                 Run only network generation (single config only)
   --validate-config              Validate configuration and exit (single config only)
   --pruning-sweep                Run pruning sweep (single config only)
@@ -40,10 +43,12 @@ cpus="${EVOPT_CPUS:-${SLURM_CPUS_PER_TASK:-}}"
 config=""
 manifest=""
 index=""
+start_index=""
 pipeline_flags=()
 suite_flags=()
 single_only=false
 suite_only=false
+continue_on_failure=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -57,6 +62,12 @@ while [[ $# -gt 0 ]]; do
         --config) config="$2"; shift 2 ;;
         --manifest) manifest="$2"; shift 2 ;;
         --index) index="$2"; shift 2 ;;
+        --start-index) start_index="$2"; shift 2 ;;
+        --continue-on-failure)
+            suite_flags+=(--continue-on-failure)
+            continue_on_failure=true
+            shift
+            ;;
         --resume) pipeline_flags+=(--resume); suite_flags+=(--resume); shift ;;
         --network-only|--validate-config|--pruning-sweep)
             pipeline_flags+=("$1"); single_only=true; shift ;;
@@ -81,6 +92,14 @@ if [[ -n "$config" && "$suite_only" == true ]]; then
 fi
 if [[ -n "$manifest" && "$single_only" == true ]]; then
     echo "--network-only/--validate-config/--pruning-sweep require --config." >&2
+    exit 2
+fi
+if [[ -n "$config" && ( -n "$start_index" || "$continue_on_failure" == true ) ]]; then
+    echo "--start-index/--continue-on-failure require --manifest." >&2
+    exit 2
+fi
+if [[ -n "$index" && -n "$start_index" ]]; then
+    echo "Use only one of --index or --start-index." >&2
     exit 2
 fi
 if [[ "$mode" != "workspace" && "$mode" != "image" ]]; then
@@ -154,6 +173,9 @@ else
     fi
     if [[ -n "$index" ]]; then
         command_args+=(--index "$index")
+    fi
+    if [[ -n "$start_index" ]]; then
+        command_args+=(--start-index "$start_index")
     fi
 fi
 

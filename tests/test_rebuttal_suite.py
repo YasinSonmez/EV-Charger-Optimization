@@ -2,11 +2,62 @@
 
 from pathlib import Path
 
-from run_suite import load_manifest
+from run_suite import load_manifest, run_jobs, select_jobs
 from src.config import Config
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_start_index_selects_suffix_and_index_selects_one():
+    jobs = [{"id": f"job_{index}"} for index in range(4)]
+    assert [job["id"] for job in select_jobs(jobs, index=2)] == ["job_2"]
+    assert [job["id"] for job in select_jobs(jobs, start_index=2)] == [
+        "job_2", "job_3",
+    ]
+    assert [job["id"] for job in select_jobs(jobs)] == [
+        "job_0", "job_1", "job_2", "job_3",
+    ]
+
+
+def test_start_index_rejects_conflict_and_out_of_range():
+    jobs = [{"id": "job_0"}]
+    try:
+        select_jobs(jobs, index=0, start_index=0)
+    except ValueError as exc:
+        assert "cannot be used together" in str(exc)
+    else:
+        raise AssertionError("conflicting index options were accepted")
+    try:
+        select_jobs(jobs, start_index=2)
+    except IndexError:
+        pass
+    else:
+        raise AssertionError("out-of-range start index was accepted")
+
+
+def test_continue_on_failure_records_failure_and_runs_later_jobs(
+    monkeypatch, tmp_path,
+):
+    _manifest, jobs = load_manifest(
+        ROOT / "configs/rebuttal/smoke/smoke_suite.json",
+        expanded_dir=tmp_path / "expanded",
+    )
+    attempted = []
+
+    def fake_run_job(job, _jobs_by_id, _results_root, _resume):
+        attempted.append(job["id"])
+        if job["id"] == "smoke_base":
+            raise RuntimeError("intentional test failure")
+
+    monkeypatch.setattr("run_suite.run_job", fake_run_job)
+    failures = run_jobs(
+        jobs, {job["id"]: job for job in jobs}, tmp_path / "results", False,
+        continue_on_failure=True,
+    )
+
+    assert attempted == ["smoke_base", "smoke_cg_routes"]
+    assert [job_id for job_id, _ in failures] == ["smoke_base"]
 
 
 def test_final_suite_sizes_and_fixed_alpha(tmp_path):

@@ -162,6 +162,62 @@ def run_job(job, jobs_by_id, results_root, resume):
                 os.environ[key] = value
 
 
+def select_jobs(jobs, *, index=None, start_index=None):
+    """Select one job or a suffix; indices are zero-based."""
+    if index is not None and start_index is not None:
+        raise ValueError("--index and --start-index cannot be used together")
+    if index is not None:
+        if index < 0 or index >= len(jobs):
+            raise IndexError(f"experiment index {index} outside 0..{len(jobs) - 1}")
+        return jobs[index:index + 1]
+    if start_index is not None:
+        if start_index < 0 or start_index > len(jobs):
+            raise IndexError(
+                f"start index {start_index} outside 0..{len(jobs)}"
+            )
+        return jobs[start_index:]
+    return jobs
+
+
+def _record_suite_failure(job, results_root, exc):
+    """Persist failures raised before the pipeline itself can write status."""
+    target = expected_run_dir(job["path"], results_root)
+    target.mkdir(parents=True, exist_ok=True)
+    status_path = target / "status.json"
+    prior = {}
+    if status_path.is_file():
+        try:
+            prior = json.loads(status_path.read_text())
+        except (OSError, ValueError):
+            pass
+    prior.update({
+        "status": "failed",
+        "eligible": False,
+        "failure_type": type(exc).__name__,
+        "failure_reason": str(exc),
+        "suite_traceback": traceback.format_exc(),
+        "config": str(job["path"]),
+        "config_name": job["raw"].get("name", job["id"]),
+    })
+    atomic_write_json(status_path, prior)
+
+
+def run_jobs(jobs, jobs_by_id, results_root, resume, *, continue_on_failure=False):
+    """Run selected jobs in order and return failures after the requested policy."""
+    failures = []
+    for job in jobs:
+        try:
+            run_job(job, jobs_by_id, results_root, resume)
+        except Exception as exc:
+            _record_suite_failure(job, results_root, exc)
+            failures.append((job["id"], exc))
+            print(f"Experiment {job['id']} failed: {exc}")
+            if not continue_on_failure:
+                break
+            print("Continuing with the next suite experiment.")
+    return failures
+
+
 def summarize(results_root):
     root = Path(results_root)
     rows = []
@@ -479,7 +535,11 @@ def main():
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--results-root", default="results")
     parser.add_argument("--index", type=int, help="zero-based config index; defaults to SLURM_ARRAY_TASK_ID or all")
+    parser.add_argument("--start-index", type=int,
+                        help="zero-based config index; run this job and all later jobs")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--continue-on-failure", action="store_true",
+                        help="record a failed job and continue with later suite jobs")
     parser.add_argument("--summarize", action="store_true")
     parser.add_argument("--export-bundle")
     parser.add_argument("--validate-only", action="store_true")
@@ -511,17 +571,21 @@ def main():
     index = args.index
     if index is None and os.environ.get("SLURM_ARRAY_TASK_ID") is not None:
         index = int(os.environ["SLURM_ARRAY_TASK_ID"])
-    selected = jobs if index is None else [jobs[index]]
+    try:
+        selected = select_jobs(jobs, index=index, start_index=args.start_index)
+    except (IndexError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
     jobs_by_id = {job["id"]: job for job in jobs}
-    for job in selected:
-        try:
-            run_job(job, jobs_by_id, args.results_root, args.resume)
-        except Exception as exc:
-            summarize(args.results_root)
-            raise SystemExit(f"{job['id']}: {exc}")
+    failures = run_jobs(
+        selected, jobs_by_id, args.results_root, args.resume,
+        continue_on_failure=args.continue_on_failure,
+    )
     summarize(args.results_root)
     if args.export_bundle:
         export_bundle(args.results_root, args.export_bundle)
+    if failures:
+        failed_ids = ", ".join(job_id for job_id, _exc in failures)
+        raise SystemExit(f"Suite finished with {len(failures)} failed experiment(s): {failed_ids}")
 
 
 if __name__ == "__main__":
