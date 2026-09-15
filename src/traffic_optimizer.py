@@ -1456,6 +1456,7 @@ class Network(RoadNet):
             dict: Dictionary containing reconstructed route flows
         """
         import cvxpy as cp
+        from cvxpy.error import SolverError
         import networkx as nx
         from itertools import islice
         
@@ -1632,14 +1633,17 @@ class Network(RoadNet):
         # their route library and later crash the queue stage.  Use explicit,
         # reproducible tolerances and a sufficiently large iteration budget;
         # the status is still checked below and is never treated as success.
-        prob.solve(
-            solver=cp.OSQP,
-            max_iter=100000,
-            eps_abs=1e-6,
-            eps_rel=1e-6,
-            polish=True,
-            verbose=False,
-        )
+        try:
+            prob.solve(
+                solver=cp.OSQP,
+                max_iter=100000,
+                eps_abs=1e-6,
+                eps_rel=1e-6,
+                polish=True,
+                verbose=False,
+            )
+        except SolverError as exc:
+            print(f"Warning: OSQP route reconstruction failed; trying Clarabel: {exc}")
 
         if prob.status != cp.OPTIMAL:
             # Clarabel provides a robust conic fallback for the same convex
