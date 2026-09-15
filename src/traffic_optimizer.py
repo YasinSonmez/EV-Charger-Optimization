@@ -1641,7 +1641,7 @@ class Network(RoadNet):
             verbose=False,
         )
 
-        if prob.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+        if prob.status != cp.OPTIMAL:
             # Clarabel provides a robust conic fallback for the same convex
             # quadratic formulation when OSQP stalls on ill-conditioned
             # route-incidence matrices.
