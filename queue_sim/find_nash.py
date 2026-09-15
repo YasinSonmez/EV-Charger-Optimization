@@ -138,6 +138,12 @@ def _write_queue_manifest(path, manifest, assignments):
         'minimum_gap_statistics': _numeric_summary(
             value.get('minimum_gap') for value in assignments.values()
         ),
+        'final_gap_mean_normalized_statistics': _numeric_summary(
+            value.get('final_gap_mean_normalized') for value in assignments.values()
+        ),
+        'minimum_gap_mean_normalized_statistics': _numeric_summary(
+            value.get('minimum_gap_mean_normalized') for value in assignments.values()
+        ),
         'exact_ne_eligible': (
             not approximate
             and not nonconverged
@@ -467,9 +473,17 @@ def _aggregate_simulation_samples(samples):
     return averaged, total_time
 
 
-def _relative_gap(details):
+def _gap_metrics(details):
+    """Return official minimum- and diagnostic mean-normalized Nash gaps.
+
+    The mean denominator is the arithmetic mean of the worst used-route cost
+    and best available-route cost.  It is reported as a symmetric dispersion
+    diagnostic only; convergence continues to use the paper's minimum-cost
+    denominator.
+    """
     best = None
     best_group = None
+    best_mean_normalized = 0.0
     for group_key, routes in details.items():
         if not routes:
             continue
@@ -483,10 +497,25 @@ def _relative_gap(details):
             relative = float('inf') if maximum_used > minimum else 0.0
         else:
             relative = max(0.0, (maximum_used - minimum) / minimum)
+        mean_cost = (maximum_used + minimum) / 2.0
+        if mean_cost <= 0 or not np.isfinite(mean_cost):
+            mean_normalized = float('inf') if maximum_used > minimum else 0.0
+        else:
+            mean_normalized = max(0.0, (maximum_used - minimum) / mean_cost)
         if best is None or relative > best:
             best = relative
+            best_mean_normalized = mean_normalized
             best_group = (group_key, routes, maximum_used, minimum)
-    return (float(best or 0.0), best_group)
+    return ({
+        'minimum_normalized': float(best or 0.0),
+        'mean_normalized': float(best_mean_normalized),
+    }, best_group)
+
+
+def _relative_gap(details):
+    """Return the paper-compatible minimum-normalized gap and worst group."""
+    metrics, selected = _gap_metrics(details)
+    return metrics['minimum_normalized'], selected
 
 
 def _nash_for_config(args):
@@ -513,6 +542,7 @@ def _nash_for_config(args):
         )
 
     history = []
+    mean_normalized_history = []
     iteration_timings = []
     converged = False
     final_details = {}
@@ -548,8 +578,10 @@ def _nash_for_config(args):
             'elapsed_seconds': time.perf_counter() - iteration_started,
         'status': 'ok',
         })
-        gap, selected = _relative_gap(final_details)
+        gap_metrics, selected = _gap_metrics(final_details)
+        gap = gap_metrics['minimum_normalized']
         history.append(gap)
+        mean_normalized_history.append(gap_metrics['mean_normalized'])
         if gap <= float(alpha) or selected is None:
             converged = gap <= float(alpha)
             break
@@ -573,6 +605,13 @@ def _nash_for_config(args):
         'converged': converged,
         'iterations': len(history),
         'final_gap': history[-1] if history else float('inf'),
+        'final_gap_mean_normalized': (
+            mean_normalized_history[-1] if mean_normalized_history else float('inf')
+        ),
+        'minimum_gap_mean_normalized': (
+            min(mean_normalized_history) if mean_normalized_history else float('inf')
+        ),
+        'mean_normalized_gap_history': mean_normalized_history,
         'route_metrics': final_details,
         'flow_data': flow_data,
         'iteration_timings': iteration_timings,
@@ -778,6 +817,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             'assignments_no': assignments_no,
             'assignments_ch': assignments_ch,
             'history': [],
+            'mean_normalized_history': [],
             'iteration_timings': [],
             'final_details': {},
             'converged': False,
@@ -787,6 +827,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             'seen_assignments': {},
             'evaluated_assignments': {},
             'final_gap_override': None,
+            'final_gap_mean_normalized_override': None,
             'cycle_start_iteration': None,
             'cycle_length': None,
             'retained_state_gap_verified': False,
@@ -808,6 +849,9 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
                 'assignments_no': prior.get('assignments', {}).get('F1', assignments_no),
                 'assignments_ch': prior.get('assignments', {}).get('F2', assignments_ch),
                 'history': [float(prior.get('final_gap', float('inf')))],
+                'mean_normalized_history': list(
+                    prior.get('mean_normalized_gap_history', [])
+                ),
                 'iteration_timings': prior.get('iteration_timings', []),
                 'final_details': prior.get('route_metrics', {}),
                 'converged': bool(prior.get('converged', False)),
@@ -841,6 +885,9 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
                 if prior_evaluation is not None:
                     state['final_details'] = prior_evaluation['route_metrics']
                     state['final_gap_override'] = prior_evaluation['gap']
+                    state['final_gap_mean_normalized_override'] = (
+                        prior_evaluation['mean_normalized_gap']
+                    )
                     state['retained_state_gap_verified'] = True
                 active.remove(loc_str)
             else:
@@ -911,13 +958,18 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
 
             final_details, _ = _aggregate_simulation_samples(samples)
             state['final_details'] = final_details
-            gap, selected = _relative_gap(final_details)
+            gap_metrics, selected = _gap_metrics(final_details)
+            gap = gap_metrics['minimum_normalized']
             state['history'].append(gap)
+            state['mean_normalized_history'].append(
+                gap_metrics['mean_normalized']
+            )
             signature = _assignment_signature(
                 state['assignments_no'], state['assignments_ch']
             )
             state['evaluated_assignments'][signature] = {
                 'gap': float(gap),
+                'mean_normalized_gap': float(gap_metrics['mean_normalized']),
                 'route_metrics': final_details,
             }
             if gap <= float(alpha) or selected is None:
@@ -965,6 +1017,12 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
         final_gap = state.get('final_gap_override')
         if final_gap is None:
             final_gap = state['history'][-1] if state['history'] else float('inf')
+        final_mean_gap = state.get('final_gap_mean_normalized_override')
+        if final_mean_gap is None:
+            final_mean_gap = (
+                state['mean_normalized_history'][-1]
+                if state['mean_normalized_history'] else float('inf')
+            )
         result = {
             'assignments': {
                 'F1': state['assignments_no'],
@@ -974,6 +1032,12 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             'iterations': iterations_completed,
             'final_gap': final_gap,
             'minimum_gap': min(state['history']) if state['history'] else final_gap,
+            'final_gap_mean_normalized': final_mean_gap,
+            'minimum_gap_mean_normalized': (
+                min(state['mean_normalized_history'])
+                if state['mean_normalized_history'] else final_mean_gap
+            ),
+            'mean_normalized_gap_history': state['mean_normalized_history'],
             'route_metrics': state['final_details'],
             'flow_data': state['flow_data'],
             'iteration_timings': state['iteration_timings'],
@@ -1034,6 +1098,17 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
         'iteration_timings': {
             key: value.get('iteration_timings', [])
             for key, value in assignments.items()
+        },
+        'convergence_history_min_normalized': convergence_data,
+        'convergence_history_mean_normalized': {
+            key: state['mean_normalized_history'] for key, state in states.items()
+        },
+        'gap_normalizations': {
+            'official': '(max_used - min_available) / min_available',
+            'diagnostic': (
+                '(max_used - min_available) / '
+                'mean(max_used, min_available)'
+            ),
         },
         'alpha': alpha,
         'max_iterations': max_ne_iterations,

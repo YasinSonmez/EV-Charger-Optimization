@@ -53,12 +53,32 @@ def test_seed_manager_named_streams_are_stable():
 
 
 def test_relative_nash_gap_uses_travel_time():
-    from queue_sim.find_nash import _relative_gap
-    gap, selected = _relative_gap({
+    from queue_sim.find_nash import _gap_metrics, _relative_gap
+    details = {
         ((0, 1), 'F1'): [
             {'travel_time': 10.0, 'used': True},
             {'travel_time': 9.0, 'used': False},
         ]
-    })
+    }
+    gap, selected = _relative_gap(details)
+    metrics, metrics_selected = _gap_metrics(details)
     assert gap == pytest.approx(1 / 9)
+    assert metrics['minimum_normalized'] == pytest.approx(1 / 9)
+    assert metrics['mean_normalized'] == pytest.approx(1 / 9.5)
     assert selected[0] == ((0, 1), 'F1')
+    assert metrics_selected == selected
+
+
+def test_convergence_csv_records_both_gap_normalizations(tmp_path):
+    from pipeline import _save_convergence_csv
+
+    output = tmp_path / 'ne_convergence.csv'
+    _save_convergence_csv({'1,2': [0.2, 0.1]}, output, {'1,2': [0.18, 0.095]})
+    frame = pd.read_csv(output)
+
+    assert frame.columns.tolist() == [
+        'config', 'iteration', 'diff',
+        'min_normalized_gap', 'mean_normalized_gap',
+    ]
+    assert frame['min_normalized_gap'].tolist() == pytest.approx([0.2, 0.1])
+    assert frame['mean_normalized_gap'].tolist() == pytest.approx([0.18, 0.095])

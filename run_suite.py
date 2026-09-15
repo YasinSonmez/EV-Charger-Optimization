@@ -287,16 +287,242 @@ def _write_csv(path, rows, default_columns):
         writer.writerows(rows)
 
 
-def export_bundle(results_root, destination):
+SENSITIVITY_PHYSICAL_EXPERIMENTS = (
+    "sensitivity_base", "budget_6_3", "budget_6_4", "budget_7_2",
+    "budget_7_3", "budget_7_4", "demand_090", "demand_270",
+    "f2_share_1_3", "f2_share_1_2", "od_count_2",
+)
+
+SENSITIVITY_FACTORS = (
+    ("Sites", "$(6/2)\\ldots(7/4)$",
+     ("sensitivity_base", "budget_6_3", "budget_6_4", "budget_7_2",
+      "budget_7_3", "budget_7_4")),
+    ("Demand", "$90/180/270$",
+     ("demand_090", "sensitivity_base", "demand_270")),
+    ("Charge share", "$1/3,1/2,2/3$",
+     ("f2_share_1_3", "f2_share_1_2", "sensitivity_base")),
+    ("ODs", "$1/2$", ("sensitivity_base", "od_count_2")),
+    ("Routes", "$K=8/16/32$",
+     ("routes_k08", "sensitivity_base", "routes_k32")),
+    ("Route src.", "CG/indep.",
+     ("sensitivity_base", "route_source_independent")),
+    ("Init.", "CG/unif./rand.",
+     ("sensitivity_base", "init_uniform", "init_random")),
+    ("BR reps.", "$1/10/50$",
+     ("sensitivity_base", "ne_reps_10", "ne_reps_50")),
+    ("Q seed", "$42/43/44$",
+     ("sensitivity_base", "queue_seed_43", "queue_seed_44")),
+)
+
+REPORTING_STRATEGIES = (
+    ("greedy", "Greedy"),
+    ("single_swap", "Greedy + swap"),
+    ("minimum_detour", "Min. detour"),
+    ("weighted_betweenness", "Wt. betw."),
+    ("uniform_random_expectation", "Random exp."),
+)
+
+
+def _latest_completed_records(records, experiment_ids=None):
+    """Select the newest completed run for each experiment name."""
+    allowed = set(experiment_ids) if experiment_ids is not None else None
+    selected = {}
+    for record in records:
+        name = record.get("name")
+        if not name or (allowed is not None and name not in allowed):
+            continue
+        if not str(record.get("status", "")).startswith("complete"):
+            continue
+        previous = selected.get(name)
+        key = (str(record.get("timestamp_utc") or ""), str(record.get("run") or ""))
+        old_key = (
+            str(previous.get("timestamp_utc") or ""), str(previous.get("run") or "")
+        ) if previous else None
+        if previous is None or key > old_key:
+            selected[name] = record
+    return selected
+
+
+def _is_exact_optimum(strategy):
+    gap = strategy.get("regret_pct") if strategy else None
+    try:
+        return np.isfinite(float(gap)) and abs(float(gap)) <= 1e-9
+    except (TypeError, ValueError):
+        return False
+
+
+def _sensitivity_paper_rows(selected):
+    """Build machine-readable rows for the horizontal paper table."""
+    if "sensitivity_base" not in selected:
+        return []
+    rows = []
+    physical = [selected[name] for name in SENSITIVITY_PHYSICAL_EXPERIMENTS
+                if name in selected]
+    for strategy, label in REPORTING_STRATEGIES:
+        rows.append({
+            "panel": "A_placement", "factor": label, "runs": len(physical),
+            "cg_exact": sum(_is_exact_optimum(value["cg_strategies"].get(strategy))
+                            for value in physical),
+            "queue_exact": sum(
+                _is_exact_optimum(value["queue_strategies"].get(strategy))
+                for value in physical
+            ),
+        })
+
+    for factor, levels, names in SENSITIVITY_FACTORS:
+        values = [selected[name] for name in names if name in selected]
+        correlations = [float(value["spearman"]) for value in values
+                        if value.get("spearman") is not None
+                        and np.isfinite(float(value["spearman"]))]
+        agreements = [bool(value["top_1_agreement"]) for value in values
+                      if value.get("top_1_agreement") is not None]
+        def mean_minutes(*fields):
+            timings = [sum(float(value.get(field) or 0) for field in fields)
+                       for value in values
+                       if all(value.get(field) is not None for field in fields)]
+            return float(np.mean(timings)) / 60 if timings else None
+        rows.append({
+            "panel": "B_agreement", "factor": factor, "levels": levels,
+            "runs": len(values),
+            "spearman_median": float(np.median(correlations)) if correlations else None,
+            "spearman_min": min(correlations, default=None),
+            "spearman_max": max(correlations, default=None),
+            "top_1_agreement_count": sum(agreements),
+            "top_1_agreement_rate": sum(agreements) / len(agreements) if agreements else None,
+            "mean_bpr_minutes": (
+                sum(float(value.get("bpr_seconds") or 0)
+                    for value in values if value.get("name") == "sensitivity_base")
+                / len(values) / 60 if values else None
+            ),
+            "mean_cg_minutes": mean_minutes("cg_seconds"),
+            "mean_queue_minutes": mean_minutes("queue_ne_seconds"),
+            "mean_total_minutes": mean_minutes("total_seconds"),
+        })
+
+    values = list(selected.values())
+    correlations = [float(value["spearman"]) for value in values
+                    if value.get("spearman") is not None
+                    and np.isfinite(float(value["spearman"]))]
+    agreements = [bool(value["top_1_agreement"]) for value in values
+                  if value.get("top_1_agreement") is not None]
+    def overall_mean_minutes(*fields):
+        timings = [sum(float(value.get(field) or 0) for field in fields)
+                   for value in values
+                   if all(value.get(field) is not None for field in fields)]
+        return float(np.mean(timings)) / 60 if timings else None
+    rows.append({
+        "panel": "B_agreement", "factor": "Overall", "levels": "All selected jobs",
+        "runs": len(values),
+        "spearman_median": float(np.median(correlations)) if correlations else None,
+        "spearman_min": min(correlations, default=None),
+        "spearman_max": max(correlations, default=None),
+        "top_1_agreement_count": sum(agreements),
+        "top_1_agreement_rate": sum(agreements) / len(agreements) if agreements else None,
+        "mean_bpr_minutes": (
+            sum(float(value.get("bpr_seconds") or 0)
+                for value in values if value.get("name") == "sensitivity_base")
+            / len(values) / 60 if values else None
+        ),
+        "mean_cg_minutes": overall_mean_minutes("cg_seconds"),
+        "mean_queue_minutes": overall_mean_minutes("queue_ne_seconds"),
+        "mean_total_minutes": overall_mean_minutes("total_seconds"),
+    })
+    return rows
+
+
+def _render_sensitivity_table_tex(rows, selected):
+    """Render placement and sensitivity results side by side."""
+    placement_rows = [row for row in rows if row["panel"] == "A_placement"]
+    sensitivity_rows = [row for row in rows if row["panel"] == "B_agreement"]
+    node_counts = sorted({int(value["nodes"]) for value in selected.values()
+                          if value.get("nodes") is not None})
+    edge_counts = sorted({int(value["edges"]) for value in selected.values()
+                          if value.get("edges") is not None})
+    network = (f"{node_counts[0]}-node, {edge_counts[0]}-link "
+               if len(node_counts) == len(edge_counts) == 1 else "")
+    cycles = sum(int(value.get("cycles") or 0) for value in selected.values())
+    searches = sum(int(value.get(field) or 0) for value in selected.values()
+                   for field in ("cycles", "converged", "nonconverged", "failed"))
+    physical_runs = placement_rows[0]["runs"] if placement_rows else 0
+
+    lines = [
+        "% Generated by run_suite.py; requires \\usepackage{booktabs}.",
+        "\\begin{table*}[t]",
+        "  \\centering",
+        f"  \\caption{{Placement quality, cross-model agreement, and mean runtime on the {network}DC sensitivity network.}}",
+        "  \\label{tab:rebuttal_sensitivity}",
+        "  \\normalsize",
+        "  \\setlength{\\tabcolsep}{1pt}",
+        "  \\renewcommand{\\arraystretch}{1.10}",
+        "  \\begin{tabular*}{\\textwidth}{@{\\extracolsep{\\fill}}lcc@{\\hspace{0.2em}}lccr@{}}",
+        "    \\toprule",
+        "    \\multicolumn{3}{c}{Placement quality} & \\multicolumn{4}{c}{Sensitivity and runtime} \\\\",
+        "    \\cmidrule(lr){1-3} \\cmidrule(lr){4-7}",
+        "    Method & CG & Q & Setting & $\\rho$ [range] & Top-1 & BPR/CG/Q/Total \\\\",
+        "    \\midrule",
+    ]
+    for index in range(max(len(placement_rows), len(sensitivity_rows))):
+        placement = placement_rows[index] if index < len(placement_rows) else None
+        sensitivity = sensitivity_rows[index] if index < len(sensitivity_rows) else None
+        if sensitivity and sensitivity["factor"] == "Overall":
+            lines.append("    \\cmidrule(lr){4-7}")
+        method = placement["factor"] if placement else ""
+        cg_exact = f"{placement['cg_exact']}/{placement['runs']}" if placement else ""
+        q_exact = f"{placement['queue_exact']}/{placement['runs']}" if placement else ""
+        setting = ""
+        if sensitivity:
+            setting = sensitivity["factor"]
+            if sensitivity["factor"] != "Overall":
+                setting += f" {sensitivity['levels']}"
+        median = sensitivity.get("spearman_median") if sensitivity else None
+        correlation = "--" if median is None else (
+            f"${median:.2f}\\,[{sensitivity['spearman_min']:.2f},"
+            f"{sensitivity['spearman_max']:.2f}]$"
+        )
+        rate = sensitivity.get("top_1_agreement_rate") if sensitivity else None
+        top_one = "--" if rate is None else (
+            f"{sensitivity['top_1_agreement_count']}/{sensitivity['runs']} "
+            f"({100 * rate:.0f}\\%)"
+        )
+        timing = ""
+        if sensitivity:
+            timing = "/".join(
+                f"{sensitivity[field]:.2f}" for field in (
+                    "mean_bpr_minutes", "mean_cg_minutes",
+                    "mean_queue_minutes", "mean_total_minutes",
+                )
+            )
+        lines.append(
+            f"    {method} & {cg_exact} & {q_exact} & {setting} & "
+            f"{correlation} & {top_one} & {timing} \\\\"
+        )
+    lines.extend([
+        "    \\bottomrule",
+        "  \\end{tabular*}",
+        "  \\vspace{3pt}",
+        "  \\begin{minipage}{0.985\\textwidth}",
+        "    \\footnotesize",
+        f"    \\textit{{Notes:}} Placement quality uses {physical_runs} physical-scenario variants; sensitivity statistics use {len(selected)} selected jobs. Exact denotes equality with the exhaustive objective within $10^{{-9}}$ percentage points; random refers to its expected objective. CG is the congestion game; Q is the queue cycle-state approximation; Top-1 requires the same best charger set. BPR/CG/Q/Total are mean wall minutes; BPR includes fitting only (shared-artifact loading is excluded), and Q includes queue search only (final comparison is excluded). Total is the complete pipeline and additionally includes final comparison and overhead. "
+        f"All {cycles}/{searches} queue searches cycled and are not Nash equilibria. Times are not CPU-hours; BPR was calibrated once and reused by the other jobs.",
+        "  \\end{minipage}",
+        "\\end{table*}",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def export_bundle(results_root, destination, experiment_ids=None):
     """Export compact reviewer-facing tables/figures without raw simulations."""
     root = Path(results_root)
     runs = summarize(root)
     placements, queue_rows, bpr_rows = [], [], []
-    summaries = {}
+    summaries, statuses = {}, {}
     run_dirs = [path.parent for path in sorted(root.glob("*/status.json"))]
     with tempfile.TemporaryDirectory(prefix="evopt-bundle-") as temporary:
         stage = Path(temporary)
         for run_dir in run_dirs:
+            status_path = run_dir / "status.json"
+            statuses[run_dir.name] = json.loads(status_path.read_text())
             summary_path = run_dir / "experiment_summary.json"
             summary = json.loads(summary_path.read_text()) if summary_path.is_file() else {}
             summaries[run_dir.name] = summary
@@ -336,6 +562,18 @@ def export_bundle(results_root, destination):
                     "iterations_p95": stats.get("p95"),
                     "iterations_max": stats.get("max"),
                     "cycle_length_median": value.get("cycle_length_statistics", {}).get("median"),
+                    "final_gap_min_normalized_median": value.get(
+                        "final_gap_statistics", {}
+                    ).get("median"),
+                    "final_gap_mean_normalized_median": value.get(
+                        "final_gap_mean_normalized_statistics", {}
+                    ).get("median"),
+                    "minimum_gap_min_normalized_median": value.get(
+                        "minimum_gap_statistics", {}
+                    ).get("median"),
+                    "minimum_gap_mean_normalized_median": value.get(
+                        "minimum_gap_mean_normalized_statistics", {}
+                    ).get("median"),
                     "route_source": value.get("route_source"),
                     "initialization": value.get("initialization"),
                     "simulator_seed": value.get("simulator_seed"),
@@ -357,11 +595,11 @@ def export_bundle(results_root, destination):
                 })
         run_by_name = {row["run"]: row for row in runs}
         bpr_by_name = {row["run"]: row for row in bpr_rows}
-        paper_rows = []
-        records = {}
+        candidate_records = []
         for run_name, summary in summaries.items():
             config = summary.get("config", {})
-            name = config.get("name", run_name)
+            status = statuses.get(run_name, {})
+            name = config.get("name", status.get("config_name", run_name))
             queue = summary.get("queue_results") or {}
             baselines = queue.get("reviewer_baselines", {})
             qbase = baselines.get("queue", {})
@@ -370,81 +608,82 @@ def export_bundle(results_root, destination):
             qstats = queue.get("ne_statistics", {}).get("status_counts", {})
             correlations = queue.get("cg_queue_correlations", {})
             demand = config.get("scenario_generation", {}).get("demand", {})
-            records[name] = {
-                "run": run_name,
-                "cg_greedy_gap": cgbase.get("greedy", {}).get("regret_pct"),
-                "cg_swap_gap": cgbase.get("single_swap", {}).get("regret_pct"),
-                "queue_greedy_gap": qbase.get("greedy", {}).get("regret_pct"),
-                "queue_swap_gap": qbase.get("single_swap", {}).get("regret_pct"),
+            known_time = sum(float(manifest_row.get(field) or 0) for field in (
+                "bpr_seconds", "cg_seconds", "queue_ne_seconds",
+                "queue_comparison_seconds",
+            ))
+            total_time = manifest_row.get("total_seconds")
+            candidate_records.append({
+                "name": name, "run": run_name,
+                "status": status.get("status", manifest_row.get("status")),
+                "timestamp_utc": status.get("timestamp_utc"),
+                "config_digest": status.get("config_digest"),
+                "cg_strategies": cgbase, "queue_strategies": qbase,
                 "queue_optimum": json.dumps(qbase.get("exhaustive", {}).get("placement")),
                 "cycles": qstats.get("cycle", 0),
                 "converged": qstats.get("converged", 0),
+                "nonconverged": qstats.get("nonconverged", 0),
+                "failed": qstats.get("failed", 0),
                 "pearson": correlations.get("pearson"),
                 "spearman": correlations.get("spearman"),
+                "top_1_agreement": correlations.get("top_1_agreement"),
                 "nodes": manifest_row.get("nodes"), "edges": manifest_row.get("edges"),
-                "total_seconds": manifest_row.get("total_seconds"),
+                "total_seconds": total_time,
                 "bpr_seconds": manifest_row.get("bpr_seconds"),
                 "cg_seconds": manifest_row.get("cg_seconds"),
                 "queue_ne_seconds": manifest_row.get("queue_ne_seconds"),
                 "queue_comparison_seconds": manifest_row.get("queue_comparison_seconds"),
+                "other_seconds": max(0.0, float(total_time) - known_time)
+                if total_time is not None else None,
                 "bpr_fit_status_counts": bpr_by_name.get(run_name, {}).get("fit_status_counts"),
                 "demand": int(demand.get("F1", 0)) + int(demand.get("F2", 0)),
                 "configurations": (summary.get("cg_results") or {}).get("num_configs"),
-            }
-            if str(name).startswith("secondary-plus-scale-"):
-                paper_rows.append({"panel": "A_scaling", "factor": name, **records[name]})
-
-        factor_members = {
-            "candidate/charger budget": ["sensitivity_base", "budget_6_3", "budget_6_4", "budget_7_2", "budget_7_3", "budget_7_4"],
-            "total demand": ["demand_090", "sensitivity_base", "demand_270"],
-            "F2 share": ["f2_share_1_3", "f2_share_1_2", "sensitivity_base"],
-            "OD count": ["sensitivity_base", "od_count_2"],
-            "route budget K": ["routes_k08", "sensitivity_base", "routes_k32"],
-            "route source": ["sensitivity_base", "route_source_cg"],
-            "initialization": ["sensitivity_base", "init_shortest", "init_random"],
-            "NE replications": ["ne_reps_10", "sensitivity_base", "ne_reps_50"],
-            "simulator seed": ["sensitivity_base", "queue_seed_43", "queue_seed_44"],
-        }
-        for factor, names in factor_members.items():
-            values = [records[name] for name in names if name in records]
-            if not values:
-                continue
-            def finite(field):
-                return [float(value[field]) for value in values if value.get(field) is not None]
-            queue_gaps = finite("queue_greedy_gap")
-            swap_gaps = finite("queue_swap_gap")
-            paper_rows.append({
-                "panel": "B_sensitivity", "factor": factor,
-                "levels": ",".join(name for name in names if name in records),
-                "runs": len(values),
-                "greedy_exact_match_rate": (
-                    sum(abs(value) <= 1e-9 for value in queue_gaps) / len(queue_gaps)
-                    if queue_gaps else None
-                ),
-                "swap_exact_match_rate": (
-                    sum(abs(value) <= 1e-9 for value in swap_gaps) / len(swap_gaps)
-                    if swap_gaps else None
-                ),
-                "median_greedy_gap": float(np.median(queue_gaps)) if queue_gaps else None,
-                "maximum_greedy_gap": max(queue_gaps) if queue_gaps else None,
-                "median_swap_gap": float(np.median(swap_gaps)) if swap_gaps else None,
-                "maximum_swap_gap": max(swap_gaps) if swap_gaps else None,
-                "unique_queue_optima": len({value["queue_optimum"] for value in values}),
-                "cycle_rate": (
-                    sum(value["cycles"] for value in values) /
-                    max(1, sum(value["cycles"] + value["converged"] for value in values))
-                ),
-                "pearson_min": min(finite("pearson"), default=None),
-                "pearson_max": max(finite("pearson"), default=None),
-                "spearman_min": min(finite("spearman"), default=None),
-                "spearman_max": max(finite("spearman"), default=None),
             })
+
+        selected = _latest_completed_records(candidate_records, experiment_ids)
+        scaling_rows = []
+        for name, value in selected.items():
+            if not str(name).startswith("secondary-plus-scale-"):
+                continue
+            scaling_rows.append({
+                "panel": "A_scaling", "factor": name,
+                "run": value["run"], "nodes": value.get("nodes"),
+                "edges": value.get("edges"), "demand": value.get("demand"),
+                "configurations": value.get("configurations"),
+                "cg_greedy_gap": value["cg_strategies"].get("greedy", {}).get("regret_pct"),
+                "cg_swap_gap": value["cg_strategies"].get("single_swap", {}).get("regret_pct"),
+                "queue_greedy_gap": value["queue_strategies"].get("greedy", {}).get("regret_pct"),
+                "queue_swap_gap": value["queue_strategies"].get("single_swap", {}).get("regret_pct"),
+                "queue_optimum": value.get("queue_optimum"),
+                "cycles": value.get("cycles"), "converged": value.get("converged"),
+                "pearson": value.get("pearson"), "spearman": value.get("spearman"),
+                "total_seconds": value.get("total_seconds"),
+                "bpr_seconds": value.get("bpr_seconds"),
+                "cg_seconds": value.get("cg_seconds"),
+                "queue_ne_seconds": value.get("queue_ne_seconds"),
+                "queue_comparison_seconds": value.get("queue_comparison_seconds"),
+                "bpr_fit_status_counts": value.get("bpr_fit_status_counts"),
+            })
+        sensitivity_rows = _sensitivity_paper_rows(selected)
+        paper_rows = scaling_rows + sensitivity_rows
+        cohort = {
+            name: {
+                "run": value["run"], "config_digest": value.get("config_digest"),
+                "status": value.get("status"), "timestamp_utc": value.get("timestamp_utc"),
+            }
+            for name, value in sorted(selected.items())
+        }
 
         _write_csv(stage / "runs.csv", runs, ["run", "status", "eligible"])
         _write_csv(stage / "placements.csv", placements, ["run", "model", "placement", "objective"])
         _write_csv(stage / "queue_diagnostics.csv", queue_rows, ["run", "converged", "cycles"])
         _write_csv(stage / "bpr_summary.csv", bpr_rows, ["run", "network_hash", "method"])
         _write_csv(stage / "paper_table.csv", paper_rows, ["panel", "factor", "runs"])
+        atomic_write_json(stage / "reporting_cohort.json", cohort)
+        if sensitivity_rows:
+            (stage / "rebuttal_sensitivity_table.tex").write_text(
+                _render_sensitivity_table_tex(sensitivity_rows, selected)
+            )
 
         try:
             import matplotlib.pyplot as plt
@@ -566,7 +805,10 @@ def main():
     if args.summarize:
         summarize(args.results_root)
         if args.export_bundle:
-            export_bundle(args.results_root, args.export_bundle)
+            export_bundle(
+                args.results_root, args.export_bundle,
+                experiment_ids=[job["id"] for job in jobs],
+            )
         return
     index = args.index
     if index is None and os.environ.get("SLURM_ARRAY_TASK_ID") is not None:
@@ -582,7 +824,10 @@ def main():
     )
     summarize(args.results_root)
     if args.export_bundle:
-        export_bundle(args.results_root, args.export_bundle)
+        export_bundle(
+            args.results_root, args.export_bundle,
+            experiment_ids=[job["id"] for job in jobs],
+        )
     if failures:
         failed_ids = ", ".join(job_id for job_id, _exc in failures)
         raise SystemExit(f"Suite finished with {len(failures)} failed experiment(s): {failed_ids}")

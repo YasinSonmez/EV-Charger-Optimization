@@ -529,6 +529,12 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
             ),
             'final_gap_statistics': queue_manifest.get('final_gap_statistics', {}),
             'minimum_gap_statistics': queue_manifest.get('minimum_gap_statistics', {}),
+            'final_gap_mean_normalized_statistics': queue_manifest.get(
+                'final_gap_mean_normalized_statistics', {}
+            ),
+            'minimum_gap_mean_normalized_statistics': queue_manifest.get(
+                'minimum_gap_mean_normalized_statistics', {}
+            ),
             'configuration_statuses': queue_manifest.get(
                 'configuration_statuses', {}
             ),

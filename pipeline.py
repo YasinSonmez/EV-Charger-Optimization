@@ -756,15 +756,28 @@ def _plot_placement_search_comparison(cg_search, queue_search, output_path):
     print(f"Placement search comparison saved to {output_path}")
 
 
-def _save_convergence_csv(convergence_data, path):
-    """Save NE convergence data (per-config, per-iteration diff) to CSV."""
+def _save_convergence_csv(convergence_data, path, mean_normalized_data=None):
+    """Save official and diagnostic NE gaps for every configuration/iteration."""
     import csv
+    mean_normalized_data = mean_normalized_data or {}
     with open(path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['config', 'iteration', 'diff'])
+        writer.writerow([
+            'config', 'iteration', 'diff',
+            'min_normalized_gap', 'mean_normalized_gap',
+        ])
         for config_str, diffs in convergence_data.items():
+            mean_diffs = mean_normalized_data.get(config_str, [])
             for i, d in enumerate(diffs):
-                writer.writerow([config_str, i, d])
+                if i < len(mean_diffs):
+                    mean_gap = mean_diffs[i]
+                else:
+                    value = float(d)
+                    mean_gap = (
+                        2.0 * value / (2.0 + value)
+                        if np.isfinite(value) and value >= 0 else value
+                    )
+                writer.writerow([config_str, i, d, d, mean_gap])
 
 
 def _plot_pruning_phases(network_stages, output_path, node_count=None, edge_count=None,
@@ -1448,14 +1461,29 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
                 ])
             final_gap_stats = ne_stats.get('final_gap_statistics', {})
             minimum_gap_stats = ne_stats.get('minimum_gap_statistics', {})
+            final_mean_gap_stats = ne_stats.get(
+                'final_gap_mean_normalized_statistics', {}
+            )
+            minimum_mean_gap_stats = ne_stats.get(
+                'minimum_gap_mean_normalized_statistics', {}
+            )
             if final_gap_stats.get('count'):
                 lines.extend([
                     "",
-                    "Final relative gaps had median "
+                    "Final minimum-normalized gaps had median "
                     f"`{final_gap_stats['median']:.4f}`, p95 "
                     f"`{final_gap_stats['p95']:.4f}`, and maximum "
                     f"`{final_gap_stats['max']:.4f}`. Median minimum attained gap was "
                     f"`{minimum_gap_stats.get('median', float('nan')):.4f}`.",
+                ])
+            if final_mean_gap_stats.get('count'):
+                lines.extend([
+                    "",
+                    "Final mean-normalized diagnostic gaps had median "
+                    f"`{final_mean_gap_stats['median']:.4f}`, p95 "
+                    f"`{final_mean_gap_stats['p95']:.4f}`, and maximum "
+                    f"`{final_mean_gap_stats['max']:.4f}`. Median minimum attained "
+                    f"diagnostic gap was `{minimum_mean_gap_stats.get('median', float('nan')):.4f}`.",
                 ])
             lines.append("")
         if queue_results.get('timing', {}).get('paired_placement_cache'):
@@ -2069,7 +2097,11 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
             )
 
         if convergence_data:
-            _save_convergence_csv(convergence_data, os.path.join(experiment_dir, 'queue', 'ne_convergence.csv'))
+            _save_convergence_csv(
+                convergence_data,
+                os.path.join(experiment_dir, 'queue', 'ne_convergence.csv'),
+                queue_manifest.get('convergence_history_mean_normalized', {}),
+            )
             print(f"Convergence data saved to {experiment_dir}/queue/ne_convergence.csv")
             _plot_ne_convergence(
                 convergence_data,
