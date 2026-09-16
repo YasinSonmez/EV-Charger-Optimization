@@ -12,6 +12,7 @@ import copy
 import shutil
 import zipfile
 import tempfile
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -511,8 +512,44 @@ def _render_sensitivity_table_tex(rows, selected):
     return "\n".join(lines)
 
 
-def export_bundle(results_root, destination, experiment_ids=None):
-    """Export compact reviewer-facing tables/figures without raw simulations."""
+def _analysis_run_files(run_dir):
+    """Yield reviewable run artifacts without descending into simulation traces."""
+    visual_suffixes = {".png", ".jpg", ".jpeg", ".svg"}
+    data_suffixes = {".json", ".csv", ".md", ".txt", ".tex", ".gz"}
+    for path in sorted(run_dir.iterdir()):
+        if path.is_symlink():
+            continue
+        if path.is_file() and (path.suffix.lower() in visual_suffixes | data_suffixes
+                               or path.name == "all_optimization_results.pkl"):
+            yield path
+        elif path.is_dir() and path.name in {"network", "bpr", "queue"}:
+            for item in sorted(path.iterdir()):
+                if item.is_symlink() or not item.is_file():
+                    continue
+                if path.name == "queue" and item.name == "NE_path_assignments.pkl":
+                    yield item
+                elif item.suffix.lower() in data_suffixes | visual_suffixes:
+                    # The canonical network is already included under network/.
+                    if path.name != "queue" or not item.name.startswith(("canonical_nodes", "canonical_edges")):
+                        yield item
+        elif path.is_dir() and (path.name == "plots" or path.name.startswith(("config_", "BEST_config_"))):
+            for item in sorted(path.rglob("*")):
+                if not item.is_symlink() and item.is_file() and item.suffix.lower() in visual_suffixes:
+                    yield item
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def export_bundle(results_root, destination, experiment_ids=None, profile="compact"):
+    """Export compact tables or a trace-free, investigation-ready analysis ZIP."""
+    if profile not in {"compact", "analysis"}:
+        raise ValueError(f"Unknown bundle profile: {profile}")
     root = Path(results_root)
     runs = summarize(root)
     placements, queue_rows, bpr_rows = [], [], []
@@ -752,11 +789,33 @@ def export_bundle(results_root, destination, experiment_ids=None):
                     target = stage / "provenance" / run_dir.name
                     target.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, target / filename)
+        analysis_files = []
+        if profile == "analysis":
+            for run_dir in run_dirs:
+                for source in _analysis_run_files(run_dir):
+                    # Never archive links to files outside the experiment directory.
+                    if source.is_symlink():
+                        continue
+                    analysis_files.append((source, Path("runs") / run_dir.name / source.relative_to(run_dir)))
+            _write_csv(stage / "bundle_inventory.csv", [
+                {"run": archive_path.parts[1], "path": str(archive_path),
+                 "uncompressed_bytes": source.stat().st_size}
+                for source, archive_path in analysis_files
+            ], ["run", "path", "uncompressed_bytes"])
+            (stage / "BUNDLE_README.txt").write_text(
+                "Analysis bundle: generated suite tables and figures are at the ZIP root; "
+                "per-run artifacts are under runs/<run-id>/. Includes all run figures, "
+                "network tables, BPR fits/observations, CG aggregate results, queue "
+                "assignments/diagnostics, reports, and configurations. Excludes raw "
+                "per-link BPR sweeps, queue traffic traces, and CG checkpoints. "
+                "Pickle files must only be opened from trusted sources.\n"
+            )
         checksum = {}
         for path in sorted(stage.rglob("*")):
             if path.is_file():
-                import hashlib
-                checksum[str(path.relative_to(stage))] = hashlib.sha256(path.read_bytes()).hexdigest()
+                checksum[str(path.relative_to(stage))] = _sha256_file(path)
+        for source, archive_path in analysis_files:
+            checksum[str(archive_path)] = _sha256_file(source)
         atomic_write_json(stage / "checksums.json", checksum)
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -764,9 +823,12 @@ def export_bundle(results_root, destination, experiment_ids=None):
             for path in sorted(stage.rglob("*")):
                 if path.is_file():
                     archive.write(path, path.relative_to(stage))
-    if destination.stat().st_size > 25 * 1024 * 1024:
+            for source, archive_path in analysis_files:
+                archive.write(source, archive_path)
+    if profile == "compact" and destination.stat().st_size > 25 * 1024 * 1024:
         raise ValueError(f"Export bundle exceeds 25 MiB: {destination}")
-    print(f"Exported compact result bundle: {destination}")
+    print(f"Exported {profile} result bundle: {destination} "
+          f"({len(analysis_files)} per-run artifacts, {destination.stat().st_size / 1024**2:.1f} MiB)")
 
 
 def main():
@@ -781,6 +843,8 @@ def main():
                         help="record a failed job and continue with later suite jobs")
     parser.add_argument("--summarize", action="store_true")
     parser.add_argument("--export-bundle")
+    parser.add_argument("--bundle-profile", choices=("compact", "analysis"), default="compact",
+                        help="analysis includes per-run figures and key data, but excludes simulation traces")
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--print-count", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--first-pending", action="store_true", help=argparse.SUPPRESS)
@@ -808,6 +872,7 @@ def main():
             export_bundle(
                 args.results_root, args.export_bundle,
                 experiment_ids=[job["id"] for job in jobs],
+                profile=args.bundle_profile,
             )
         return
     index = args.index
@@ -827,6 +892,7 @@ def main():
         export_bundle(
             args.results_root, args.export_bundle,
             experiment_ids=[job["id"] for job in jobs],
+            profile=args.bundle_profile,
         )
     if failures:
         failed_ids = ", ".join(job_id for job_id, _exc in failures)

@@ -283,3 +283,52 @@ def test_export_bundle_emits_tex_and_selected_digest(monkeypatch, tmp_path):
         paper_csv = archive.read("paper_table.csv").decode().splitlines()[0]
         assert "cg_exact" in paper_csv and "mean_queue_minutes" in paper_csv
         assert "median_greedy_gap" not in paper_csv and "cycle_rate" not in paper_csv
+
+
+def test_analysis_bundle_keeps_diagnostics_and_figures_without_trace_trees(monkeypatch, tmp_path):
+    monkeypatch.setenv("MPLBACKEND", "Agg")
+    root = tmp_path / "results"
+    run = root / "example-123"
+    files = {
+        "status.json": '{"status":"failed","failure_reason":"bounded check"}',
+        "original_config.json": "{}",
+        "resolved_config.json": "{}",
+        "experiment_summary.json": "{}",
+        "report.md": "# Partial result\n",
+        "plots/pruning_phases.png": "image",
+        "BEST_config_1/reconstruction/flow_reconstructions.png": "image",
+        "network/nodes.csv": "node_id\n1\n",
+        "network/edges.csv": "link_id\n2\n",
+        "bpr/fitter_results.csv": "link_id,R^2\n2,0.9\n",
+        "bpr/bpr_observations.csv.gz": "compressed observations",
+        "bpr/link_sweeps_capacity_fraction/link_2/trace.csv": "large trace",
+        "queue/ne_convergence.csv": "iteration,gap\n1,0.5\n",
+        "queue/NE_path_assignments.pkl": "aggregate assignment",
+        "queue/traffic_outputs/config_1/trace.csv": "large trace",
+        "all_optimization_results.pkl": "aggregate CG",
+        "cg_checkpoints/placement_1.pkl": "checkpoint",
+    }
+    for relative, content in files.items():
+        target = run / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+
+    analysis_zip = tmp_path / "analysis.zip"
+    export_bundle(root, analysis_zip, profile="analysis")
+    with zipfile.ZipFile(analysis_zip) as archive:
+        names = set(archive.namelist())
+        prefix = f"runs/{run.name}/"
+        for relative in files:
+            if relative.startswith(("bpr/link_sweeps", "queue/traffic_outputs", "cg_checkpoints")):
+                assert prefix + relative not in names
+            else:
+                assert prefix + relative in names
+        assert "bundle_inventory.csv" in names
+        checksums = json.loads(archive.read("checksums.json"))
+        assert prefix + "bpr/fitter_results.csv" in checksums
+        assert archive.testzip() is None
+
+    compact_zip = tmp_path / "compact.zip"
+    export_bundle(root, compact_zip)
+    with zipfile.ZipFile(compact_zip) as archive:
+        assert not any(name.startswith(prefix) for name in archive.namelist())

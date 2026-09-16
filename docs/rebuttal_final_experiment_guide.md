@@ -91,6 +91,27 @@ python run_suite.py \
 
 The ZIP contains compact run, placement, queue, BPR, and paper-table CSVs; paper PNGs; resolved configurations; status records; provenance; and checksums. It excludes caches, simulation traces, BPR observations, pickles, and checkpoints and is rejected if it exceeds 25 MiB.
 
+For a downloadable investigation bundle with all run figures and the key underlying
+data, use the same command with `--bundle-profile analysis` and a different ZIP name:
+
+```bash
+python run_suite.py \
+  --manifest configs/rebuttal/final/sensitivity_suite.json \
+  --results-root results/rebuttal/sensitivity \
+  --summarize --bundle-profile analysis \
+  --export-bundle rebuttal_sensitivity_analysis.zip
+```
+
+The analysis ZIP also includes each run's reports, configurations, network CSVs,
+BPR fit table and compressed observations, CG aggregate optimization results,
+queue assignment/convergence/comparison data, and all PNG/JPEG/SVG figures,
+including per-placement figures. `bundle_inventory.csv` lists included files
+and sizes, and `checksums.json` verifies their contents. It does **not** recurse
+into per-link BPR sweeps, queue traffic-output traces, or CG placement
+checkpoints. Unlike the compact export, it has no 25 MiB limit; inspect its
+size before transfer. Aggregate pickle files are for trusted local analysis
+only, not safe to load from untrusted sources.
+
 ## Interpretation limits
 
 - Nested DC windows support computational scaling claims, not geographic generalization.
