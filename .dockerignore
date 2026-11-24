@@ -7,14 +7,13 @@
 !build_liblsp.sh
 !pipeline.py
 !run_suite.py
-!validate_outputs.py
 !src/
 !src/**
 !queue_sim/
 !queue_sim/**
 !configs/
-!configs/rebuttal/
-!configs/rebuttal/**
+!configs/paper_r2/
+!configs/paper_r2/**
 
 **/__pycache__/
 **/*.py[cod]

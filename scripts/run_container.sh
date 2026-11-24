@@ -25,6 +25,9 @@ Options:
   --pruning-sweep                Run pruning sweep (single config only)
   --summarize                    Summarize suite results (manifest only)
   --validate-only                Validate every suite config (manifest only)
+  --export-bundle NAME.zip       Write a results ZIP into the results directory
+                                 after the suite (or with --summarize)
+  --bundle-profile compact|analysis  ZIP contents (default: compact)
 
 Environment equivalents: EVOPT_IMAGE, EVOPT_ENGINE, EVOPT_EXECUTION_MODE,
 EVOPT_PROJECT_DIR, EVOPT_RESULTS_DIR, EVOPT_CACHE_DIR, and EVOPT_CPUS.
@@ -73,6 +76,8 @@ while [[ $# -gt 0 ]]; do
             pipeline_flags+=("$1"); single_only=true; shift ;;
         --summarize) suite_flags+=(--summarize); suite_only=true; shift ;;
         --validate-only) suite_flags+=(--validate-only); suite_only=true; shift ;;
+        --export-bundle) suite_flags+=(--export-bundle "/results/$(basename "$2")"); suite_only=true; shift 2 ;;
+        --bundle-profile) suite_flags+=(--bundle-profile "$2"); suite_only=true; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac

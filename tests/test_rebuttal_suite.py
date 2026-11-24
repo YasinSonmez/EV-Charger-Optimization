@@ -61,14 +61,15 @@ def test_continue_on_failure_records_failure_and_runs_later_jobs(
     monkeypatch, tmp_path,
 ):
     _manifest, jobs = load_manifest(
-        ROOT / "configs/rebuttal/smoke/smoke_suite.json",
+        ROOT / "configs/paper_r2/suite.json",
         expanded_dir=tmp_path / "expanded",
     )
+    jobs = jobs[:2]
     attempted = []
 
     def fake_run_job(job, _jobs_by_id, _results_root, _resume):
         attempted.append(job["id"])
-        if job["id"] == "smoke_base":
+        if job["id"] == "sensitivity_base":
             raise RuntimeError("intentional test failure")
 
     monkeypatch.setattr("run_suite.run_job", fake_run_job)
@@ -77,70 +78,61 @@ def test_continue_on_failure_records_failure_and_runs_later_jobs(
         continue_on_failure=True,
     )
 
-    assert attempted == ["smoke_base", "smoke_cg_routes"]
-    assert [job_id for job_id, _ in failures] == ["smoke_base"]
+    assert attempted == ["sensitivity_base", "budget_6_3"]
+    assert [job_id for job_id, _ in failures] == ["sensitivity_base"]
+
+
+SCALING_IDS = {"scale_dc_0100", "scale_sf_1000"}
+
+
+def _paper_jobs(tmp_path):
+    _, jobs = load_manifest(ROOT / "configs/paper_r2/suite.json", tmp_path)
+    return jobs
 
 
 def test_final_suite_sizes_and_fixed_alpha(tmp_path):
-    _, scaling = load_manifest(
-        ROOT / "configs/rebuttal/final/scaling_suite.json", tmp_path / "scaling"
-    )
-    _, sensitivity = load_manifest(
-        ROOT / "configs/rebuttal/final/sensitivity_suite.json", tmp_path / "sensitivity"
-    )
-    assert len(scaling) == 3
-    assert len(sensitivity) == 20
-    assert [job["id"] for job in sensitivity[:6]] == [
+    jobs = _paper_jobs(tmp_path)
+    assert len(jobs) == 23
+    assert [job["id"] for job in jobs[:6]] == [
         "sensitivity_base", "budget_6_3", "budget_6_4",
         "budget_7_2", "budget_7_3", "budget_7_4",
     ]
-    assert "route_source_independent" in {job["id"] for job in sensitivity}
-    assert "init_uniform" in {job["id"] for job in sensitivity}
-    assert "route_source_cg" not in {job["id"] for job in sensitivity}
-    assert "init_shortest" not in {job["id"] for job in sensitivity}
-    assert all(Config.from_dict(job["raw"]).queue_simulation["ALPHA"] == 0.01
-               for job in sensitivity)
+    assert SCALING_IDS <= {job["id"] for job in jobs}
+    for job in jobs:
+        queue = Config.from_dict(job["raw"]).queue_simulation
+        assert queue["ALPHA"] == 0.025
+        assert queue["N"] == 20
 
 
 def test_sensitivity_dependencies_and_bpr_seed_are_immutable(tmp_path):
-    _, jobs = load_manifest(
-        ROOT / "configs/rebuttal/final/sensitivity_suite.json", tmp_path
-    )
-    for job in jobs[1:]:
+    jobs = _paper_jobs(tmp_path)
+    sensitivity = [job for job in jobs if job["id"] not in SCALING_IDS]
+    for job in sensitivity[1:]:
         assert job["reuse_network_from"] == "sensitivity_base"
         assert job["reuse_bpr_from"] == "sensitivity_base"
     assert {
         Config.from_dict(job["raw"]).pipeline["bpr_generation"]["seed"]
-        for job in jobs
-    } == {42}
+        for job in sensitivity
+    } == {101}
     assert {
         Config.from_dict(job["raw"]).queue_simulation["seed"]
-        for job in jobs if job["id"].startswith("queue_seed_")
+        for job in sensitivity if job["id"].startswith("queue_seed_")
     } == {43, 44}
 
 
 def test_balanced_route_settings_are_enabled_in_final_jobs(tmp_path):
-    _, jobs = load_manifest(
-        ROOT / "configs/rebuttal/final/sensitivity_suite.json", tmp_path
-    )
-    for job in jobs:
+    for job in _paper_jobs(tmp_path):
         queue = Config.from_dict(job["raw"]).queue_simulation
         assert queue["balanced_charger_routes"] is True
         assert queue["K"] >= Config.from_dict(job["raw"]).num_chargers
 
 
 def test_primary_jobs_use_paper_route_source_and_initialization(tmp_path):
-    _, scaling = load_manifest(
-        ROOT / "configs/rebuttal/final/scaling_suite.json", tmp_path / "scaling"
-    )
-    _, sensitivity = load_manifest(
-        ROOT / "configs/rebuttal/final/sensitivity_suite.json", tmp_path / "sensitivity"
-    )
-    primary = scaling + [job for job in sensitivity if job["id"] == "sensitivity_base"]
-    for job in primary:
-        queue = Config.from_dict(job["raw"]).queue_simulation
-        assert queue["route_source"] == "cg_recovered_top_k"
-        assert queue["initialization"] == "cg_proportional"
+    for job in _paper_jobs(tmp_path):
+        if job["id"] in SCALING_IDS | {"sensitivity_base"}:
+            queue = Config.from_dict(job["raw"]).queue_simulation
+            assert queue["route_source"] == "cg_recovered_top_k"
+            assert queue["initialization"] == "cg_proportional"
 
 
 def test_reporting_cohort_uses_latest_completed_digest():

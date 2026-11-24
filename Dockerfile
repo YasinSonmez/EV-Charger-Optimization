@@ -40,6 +40,6 @@ ENV CONDA_DEFAULT_ENV=evopt \
 
 # Verify the library loads
 RUN conda run -n evopt python -c "from queue_sim import Runner; print('Queue sim library OK')"
-RUN conda run -n evopt python run_suite.py --manifest configs/rebuttal/suite.json --validate-only
+RUN conda run -n evopt python run_suite.py --manifest configs/paper_r2/suite.json --validate-only
 
 ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "evopt", "python", "pipeline.py"]

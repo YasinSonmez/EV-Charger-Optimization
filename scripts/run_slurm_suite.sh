@@ -14,7 +14,7 @@ set -euo pipefail
 : "${EVOPT_RESULTS_DIR:?Set EVOPT_RESULTS_DIR to persistent result storage}"
 : "${EVOPT_CACHE_DIR:?Set EVOPT_CACHE_DIR to persistent OSM cache storage}"
 
-SUITE_MANIFEST="${SUITE_MANIFEST:-configs/rebuttal/suite.json}"
+SUITE_MANIFEST="${SUITE_MANIFEST:-configs/paper_r2/suite.json}"
 SUITE_INDEX="${SUITE_INDEX:?Set SUITE_INDEX for the chained suite job}"
 EVOPT_EXECUTION_MODE="${EVOPT_EXECUTION_MODE:-workspace}"
 mkdir -p "$EVOPT_RESULTS_DIR" "$EVOPT_CACHE_DIR"
