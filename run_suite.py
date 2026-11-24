@@ -735,8 +735,9 @@ def export_bundle(results_root, destination, experiment_ids=None, profile="compa
                          if row["model"] == model and row["strategy"] == method]
                         for method in methods
                     ]
-                    axis.boxplot(values, tick_labels=[value.replace('_', '\n') for value in methods],
-                                 showfliers=False)
+                    axis.boxplot(values, showfliers=False)
+                    axis.set_xticks(range(1, len(methods) + 1))
+                    axis.set_xticklabels([value.replace('_', '\n') for value in methods])
                     axis.axhline(0, color="black", linewidth=.8)
                     axis.set_title("Congestion game" if model == "congestion_game" else "Queue simulation")
                     axis.tick_params(axis="x", labelrotation=25)

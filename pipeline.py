@@ -597,10 +597,27 @@ def load_or_fit_model(data_path="data/traffic_data.csv", cache_path="data/cached
     return pandas_df, model_fitter
 
 
-def _plot_objective_comparison(cg_results, queue_results, output_path):
-    """Plot paired placement objectives and cross-model agreement."""
+def _plot_objective_comparison(cg_results, queue_results, output_path,
+                               candidate_labels=None):
+    """Plot paired placement objectives and cross-model agreement.
+
+    ``candidate_labels`` optionally maps node ids to candidate names (C1, C2,
+    ...).  When provided, the left panel's tick labels use the candidate names
+    prefixed by a configuration number, and the right panel annotates each
+    point with only that number so the two panels can be matched visually.
+    """
     if not cg_results or not queue_results:
         return
+
+    def placement_label(value):
+        if candidate_labels:
+            tokens = [candidate_labels.get(int(node), str(node)) for node in value]
+            tokens.sort(key=lambda token: int(token[1:])
+                        if token.startswith("C") and token[1:].isdigit()
+                        else 10 ** 9)
+        else:
+            tokens = [str(node) for node in value]
+        return '+'.join(tokens)
 
     target_size = int(queue_results.get('config', {}).get('num_stations', 0))
     cg_configs = [
@@ -623,7 +640,8 @@ def _plot_objective_comparison(cg_results, queue_results, output_path):
     cg = np.asarray([cg_map[value] for value in placements], dtype=float)
     queue = np.asarray([q_map[value] for value in placements], dtype=float)
     cg_norm, queue_norm = cg / np.min(cg), queue / np.min(queue)
-    labels = ['+'.join(map(str, value)) for value in placements]
+    labels = [placement_label(value) for value in placements]
+    numbered = [f"{index + 1}: {label}" for index, label in enumerate(labels)]
     x = np.arange(len(placements))
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.5, 4.2), constrained_layout=True)
@@ -637,7 +655,7 @@ def _plot_objective_comparison(cg_results, queue_results, output_path):
                 label='Queue simulation', zorder=2)
     ax1.axhline(1.0, color=COLORS['mid'], linestyle=':', linewidth=0.9)
     ax1.set_xticks(x)
-    ax1.set_xticklabels(labels, rotation=45, ha='right')
+    ax1.set_xticklabels(numbered, rotation=45, ha='right')
     ax1.set_ylabel('Objective / model-specific minimum')
     ax1.set_xlabel('Charger placement (ordered by CG objective)')
     ax1.set_title('Relative objective by placement')
@@ -651,8 +669,9 @@ def _plot_objective_comparison(cg_results, queue_results, output_path):
     pad = max(0.01, 0.06 * (hi - lo))
     ax2.plot([lo - pad, hi + pad], [lo - pad, hi + pad], color=COLORS['mid'],
              linestyle='--', linewidth=0.9, label='Equal relative objective')
-    for cx, qx, label in zip(cg_norm, queue_norm, labels):
-        ax2.annotate(label, (cx, qx), xytext=(4, 3), textcoords='offset points', fontsize=7)
+    for index, (cx, qx) in enumerate(zip(cg_norm, queue_norm)):
+        ax2.annotate(str(index + 1), (cx, qx), xytext=(4, 3),
+                     textcoords='offset points', fontsize=7)
     corr = queue_results.get('cg_queue_correlations', {})
     pearson, spearman = corr.get('pearson'), corr.get('spearman')
     annotation = (
@@ -2123,8 +2142,17 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
         timing_recorder.add('queue_comparison', timing['queue_comparison'])
 
         if cg_results and queue_results:
-            _plot_objective_comparison(cg_results, queue_results,
-                                       os.path.join(plot_dir, 'objective_comparison.png'))
+            candidate_labels = None
+            if scenario_metadata:
+                candidate_labels = {
+                    int(candidate['node_id']): f"C{index + 1}"
+                    for index, candidate in enumerate(
+                        scenario_metadata.get('candidates', []))
+                }
+            _plot_objective_comparison(
+                cg_results, queue_results,
+                os.path.join(plot_dir, 'objective_comparison.png'),
+                candidate_labels=candidate_labels)
             _plot_placement_search_comparison(
                 cg_results.get('placement_search'),
                 queue_results.get('placement_search'),

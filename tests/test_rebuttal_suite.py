@@ -19,6 +19,12 @@ from run_suite import (
     select_jobs,
 )
 from src.config import Config
+from paper_tables import (
+    EXACT_TOLERANCE_PERCENT,
+    _placement_rows,
+    _pooled_robustness,
+    render_robustness_table,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -276,6 +282,8 @@ def test_export_bundle_emits_tex_and_selected_digest(monkeypatch, tmp_path):
     with zipfile.ZipFile(destination) as archive:
         names = set(archive.namelist())
         assert "rebuttal_sensitivity_table.tex" in names
+        assert "placement_quality.png" in names
+        assert "robustness_scalability.png" in names
         cohort = json.loads(archive.read("reporting_cohort.json"))
         assert cohort["sensitivity_base"]["config_digest"] == "newdigest"
         tex = archive.read("rebuttal_sensitivity_table.tex").decode()
@@ -332,3 +340,41 @@ def test_analysis_bundle_keeps_diagnostics_and_figures_without_trace_trees(monke
     export_bundle(root, compact_zip)
     with zipfile.ZipFile(compact_zip) as archive:
         assert not any(name.startswith(prefix) for name in archive.namelist())
+
+
+def test_paper_tables_use_recorded_alpha_and_numerical_exact_tolerance():
+    strategies_cg = {
+        strategy: {"objective": 100.0 * (1 + 0.0019 / 100)}
+        for strategy, _label in REPORTING_STRATEGIES
+    }
+    strategies_queue = {
+        strategy: {"objective": 100.0 * (1 + 0.0021 / 100)}
+        for strategy, _label in REPORTING_STRATEGIES
+    }
+    strategies_cg["exhaustive"] = {"objective": 100.0}
+    strategies_queue["exhaustive"] = {"objective": 100.0}
+    record = {
+        "name": "sensitivity_base",
+        "cg_strategies": strategies_cg,
+        "queue_strategies": strategies_queue,
+        "cg_objectives": [100.0],
+        "converged": 1,
+        "cycles": 0,
+        "nonconverged": 0,
+        "failed": 0,
+        "spearman": 0.5,
+        "pearson": 0.6,
+        "top_1_agreement": True,
+        "alpha": 0.025,
+    }
+
+    rows, count = _placement_rows({"sensitivity_base": record})
+    assert count == 1
+    assert EXACT_TOLERANCE_PERCENT == pytest.approx(0.002)
+    assert rows[0]["cg_exact"] == 1
+    assert rows[0]["queue_exact"] == 0
+
+    pooled = _pooled_robustness({"sensitivity_base": record})
+    tex = render_robustness_table([], pooled, 1, "")
+    assert "$\\alpha=2.5\\%$" in tex
+    assert "1\\% minimum-cost-normalized" not in tex
