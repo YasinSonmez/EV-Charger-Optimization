@@ -34,6 +34,8 @@ def test_runner_assigns_all_od_type_groups(tmp_path):
     od.to_csv(od_path, index=False)
 
     runner = Runner(str(edges_path), str(nodes_path), str(od_path), seed=42)
+    # F2 route records name node 1, so a station must exist there.
+    runner.create_EV_charging_station_at_node(1, 250, 250, 250, 0)
     data = {
         (0, 2): {
             'no charging type': [{'path': [0, 1, 2], 'flow': 1}],

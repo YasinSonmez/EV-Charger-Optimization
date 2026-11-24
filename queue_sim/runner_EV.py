@@ -885,6 +885,20 @@ class Runner:
         self.ch_routes = []
         self.route_groups = []
         self.route_agent_ids = {}
+        # The station model matches agents by simulator station id, while
+        # route records name the charger by its road node id.
+        station_id_by_node = {
+            int(station.ent_ex_node_id): station_id
+            for station_id, station in self.sim.all_charging_stations.items()
+        }
+        # Charging adds one charge unit per one-second step, so an unused
+        # charging route's cost must include this dwell to be comparable with
+        # the observed door-to-door time of used charging routes.
+        self.nominal_charging_seconds = max(
+            [float(agent.target_charge - agent.current_charge)
+             for agent in self.sim.all_agents.values() if agent.need_to_charge],
+            default=0.0,
+        )
 
         def normalize_key(value):
             if isinstance(value, str):
@@ -971,7 +985,12 @@ class Runner:
                     agent.route_group_key = (od, vehicle_type)
                     agent.route_index = route_index
                     if vehicle_type == 'F2':
-                        agent.go_to_station_id = entries[route_index].get('station node')
+                        station_node = int(entries[route_index].get('station node'))
+                        if station_node not in station_id_by_node:
+                            raise ValueError(
+                                f'No charging station was created at node {station_node}'
+                            )
+                        agent.go_to_station_id = station_id_by_node[station_node]
                     group['agent_ids'].append(agent.aid)
                     assigned_agent_ids.add(agent.aid)
                     group['route_agent_ids'][route_index].append(agent.aid)
@@ -1028,7 +1047,7 @@ class Runner:
                             else link.fft
                         )
                     if group['vehicle_type'] == 'F2':
-                        travel_time += float(group['entries'][route_index].get('station_cost', 0.0) or 0.0)
+                        travel_time += float(getattr(self, 'nominal_charging_seconds', 0.0))
                 details.setdefault(key, []).append({
                     'route_id': group.get('route_ids', [])[route_index]
                     if route_index < len(group.get('route_ids', [])) else None,

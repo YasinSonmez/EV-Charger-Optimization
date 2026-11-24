@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import pickle
 import time
@@ -34,6 +35,11 @@ from queue_sim.route_library import (
 
 
 CYCLE_APPROXIMATION_STATUS = 'approximate_cycle_state'
+CAP_APPROXIMATION_STATUS = 'approximate_iteration_cap'
+APPROXIMATION_STATUSES = (CYCLE_APPROXIMATION_STATUS, CAP_APPROXIMATION_STATUS)
+# Bump when queue costs or the retained-state rule change, so checkpoints
+# produced by an older method are never reused on resume.
+QUEUE_METHOD_VERSION = 'v2-station-routing-lowest-gap'
 
 
 def _numeric_summary(values):
@@ -57,7 +63,7 @@ def _is_cycle_termination(result):
     """Return whether a saved result terminated by repeating an assignment."""
     if not isinstance(result, dict):
         return False
-    if result.get('status') == CYCLE_APPROXIMATION_STATUS:
+    if result.get('status') in APPROXIMATION_STATUSES:
         return True
     reason = result.get('termination_reason') or result.get('failure_reason') or ''
     return str(reason).startswith('assignment cycle detected at iteration ')
@@ -70,10 +76,11 @@ def _promote_cycle_result(result, *, gap_verified=False):
         or result.get('failure_reason')
         or 'assignment cycle detected'
     )
-    result['status'] = CYCLE_APPROXIMATION_STATUS
+    if result.get('status') not in APPROXIMATION_STATUSES:
+        result['status'] = CYCLE_APPROXIMATION_STATUS
     result['converged'] = False
     result['approximate_equilibrium'] = True
-    result['approximation_method'] = 'current_assignment_at_cycle_detection'
+    result['approximation_method'] = 'lowest_gap_visited_state'
     result['exact_ne_eligible'] = False
     result['termination_reason'] = reason
     result['failure_reason'] = None
@@ -81,12 +88,32 @@ def _promote_cycle_result(result, *, gap_verified=False):
     return result
 
 
+def _retain_lowest_gap_state(state):
+    """Keep the visited assignment with the smallest measured gap.
+
+    Every visited assignment was simulated and has a recorded gap, so this
+    selects the best epsilon-approximate equilibrium found by the search.  For
+    a converged search this is the final state; for cycles or the iteration
+    cap it replaces the arbitrary state at termination.
+    """
+    best = state.get('best')
+    if best is None:
+        return
+    state['assignments_no'] = copy.deepcopy(best['assignments_no'])
+    state['assignments_ch'] = copy.deepcopy(best['assignments_ch'])
+    state['final_details'] = best['route_metrics']
+    state['final_gap_override'] = best['gap']
+    state['final_gap_mean_normalized_override'] = best['mean_normalized_gap']
+    state['retained_iteration'] = best['iteration']
+    state['retained_state_gap_verified'] = True
+
+
 def _write_queue_manifest(path, manifest, assignments):
     """Update manifest quality fields from the assignment result contract."""
     approximate = {
         key: value.get('termination_reason')
         for key, value in assignments.items()
-        if value.get('status') == CYCLE_APPROXIMATION_STATUS
+        if value.get('status') in APPROXIMATION_STATUSES
     }
     nonconverged = {
         key: value.get('failure_reason') or value.get('termination_reason')
@@ -97,6 +124,7 @@ def _write_queue_manifest(path, manifest, assignments):
         key: (
             'converged' if value.get('converged', False)
             else 'cycle' if value.get('status') == CYCLE_APPROXIMATION_STATUS
+            else 'nonconverged' if value.get('status') == CAP_APPROXIMATION_STATUS
             else 'failed' if value.get('status') == 'failed'
             else 'nonconverged'
         )
@@ -241,7 +269,6 @@ def _route_record(route, od, route_index):
         'route_id': route.get('route_id', f"{od[0]}_{od[1]}_F2_{route.get('charger')}_{route_index}"),
         'path': path, 'link_ids': link_ids, 'flow': route['flow'],
         'station node': int(route['charger']),
-        'station_cost': route.get('station_cost', 0.0),
     }
 
 
@@ -724,6 +751,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
     input_paths = (nodes_path, edges_path, od_path)
     configs = _expanded_queue_configs(config, data)
     queue_identity = {
+        'queue_method_version': QUEUE_METHOD_VERSION,
         'network_hash': manifest['network_hash'],
         'K': int(q['K']),
         'route_source': q.get('route_source', 'cg_recovered_top_k'),
@@ -831,6 +859,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             'cycle_start_iteration': None,
             'cycle_length': None,
             'retained_state_gap_verified': False,
+            'best': None,
         }
 
         prior = resume_assignments.get(loc_str)
@@ -881,14 +910,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
                 state['failure_reason'] = None
                 state['cycle_start_iteration'] = int(first_seen)
                 state['cycle_length'] = int(iteration - first_seen)
-                prior_evaluation = state['evaluated_assignments'].get(signature)
-                if prior_evaluation is not None:
-                    state['final_details'] = prior_evaluation['route_metrics']
-                    state['final_gap_override'] = prior_evaluation['gap']
-                    state['final_gap_mean_normalized_override'] = (
-                        prior_evaluation['mean_normalized_gap']
-                    )
-                    state['retained_state_gap_verified'] = True
+                _retain_lowest_gap_state(state)
                 active.remove(loc_str)
             else:
                 state['seen_assignments'][signature] = int(iteration)
@@ -972,8 +994,24 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
                 'mean_normalized_gap': float(gap_metrics['mean_normalized']),
                 'route_metrics': final_details,
             }
-            if gap <= float(alpha) or selected is None:
-                state['converged'] = gap <= float(alpha)
+            if selected is None:
+                # No OD/type group has a used route, so the gap is undefined;
+                # never report this as convergence.
+                state['status'] = 'failed'
+                state['failure_reason'] = 'no route group with used routes; gap undefined'
+                active.remove(loc_str)
+                continue
+            if state['best'] is None or gap < state['best']['gap']:
+                state['best'] = {
+                    'gap': float(gap),
+                    'mean_normalized_gap': float(gap_metrics['mean_normalized']),
+                    'route_metrics': final_details,
+                    'assignments_no': copy.deepcopy(state['assignments_no']),
+                    'assignments_ch': copy.deepcopy(state['assignments_ch']),
+                    'iteration': int(iteration),
+                }
+            if gap <= float(alpha):
+                state['converged'] = True
                 active.remove(loc_str)
                 continue
 
@@ -1009,11 +1047,12 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             # completed simulation job, but it is not an equilibrium.  Keep
             # the artifact for diagnosis/comparison and expose this status so
             # downstream reports cannot mistake it for a converged result.
-            state['status'] = 'nonconverged'
-            state['failure_reason'] = (
+            state['status'] = CAP_APPROXIMATION_STATUS
+            state['termination_reason'] = (
                 f'relative Nash gap {state["history"][-1] if state["history"] else float("inf"):.6g} '
                 f'exceeded alpha={float(alpha):.6g} after {iterations_completed} iterations'
             )
+            _retain_lowest_gap_state(state)
         final_gap = state.get('final_gap_override')
         if final_gap is None:
             final_gap = state['history'][-1] if state['history'] else float('inf')
@@ -1049,6 +1088,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             'retained_state_gap_verified': bool(
                 state.get('retained_state_gap_verified', False)
             ),
+            'retained_iteration': state.get('retained_iteration'),
             'resumed_complete': bool(state.get('resumed_complete', False)),
             'route_assignments': [
                 {
@@ -1073,7 +1113,7 @@ def find_nash_assignments(config, experiment_dir, all_opt_results_path,
             'queue_identity': queue_identity,
             'canonical_od_checksum': canonical_od_checksum,
         }
-        if state['status'] == CYCLE_APPROXIMATION_STATUS:
+        if state['status'] in APPROXIMATION_STATUSES:
             _promote_cycle_result(
                 result,
                 gap_verified=state.get('retained_state_gap_verified', False),

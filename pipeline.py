@@ -1191,8 +1191,9 @@ def _generate_run_summary(experiment_dir, config, timing, cg_results, queue_resu
         )
         if queue_results.get('uses_approximate_ne'):
             lines.append(
-                "  WARNING: cycle states were retained as approximate assignments; "
-                "they are not verified Nash equilibria."
+                "  WARNING: for searches that cycled or hit the iteration cap, the "
+                "lowest-gap visited assignment was retained; these are approximate "
+                "equilibria, not verified Nash equilibria."
             )
         if status_counts:
             lines.append(
@@ -1435,10 +1436,11 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
         ])
         if queue_results.get('uses_approximate_ne'):
             lines.extend([
-                "**Important limitation:** Better-response dynamics cycled. The "
-                "comparison below uses the current assignment retained at cycle "
-                "detection. These assignments are approximations and have not "
-                "been verified as Nash equilibria.",
+                "**Important limitation:** Better-response dynamics cycled or hit "
+                "the iteration cap for some placements. For those, the comparison "
+                "uses the lowest-gap assignment visited by the search. These are "
+                "approximate equilibria with the reported gap, not verified Nash "
+                "equilibria.",
                 "",
             ])
         ne_stats = queue_results.get('ne_statistics', {})
@@ -1622,7 +1624,7 @@ def generate_report(experiment_dir, config, timing, cg_results, queue_results, c
             ])
             if queue_results.get('uses_approximate_ne'):
                 lines.extend([
-                    "Because at least one queue assignment is a retained cycle state, "
+                    "Because at least one queue assignment is a retained approximate state, "
                     "the correlations are descriptive of the current approximations, not "
                     "correlations between verified Nash-equilibrium outcomes.",
                 ])
@@ -2109,7 +2111,7 @@ def run_pipeline(config_path: str, results_root: str = "results", resume: bool =
             )
         if queue_manifest.get('approximate_configurations'):
             print(
-                'WARNING: cycle detection retained the current assignment as '
+                'WARNING: the lowest-gap visited assignment was retained as '
                 'an approximate equilibrium for '
                 f'{len(queue_manifest["approximate_configurations"])} '
                 'configurations. Downstream results will be labeled approximate.'

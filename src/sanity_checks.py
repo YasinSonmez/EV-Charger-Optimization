@@ -331,7 +331,7 @@ def _validate_queue_outputs(
                 errors.append(f"NE placement {placement!r}: network_hash mismatch")
             if result.get("status") == "failed":
                 errors.append(f"NE placement {placement!r}: status=failed")
-            if result.get("status") == "approximate_cycle_state":
+            if result.get("status") in ("approximate_cycle_state", "approximate_iteration_cap"):
                 approximate.append(str(placement))
             elif not bool(result.get("converged", False)):
                 nonconverged.append(str(placement))

@@ -18,7 +18,7 @@ import networkx as nx
 warnings.filterwarnings('ignore')
 
 from queue_sim import Runner, QUEUE_SIM_AVAILABLE
-from queue_sim.find_nash import CYCLE_APPROXIMATION_STATUS, _prune_flow_data
+from queue_sim.find_nash import APPROXIMATION_STATUSES, _gap_metrics, _prune_flow_data
 from src.contracts import (
     SeedManager,
     canonical_placement,
@@ -31,16 +31,12 @@ from src.network_artifact import load_network_artifact
 from src.run_state import available_cpus
 
 
-def _placement_seed(rep, positions):
-    return rep * 100000 + sum(sorted(set(positions)))
-
-
 def _assignment_is_usable(value):
     """Accept exact NE or explicitly labeled retained cycle approximations."""
     if not isinstance(value, dict) or value.get('status') == 'failed':
         return False
     return bool(value.get('converged', False)) or (
-        value.get('status') == CYCLE_APPROXIMATION_STATUS
+        value.get('status') in APPROXIMATION_STATUSES
         and bool(value.get('approximate_equilibrium', False))
     )
 
@@ -75,88 +71,85 @@ def _run_sim(positions, data, ne, k, demand_classes, input_paths, output_root,
         t_end=int(simulation_horizon),
         output_dir=output_dir,
     )
-    return float(runner.tot_travel_time)
+    return float(runner.tot_travel_time), runner.check_NE(return_details=True)
 
 
-def _comparison_rep(args):
-    """Run one paired replication, caching each unordered placement once."""
-    (rep, file_path, ne_path, k, num_stations, possible_positions,
-     demand_classes, input_paths, work_dir, ent_cap, ch_cap, ex_cap, cost,
-     simulation_horizon, single_swap, combinations_list, seed) = args
+_WORKER_INPUTS = {}
+
+
+def _load_comparison_inputs(file_path, ne_path):
+    """Pool initializer: load the large CG and NE pickles once per worker."""
     with open(file_path, 'rb') as handle:
-        data = pickle.load(handle)
+        _WORKER_INPUTS['data'] = pickle.load(handle)
     with open(ne_path, 'rb') as handle:
-        ne = pickle.load(handle)
+        _WORKER_INPUTS['ne'] = pickle.load(handle)
 
-    cache = {}
-    cache_elapsed = {}
-    cache_hits = 0
 
-    def evaluate(positions):
-        nonlocal cache_hits
-        placement = canonical_placement(positions)
-        if placement in cache:
-            cache_hits += 1
-            return cache[placement]
-        started = time.perf_counter()
-        cache[placement] = _run_sim(
-            placement, data, ne, k, demand_classes, input_paths, work_dir,
-            ent_cap, ch_cap, ex_cap, cost, simulation_horizon,
-            seed=SeedManager(seed).derive('placement', rep, placement),
-            scenario=f'comparison_rep_{rep}',
-        )
-        cache_elapsed[placement] = time.perf_counter() - started
-        return cache[placement]
+def _comparison_task(args):
+    """Simulate one placement in one replication.
 
-    # Every replication must observe the same placement universe. Previously
-    # each replication followed its own noisy greedy prefix, leaving some
-    # intermediate placements without all paired observations and causing the
-    # mean-search summary to fail after simulation had already completed.
-    for size in range(1, int(num_stations) + 1):
-        for placement in enumerate_placements(possible_positions, size):
-            evaluate(placement)
+    All placements in replication ``rep`` share one seed (common random
+    numbers), so placement differences are not inflated by independent noise.
+    """
+    (rep, placement, k, demand_classes, input_paths, work_dir, ent_cap,
+     ch_cap, ex_cap, cost, simulation_horizon, seed) = args
+    started = time.perf_counter()
+    value, details = _run_sim(
+        placement, _WORKER_INPUTS['data'], _WORKER_INPUTS['ne'], k,
+        demand_classes, input_paths, work_dir, ent_cap, ch_cap, ex_cap, cost,
+        simulation_horizon,
+        seed=SeedManager(seed).derive('placement', rep),
+        scenario=f'comparison_rep_{rep}',
+    )
+    return rep, placement, value, time.perf_counter() - started, details
 
-    best_positions = []
-    best_time = float('inf')
-    remaining = list(ordered_unique_positions(possible_positions))
-    for _ in range(num_stations):
-        best_round_time = float('inf')
-        new_best = None
-        for candidate in remaining:
-            positions = canonical_placement([candidate] + best_positions)
-            value = evaluate(positions)
-            if value < best_round_time:
-                best_round_time = value
-                new_best = candidate
-        if new_best is None:
-            raise RuntimeError(f'No feasible greedy candidate at round {len(best_positions)}')
-        best_positions.append(new_best)
-        remaining.remove(new_best)
-        best_time = best_round_time
 
-    if single_swap:
-        swap_results = [
-            (evaluate(trial), trial)
-            for trial in single_swap_neighbors(best_positions, possible_positions)
+def _assemble_paired_results(task_results, n_reps, combinations_list):
+    """Group per-task results into one record per replication."""
+    paired = [
+        {'placement_values': {}, 'placement_elapsed_seconds': {}}
+        for _ in range(int(n_reps))
+    ]
+    for rep, placement, value, elapsed, _details in task_results:
+        placement = canonical_placement(placement)
+        paired[rep]['placement_values'][placement] = float(value)
+        paired[rep]['placement_elapsed_seconds'][placement] = float(elapsed)
+    for record in paired:
+        record['exhaustive_values'] = [
+            record['placement_values'][canonical_placement(value)]
+            for value in combinations_list
         ]
-        if swap_results:
-            swap_time, swap_positions = min(
-                swap_results, key=lambda value: (value[0], value[1])
-            )
-            if swap_time < best_time:
-                best_time = swap_time
-                best_positions = list(swap_positions)
+        record['unique_simulations'] = len(record['placement_values'])
+        record['cache_hits'] = 0
+    return paired
 
-    exhaustive_values = [evaluate(combination) for combination in combinations_list]
-    return {
-        'greedy_positions': canonical_placement(best_positions),
-        'greedy_time': float(best_time),
-        'exhaustive_values': exhaustive_values,
-        'placement_values': cache,
-        'placement_elapsed_seconds': cache_elapsed,
-        'unique_simulations': len(cache),
-        'cache_hits': cache_hits,
-    }
+
+def _replicated_gaps(task_results):
+    """Gap of each retained assignment, re-estimated from all replications."""
+    by_placement = {}
+    for _rep, placement, _value, _elapsed, details in task_results:
+        groups = by_placement.setdefault(canonical_placement(placement), {})
+        for group_key, routes in details.items():
+            target = groups.setdefault(group_key, [
+                {'travel_time': [], 'used': route['used']} for route in routes
+            ])
+            for slot, route in zip(target, routes):
+                slot['travel_time'].append(float(route['travel_time']))
+    gaps = {}
+    for placement, groups in by_placement.items():
+        averaged = {
+            group_key: [
+                {'travel_time': float(np.mean(slot['travel_time'])), 'used': slot['used']}
+                for slot in routes
+            ]
+            for group_key, routes in groups.items()
+        }
+        metrics, _ = _gap_metrics(averaged)
+        gaps[','.join(map(str, placement))] = {
+            'min_normalized': metrics['minimum_normalized'],
+            'mean_normalized': metrics['mean_normalized'],
+        }
+    return gaps
 
 
 def _build_queue_search_summary(
@@ -417,12 +410,12 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
         )
     approximate = sorted(
         key for key, value in ne.items()
-        if value.get('status') == CYCLE_APPROXIMATION_STATUS
+        if value.get('status') in APPROXIMATION_STATUSES
     )
     if approximate:
         print(
-            'WARNING: queue comparison is using current assignments retained '
-            f'at cycle detection for {len(approximate)} configurations. '
+            'WARNING: queue comparison is using the lowest-gap visited '
+            f'assignment for {len(approximate)} configurations. '
             'These are approximations, not verified Nash equilibria.'
         )
     demand_classes = normalize_od_demand(data['run_configuration']['od_demand'])
@@ -455,14 +448,20 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
         q.get('SIMULATION_HORIZON', 10801),
     )
 
-    comparison_args = [
-        (rep, all_opt_results_path, ne_assignments_path, k, num_stations,
-         possible_positions, *sim_args, q.get('single_swap', True),
-         combinations_list, seed)
+    placements = sorted(required_placements, key=lambda value: (len(value), value))
+    tasks = [
+        (rep, placement, k, *sim_args, seed)
         for rep in range(n_reps)
+        for placement in placements
     ]
-    with Pool(workers) as pool:
-        paired_raw = pool.map(_comparison_rep, comparison_args)
+    with Pool(
+        workers, initializer=_load_comparison_inputs,
+        initargs=(all_opt_results_path, ne_assignments_path),
+    ) as pool:
+        task_results = pool.map(_comparison_task, tasks, chunksize=1)
+    paired_raw = _assemble_paired_results(task_results, n_reps, combinations_list)
+    replicated_gaps = _replicated_gaps(task_results)
+    gap_values = [value['min_normalized'] for value in replicated_gaps.values()]
 
     exhaustive_values = np.asarray(
         [value['exhaustive_values'] for value in paired_raw], dtype=float
@@ -556,7 +555,7 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
         'exact_ne_eligible': not approximate,
         'approximate_configurations': approximate,
         'assignment_quality': (
-            'current_state_at_cycle_detection'
+            'lowest_gap_visited_state'
             if approximate else 'converged_nash'
         ),
         'best_greedy': best_greedy,
@@ -574,8 +573,14 @@ def run_comparison(config, experiment_dir, all_opt_results_path, ne_assignments_
         'exhaustive_results': exhaustive_results,
         'placement_search': search,
         'ne_statistics': ne_statistics,
+        'replicated_gaps': replicated_gaps,
+        'replicated_gap_statistics': {
+            'replications': int(n_reps),
+            'median': float(np.median(gap_values)) if gap_values else None,
+            'p90': float(np.percentile(gap_values, 90)) if gap_values else None,
+            'max': float(np.max(gap_values)) if gap_values else None,
+        },
         'cg_queue_correlations': correlations,
-        'reviewer_baselines': reviewer_baselines,
         'reviewer_baselines': reviewer_baselines,
         'config': {
             'N': n_reps, 'K': k, 'num_stations': num_stations,
