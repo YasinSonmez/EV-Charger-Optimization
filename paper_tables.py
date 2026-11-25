@@ -50,7 +50,7 @@ from run_suite import REPORTING_STRATEGIES, _latest_completed_records
 PHYSICAL_EXPERIMENTS = (
     "sensitivity_base",
     "budget_6_3", "budget_6_4", "budget_7_2", "budget_7_3", "budget_7_4",
-    "demand_045", "demand_090", "demand_180", "demand_270",
+    "demand_045", "demand_120", "demand_180",
     "f2_share_1_3", "f2_share_1_2",
     "od_count_2",
 )
@@ -89,6 +89,8 @@ TABLE3_PROBLEMS = (
     ("7 cand., $C{=}3$", "budget_7_3"),
     ("7 cand., $C{=}4$", "budget_7_4"),
     ("45 veh.", "demand_045"),
+    ("120 veh.", "demand_120"),
+    ("180 veh.", "demand_180"),
     ("F2 $1/2$", "f2_share_1_2"),
     ("F2 $1/3$", "f2_share_1_3"),
     ("Two OD pairs", "od_count_2"),

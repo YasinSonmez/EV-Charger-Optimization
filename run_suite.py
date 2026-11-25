@@ -290,7 +290,7 @@ def _write_csv(path, rows, default_columns):
 
 SENSITIVITY_PHYSICAL_EXPERIMENTS = (
     "sensitivity_base", "budget_6_3", "budget_6_4", "budget_7_2",
-    "budget_7_3", "budget_7_4", "demand_090", "demand_270",
+    "budget_7_3", "budget_7_4", "demand_045", "demand_120", "demand_180",
     "f2_share_1_3", "f2_share_1_2", "od_count_2",
 )
 
@@ -298,8 +298,8 @@ SENSITIVITY_FACTORS = (
     ("Sites", "$(6/2)\\ldots(7/4)$",
      ("sensitivity_base", "budget_6_3", "budget_6_4", "budget_7_2",
       "budget_7_3", "budget_7_4")),
-    ("Demand", "$90/180/270$",
-     ("demand_090", "sensitivity_base", "demand_270")),
+    ("Demand", "$45/90/120/180$",
+     ("demand_045", "sensitivity_base", "demand_120", "demand_180")),
     ("Charge share", "$1/3,1/2,2/3$",
      ("f2_share_1_3", "f2_share_1_2", "sensitivity_base")),
     ("ODs", "$1/2$", ("sensitivity_base", "od_count_2")),
@@ -504,7 +504,7 @@ def _render_sensitivity_table_tex(rows, selected):
         "  \\begin{minipage}{0.985\\textwidth}",
         "    \\footnotesize",
         f"    \\textit{{Notes:}} Placement quality uses {physical_runs} physical-scenario variants; sensitivity statistics use {len(selected)} selected jobs. Exact denotes equality with the exhaustive objective within $10^{{-9}}$ percentage points; random refers to its expected objective. CG is the congestion game; Q is the queue cycle-state approximation; Top-1 requires the same best charger set. BPR/CG/Q/Total are mean wall minutes; BPR includes fitting only (shared-artifact loading is excluded), and Q includes queue search only (final comparison is excluded). Total is the complete pipeline and additionally includes final comparison and overhead. "
-        f"All {cycles}/{searches} queue searches cycled and are not Nash equilibria. Times are not CPU-hours; BPR was calibrated once and reused by the other jobs.",
+        f"{cycles} of {searches} queue searches ended in a best-response cycle; for these, the lowest-gap visited state is used. Times are not CPU-hours; BPR was calibrated once and reused by the other jobs.",
         "  \\end{minipage}",
         "\\end{table*}",
         "",

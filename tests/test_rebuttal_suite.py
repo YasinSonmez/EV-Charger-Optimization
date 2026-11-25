@@ -196,7 +196,7 @@ def test_horizontal_sensitivity_table_contract():
         name: _paper_record(name, index)
         for index, name in enumerate(experiment_names)
     }
-    assert len(selected) == 20
+    assert len(selected) == 21
 
     rows = _sensitivity_paper_rows(selected)
     placement = {row["factor"]: row for row in rows
@@ -211,7 +211,7 @@ def test_horizontal_sensitivity_table_contract():
     assert agreement["Route src."]["runs"] == 2
     assert agreement["Init."]["runs"] == 3
     assert agreement["Overall"]["top_1_agreement_count"] == 5
-    assert agreement["Overall"]["mean_bpr_minutes"] == pytest.approx(1 / 20 / 60)
+    assert agreement["Overall"]["mean_bpr_minutes"] == pytest.approx(1 / 21 / 60)
     assert agreement["Overall"]["mean_cg_minutes"] == pytest.approx(2)
     assert agreement["Overall"]["mean_queue_minutes"] == pytest.approx(5)
     assert agreement["Overall"]["mean_total_minutes"] == pytest.approx(620 / 60)
